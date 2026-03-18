@@ -1,0 +1,3 @@
+[submodule "DeviceIndependentRenderingLibrary"]
+	path = DeviceIndependentRenderingLibrary
+	url = https://github.com/DrawboardLtd/DeviceIndependentRenderingLibrary.git
