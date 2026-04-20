@@ -5,20 +5,32 @@ using static Vortice.Vulkan.Vulkan;
 
 namespace SdlVulkan.Renderer;
 
-internal sealed unsafe class VkFontAtlas : IDisposable
+/// <summary>
+/// SDF-based font atlas using R8_Unorm single-channel textures.
+/// Glyphs are rasterized as signed distance fields — the fragment shader
+/// reconstructs crisp anti-aliased edges at any scale via smoothstep.
+/// </summary>
+internal sealed unsafe class VkSdfFontAtlas : IDisposable
 {
-    // CharCode is included in the key for CID subset fonts where the same Unicode
-    // character may need different glyph indices. For non-CID fonts, charCode is -1.
-    private readonly record struct GlyphKey(string Font, float Size, Rune Character, int CharCode);
+    private readonly record struct GlyphKey(string Font, float Size, Rune Character);
 
-    internal readonly record struct GlyphInfo(float U0, float V0, float U1, float V1, int Width, int Height, float AdvanceX, int BearingX, int BearingY);
+    internal readonly record struct GlyphInfo(float U0, float V0, float U1, float V1,
+        int Width, int Height, float AdvanceX, int BearingX, int BearingY, float Spread);
 
     private readonly VulkanContext _ctx;
-    internal readonly ManagedFontRasterizer Rasterizer = new();
+    private readonly ManagedFontRasterizer _rasterizer;
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
     private const int MaxAtlasSize = 4096;
+    private const float SdfSpread = 4f;
+
+    /// <summary>
+    /// SDF glyphs are rasterized at this fixed size. The GPU scales the quad
+    /// for any requested display size. Because SDF encodes distance, not pixels,
+    /// a single rasterization looks sharp at all display sizes.
+    /// </summary>
+    private const float SdfRasterSize = 48f;
 
     private int _atlasWidth;
     private int _atlasHeight;
@@ -26,6 +38,7 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     private int _cursorY;
     private int _rowHeight;
 
+    // Single-channel staging buffer (1 byte per pixel)
     private byte[] _staging;
 
     private int _dirtyX0, _dirtyY0, _dirtyX1, _dirtyY1;
@@ -40,26 +53,29 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     private VkDeviceMemory _uploadMemory;
     private ulong _uploadBufferSize;
 
+    // Own descriptor set for the SDF atlas texture
+    private VkDescriptorSet _descriptorSet;
+
     public VkImageView ImageView => _imageView;
     public VkSampler Sampler => _sampler;
+    public VkDescriptorSet DescriptorSet => _descriptorSet;
+    public bool IsDirty => _needsEviction || (_dirtyX0 < _dirtyX1 && _dirtyY0 < _dirtyY1);
 
-    public VkFontAtlas(VulkanContext ctx, int initialWidth = 512, int initialHeight = 512)
+    public VkSdfFontAtlas(VulkanContext ctx, ManagedFontRasterizer rasterizer, int initialWidth = 512, int initialHeight = 512)
     {
         _ctx = ctx;
+        _rasterizer = rasterizer;
         _atlasWidth = initialWidth;
         _atlasHeight = initialHeight;
-        _staging = new byte[initialWidth * initialHeight * 4];
+        _staging = new byte[initialWidth * initialHeight]; // 1 byte per pixel
         ResetDirtyRegion();
 
         CreateImage(initialWidth, initialHeight);
         CreateSampler();
-        ctx.UpdateDescriptorSet(ctx.DescriptorSet, _imageView, _sampler);
+        _descriptorSet = ctx.AllocateDescriptorSet();
+        ctx.UpdateDescriptorSet(_descriptorSet, _imageView, _sampler);
     }
 
-    /// <summary>
-    /// Call at the start of each frame to handle deferred eviction.
-    /// This ensures no stale UV coordinates exist in the current frame's batch.
-    /// </summary>
     public void BeginFrame()
     {
         if (_needsEviction)
@@ -70,57 +86,25 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     }
 
     /// <summary>
-    /// Returns the scale factor between the requested fontSize and the actual rasterized size.
-    /// Callers must scale glyph metrics (Width, Height, BearingX, BearingY) by this factor.
+    /// Returns the scale factor between the requested fontSize and the SDF raster size.
     /// </summary>
-    public static float GetGlyphScale(float requestedFontSize)
-    {
-        var quantized = QuantizeFontSize(requestedFontSize);
-        return requestedFontSize / quantized;
-    }
+    public static float GetGlyphScale(float requestedFontSize) => requestedFontSize / SdfRasterSize;
 
-    /// <summary>
-    /// Gets glyph info, rasterizing into the staging buffer if needed.
-    /// Use <paramref name="skipUnflushed"/> in draw loops to avoid sampling stale GPU texture data.
-    /// </summary>
-    public GlyphInfo GetGlyph(string fontPath, float fontSize, Rune character, bool skipUnflushed = false, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto)
+    public GlyphInfo GetGlyph(string fontPath, float fontSize, Rune character, bool skipUnflushed = false)
     {
-        fontSize = QuantizeFontSize(fontSize);
-        var key = new GlyphKey(fontPath, fontSize, character, charCode);
+        // All SDF glyphs are rasterized at SdfRasterSize; the caller scales the quad
+        var key = new GlyphKey(fontPath, SdfRasterSize, character);
         if (_glyphs.TryGetValue(key, out var existing))
         {
-            // Cache hit — safe to draw only if this glyph has been flushed to GPU
             if (skipUnflushed && _unflushedGlyphs.Contains(key))
-                return existing with { Width = 0 }; // metrics preserved for advance, but skip quad
+                return existing with { Width = 0 };
             return existing;
         }
-        var result = RasterizeGlyph(key, charCode, hint);
+        var result = RasterizeGlyph(key);
         if (skipUnflushed && result.Width > 0)
-            return result with { Width = 0 }; // just rasterized, not flushed yet — skip quad
+            return result with { Width = 0 };
         return result;
     }
-
-    /// <summary>
-    /// Max rasterization size in pixels. Larger glyphs are rasterized at this size
-    /// and the textured quad is scaled up by the GPU — avoids atlas overflow at high zoom.
-    /// </summary>
-    private const float MaxRasterSize = 128f;
-
-    /// <summary>
-    /// Snaps font sizes to coarser steps at larger sizes to reduce atlas churn during zoom.
-    /// Small text (≤16pt): 1pt steps. Medium (≤48pt): 2pt steps. Large: 4pt steps.
-    /// Capped at MaxRasterSize — the GPU scales the quad for anything larger.
-    /// </summary>
-    private static float QuantizeFontSize(float size)
-    {
-        if (size < 4f) return 4f;
-        if (size <= 16f) return MathF.Ceiling(size);
-        if (size <= 48f) return MathF.Ceiling(size / 2f) * 2f;
-        if (size <= MaxRasterSize) return MathF.Ceiling(size / 4f) * 4f;
-        return MaxRasterSize;
-    }
-
-    public bool IsDirty => _needsEviction || (_dirtyX0 < _dirtyX1 && _dirtyY0 < _dirtyY1);
 
     public void Flush(VkCommandBuffer cmd)
     {
@@ -131,28 +115,24 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         var regionH = _dirtyY1 - _dirtyY0;
         var pixelCount = regionW * regionH;
 
-        // Extract the dirty region into a contiguous buffer
-        var rgba = new byte[pixelCount * 4];
+        // Extract dirty region into contiguous buffer (1 byte per pixel)
+        var data = new byte[pixelCount];
         for (var row = 0; row < regionH; row++)
         {
-            var srcOffset = ((_dirtyY0 + row) * _atlasWidth + _dirtyX0) * 4;
-            var dstOffset = row * regionW * 4;
-            Buffer.BlockCopy(_staging, srcOffset, rgba, dstOffset, regionW * 4);
+            var srcOffset = (_dirtyY0 + row) * _atlasWidth + _dirtyX0;
+            var dstOffset = row * regionW;
+            Buffer.BlockCopy(_staging, srcOffset, data, dstOffset, regionW);
         }
 
-        var bufferSize = (ulong)(pixelCount * 4);
+        var bufferSize = (ulong)pixelCount;
 
-        // Wait for any in-flight command buffers to finish reading the upload buffer
-        // before overwriting it. With MaxFramesInFlight=2, the previous frame's
-        // vkCmdCopyBufferToImage may still be reading the shared upload buffer.
         _ctx.DeviceApi.vkDeviceWaitIdle();
-
         EnsureUploadBuffer(bufferSize);
 
         void* mapped;
         _ctx.DeviceApi.vkMapMemory(_uploadMemory, 0, bufferSize, 0, &mapped);
-        fixed (byte* pRgba = rgba)
-            Buffer.MemoryCopy(pRgba, mapped, bufferSize, bufferSize);
+        fixed (byte* pData = data)
+            Buffer.MemoryCopy(pData, mapped, bufferSize, bufferSize);
         _ctx.DeviceApi.vkUnmapMemory(_uploadMemory);
 
         VulkanHelpers.TransitionImageLayout(_ctx.DeviceApi, cmd, _image, VkImageLayout.ShaderReadOnlyOptimal, VkImageLayout.TransferDstOptimal);
@@ -176,9 +156,9 @@ internal sealed unsafe class VkFontAtlas : IDisposable
 
     public void Dispose()
     {
-        Rasterizer.Dispose();
-
         var api = _ctx.DeviceApi;
+
+        _ctx.FreeDescriptorSet(_descriptorSet);
 
         if (_uploadBuffer != VkBuffer.Null)
         {
@@ -192,23 +172,17 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         api.vkFreeMemory(_imageMemory);
     }
 
-    private GlyphInfo RasterizeGlyph(GlyphKey key, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto)
+    private GlyphInfo RasterizeGlyph(GlyphKey key)
     {
         if (Rune.IsWhiteSpace(key.Character))
         {
-            var refGlyph = GetGlyph(key.Font, key.Size, new Rune('n'));
-            var info = new GlyphInfo(0, 0, 0, 0, 0, 0, refGlyph.AdvanceX, 0, 0);
+            var refGlyph = GetGlyph(key.Font, SdfRasterSize, new Rune('n'));
+            var info = new GlyphInfo(0, 0, 0, 0, 0, 0, refGlyph.AdvanceX, 0, 0, SdfSpread);
             _glyphs[key] = info;
             return info;
         }
 
-        // Use charCode-aware lookup when charCode is available (subset/embedded fonts).
-        // RasterizeGlyphWithCharCode supports multiple cmap strategies via GlyphMapHint.
-        GlyphBitmap bitmap;
-        if (charCode >= 0)
-            bitmap = Rasterizer.RasterizeGlyphWithCharCode(key.Font, key.Size, key.Character, (uint)charCode, hint);
-        else
-            bitmap = Rasterizer.RasterizeGlyph(key.Font, key.Size, key.Character);
+        var bitmap = _rasterizer.RasterizeGlyphSdf(key.Font, key.Size, key.Character, SdfSpread);
         var glyphWidth = bitmap.Width;
         var glyphHeight = bitmap.Height;
 
@@ -228,17 +202,16 @@ internal sealed unsafe class VkFontAtlas : IDisposable
                 Grow();
                 return RasterizeGlyph(key);
             }
-            // Defer eviction to next frame start to avoid stale UVs in current batch
             _needsEviction = true;
             return default;
         }
 
-        // Blit glyph RGBA into staging buffer
+        // Blit single-channel SDF data into staging buffer
         for (var row = 0; row < glyphHeight; row++)
         {
-            var srcOffset = row * glyphWidth * 4;
-            var dstOffset = ((_cursorY + row) * _atlasWidth + _cursorX) * 4;
-            Buffer.BlockCopy(bitmap.Rgba, srcOffset, _staging, dstOffset, glyphWidth * 4);
+            var srcOffset = row * glyphWidth;
+            var dstOffset = (_cursorY + row) * _atlasWidth + _cursorX;
+            Buffer.BlockCopy(bitmap.Alpha, srcOffset, _staging, dstOffset, glyphWidth);
         }
 
         _dirtyX0 = Math.Min(_dirtyX0, _cursorX);
@@ -255,7 +228,8 @@ internal sealed unsafe class VkFontAtlas : IDisposable
             Height: glyphHeight,
             AdvanceX: bitmap.AdvanceX,
             BearingX: bitmap.BearingX,
-            BearingY: bitmap.BearingY);
+            BearingY: bitmap.BearingY,
+            Spread: bitmap.Spread);
 
         _glyphs[key] = glyphInfo;
         _unflushedGlyphs.Add(key);
@@ -272,13 +246,12 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         _atlasWidth = Math.Min(_atlasWidth * 2, MaxAtlasSize);
         _atlasHeight = Math.Min(_atlasHeight * 2, MaxAtlasSize);
 
-        var newStaging = new byte[_atlasWidth * _atlasHeight * 4];
-        // Copy old rows into the wider buffer
+        var newStaging = new byte[_atlasWidth * _atlasHeight];
         for (var row = 0; row < oldHeight; row++)
         {
-            var srcOffset = row * oldWidth * 4;
-            var dstOffset = row * _atlasWidth * 4;
-            Buffer.BlockCopy(_staging, srcOffset, newStaging, dstOffset, oldWidth * 4);
+            var srcOffset = row * oldWidth;
+            var dstOffset = row * _atlasWidth;
+            Buffer.BlockCopy(_staging, srcOffset, newStaging, dstOffset, oldWidth);
         }
         _staging = newStaging;
 
@@ -297,7 +270,7 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         api.vkDestroyImage(_image);
         api.vkFreeMemory(_imageMemory);
         CreateImage(_atlasWidth, _atlasHeight);
-        _ctx.UpdateDescriptorSet(_ctx.DescriptorSet, _imageView, _sampler);
+        _ctx.UpdateDescriptorSet(_descriptorSet, _imageView, _sampler);
 
         _dirtyX0 = 0; _dirtyY0 = 0;
         _dirtyX1 = _atlasWidth; _dirtyY1 = _atlasHeight;
@@ -307,7 +280,7 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     {
         _glyphs.Clear();
         _cursorX = 0; _cursorY = 0; _rowHeight = 0;
-        _staging = new byte[_atlasWidth * _atlasHeight * 4];
+        _staging = new byte[_atlasWidth * _atlasHeight];
         _dirtyX0 = 0; _dirtyY0 = 0;
         _dirtyX1 = _atlasWidth; _dirtyY1 = _atlasHeight;
     }
@@ -319,7 +292,7 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         VkImageCreateInfo imageCI = new()
         {
             imageType = VkImageType.Image2D,
-            format = VkFormat.R8G8B8A8Unorm,
+            format = VkFormat.R8Unorm,
             extent = new VkExtent3D((uint)width, (uint)height, 1),
             mipLevels = 1,
             arrayLayers = 1,
@@ -343,15 +316,19 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         _ctx.ExecuteOneShot(cmd =>
             VulkanHelpers.TransitionImageLayout(api, cmd, _image, VkImageLayout.Undefined, VkImageLayout.ShaderReadOnlyOptimal));
 
+        // Swizzle R channel into all RGBA channels so the sampler reads the SDF
+        // value consistently regardless of which component the shader samples
         var viewCI = new VkImageViewCreateInfo(
-            _image, VkImageViewType.Image2D, VkFormat.R8G8B8A8Unorm,
-            VkComponentMapping.Rgba,
+            _image, VkImageViewType.Image2D, VkFormat.R8Unorm,
+            new VkComponentMapping(VkComponentSwizzle.R, VkComponentSwizzle.R, VkComponentSwizzle.R, VkComponentSwizzle.R),
             new VkImageSubresourceRange(VkImageAspectFlags.Color, 0, 1, 0, 1));
         api.vkCreateImageView(&viewCI, null, out _imageView).CheckResult();
     }
 
     private void CreateSampler()
     {
+        // Bilinear filtering is ideal for SDF — smooth interpolation between
+        // distance values produces correct anti-aliased edges
         VkSamplerCreateInfo samplerCI = new()
         {
             magFilter = VkFilter.Linear,

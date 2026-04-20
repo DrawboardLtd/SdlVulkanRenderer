@@ -7,6 +7,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 {
     private VkPipelineSet? _pipelines;
     private VkFontAtlas? _fontAtlas;
+    private VkSdfFontAtlas? _sdfFontAtlas;
     private uint _width;
     private uint _height;
     private VkCommandBuffer _currentCmd;
@@ -25,6 +26,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _height = height;
         _pipelines = VkPipelineSet.Create(ctx);
         _fontAtlas = new VkFontAtlas(ctx);
+        _sdfFontAtlas = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer);
         UpdateProjection();
     }
 
@@ -33,8 +35,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
     public VkPipelineSet? Pipelines => _pipelines;
     internal VkFontAtlas? FontAtlas => _fontAtlas;
-    public FreeTypeGlyphRasterizer? GlyphRasterizer => _fontAtlas?.Rasterizer;
-    public bool FontAtlasDirty => _fontAtlas?.IsDirty == true;
+    public ManagedFontRasterizer? GlyphRasterizer => _fontAtlas?.Rasterizer;
+    public bool FontAtlasDirty => _fontAtlas?.IsDirty == true || _sdfFontAtlas?.IsDirty == true;
 
     public VulkanContext Context => Surface;
 
@@ -50,18 +52,38 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// </summary>
     public override (float Width, float Height) MeasureText(ReadOnlySpan<char> text, string fontFamily, float fontSize)
     {
-        if (_fontAtlas is null || text.IsEmpty)
+        if (_sdfFontAtlas is null || text.IsEmpty)
             return (0f, 0f);
 
+        var glyphScale = VkSdfFontAtlas.GetGlyphScale(fontSize);
+        var bitmapScale = VkFontAtlas.GetGlyphScale(fontSize);
         var width = 0f;
-        var maxAscent = 0;
-        var maxDescent = 0;
+        var maxAscent = 0f;
+        var maxDescent = 0f;
         foreach (var ch in text.EnumerateRunes())
         {
-            var glyph = _fontAtlas.GetGlyph(fontFamily, fontSize, ch);
-            width += glyph.AdvanceX;
-            if (glyph.BearingY > maxAscent) maxAscent = glyph.BearingY;
-            var descent = glyph.Height - glyph.BearingY;
+            float advance, bearingY, height;
+            var isEmoji = ch.Value >= 0x1F000
+                || (ch.Value >= 0x2600 && ch.Value <= 0x27BF)
+                || (ch.Value >= 0xFE00 && ch.Value <= 0xFE0F)
+                || ch.Value == 0x200D;
+            if (isEmoji && _fontAtlas is not null)
+            {
+                var bg = _fontAtlas.GetGlyph(fontFamily, fontSize, ch);
+                advance = bg.AdvanceX * bitmapScale;
+                bearingY = bg.BearingY * bitmapScale;
+                height = bg.Height * bitmapScale;
+            }
+            else
+            {
+                var glyph = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, ch);
+                advance = glyph.AdvanceX * glyphScale;
+                bearingY = glyph.BearingY * glyphScale;
+                height = glyph.Height * glyphScale;
+            }
+            width += advance;
+            if (bearingY > maxAscent) maxAscent = bearingY;
+            var descent = height - bearingY;
             if (descent > maxDescent) maxDescent = descent;
         }
         return (width, maxAscent + maxDescent);
@@ -91,8 +113,10 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
         // Handle deferred eviction, then flush font atlas changes before render pass
         _fontAtlas?.BeginFrame();
+        _sdfFontAtlas?.BeginFrame();
         OnPreFlush?.Invoke();
         _fontAtlas?.Flush(_currentCmd);
+        _sdfFontAtlas?.Flush(_currentCmd);
 
         // Record pending texture uploads before the render pass (transfers can't happen inside)
         OnPreRenderPass?.Invoke(_currentCmd);
@@ -683,6 +707,40 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     public void DestroyBuffer(Vortice.Vulkan.VkBuffer buffer, Vortice.Vulkan.VkDeviceMemory memory)
         => Surface.DestroyBuffer(buffer, memory);
 
+    /// <summary>
+    /// GPU-efficient line drawing: computes a rotated quad (2 triangles) from the
+    /// line endpoints and submits via the FlatPipeline in a single draw call.
+    /// </summary>
+    public override void DrawLine(float x0, float y0, float x1, float y1, DIR.Lib.RGBAColor32 color, int thickness = 1)
+    {
+        if (_pipelines is null) return;
+
+        var dx = x1 - x0;
+        var dy = y1 - y0;
+        var len = MathF.Sqrt(dx * dx + dy * dy);
+        if (len < 0.001f) return;
+
+        // Perpendicular normal scaled to half-thickness
+        var hw = Math.Max(thickness, 1) * 0.5f;
+        var nx = -dy / len * hw;
+        var ny = dx / len * hw;
+
+        // 4 corners of the rotated quad
+        var ax = x0 + nx; var ay = y0 + ny;
+        var bx = x0 - nx; var by = y0 - ny;
+        var cx = x1 - nx; var cy = y1 - ny;
+        var ex = x1 + nx; var ey = y1 + ny;
+
+        // 2 triangles (6 vertices, 2 floats each)
+        ReadOnlySpan<float> vertices =
+        [
+            ax, ay, bx, by, cx, cy,
+            ax, ay, cx, cy, ex, ey
+        ];
+
+        DrawTriangles(vertices, color);
+    }
+
     public override void DrawRectangle(in RectInt rect, DIR.Lib.RGBAColor32 strokeColor, int strokeWidth)
     {
         var x0 = (float)rect.UpperLeft.X;
@@ -734,6 +792,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     }
 
     /// <summary>
+    /// GPU-efficient ellipse outline via the EllipsePipeline ring shader.
+    /// </summary>
+    public override void DrawEllipse(in RectInt rect, DIR.Lib.RGBAColor32 strokeColor, float strokeWidth)
+        => DrawEllipseOutline(rect, strokeColor, strokeWidth);
+
+    /// <summary>
     /// Draws an ellipse outline (ring) with the given stroke width in pixels.
     /// </summary>
     public void DrawEllipseOutline(in RectInt rect, DIR.Lib.RGBAColor32 strokeColor, float strokeWidth)
@@ -780,13 +844,14 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         DIR.Lib.RGBAColor32 fontColor, in RectInt layout, TextAlign horizAlignment = TextAlign.Center,
         TextAlign vertAlignment = TextAlign.Near)
     {
-        if (_pipelines is null || _fontAtlas is null || text.IsEmpty)
+        if (_pipelines is null || _sdfFontAtlas is null || text.IsEmpty)
             return;
 
         var api = Surface.DeviceApi;
         var textStr = text.ToString();
         var lines = textStr.Split('\n');
 
+        var glyphScale = VkSdfFontAtlas.GetGlyphScale(fontSize);
         var lineHeight = fontSize * 1.3f;
         var totalHeight = lines.Length * lineHeight;
 
@@ -804,9 +869,14 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
         SetColor(fontColor);
 
-        api.vkCmdBindPipeline(_currentCmd, VkPipelineBindPoint.Graphics, _pipelines.TexturedPipeline);
+        // Set SDF edge softness in the extra push constant slot (offset 20 = float index for innerRadius/sdfEdge)
+        // Compute edge width from spread and display scale for sharp anti-aliased edges
+        _pushConstants[20] = 1.5f / (4f * glyphScale * fontSize / 48f + 0.001f);
+        if (_pushConstants[20] > 0.5f) _pushConstants[20] = 0.5f;
 
-        var descriptorSet = Surface.DescriptorSet;
+        api.vkCmdBindPipeline(_currentCmd, VkPipelineBindPoint.Graphics, _pipelines.SdfPipeline);
+
+        var descriptorSet = _sdfFontAtlas.DescriptorSet;
         api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
             Surface.PipelineLayout, 0, 1, &descriptorSet, 0, null);
 
@@ -815,22 +885,46 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             var line = lines[lineIdx];
             if (string.IsNullOrEmpty(line)) continue;
 
-            // Compute visual text metrics
+            // Compute visual text metrics (scaled from SDF raster size to display size)
             var advanceSum = 0f;
-            var firstBearingX = 0;
+            var firstBearingX = 0f;
             var lastRightEdge = 0f;
-            var maxAscent = 0;  // max BearingY (above baseline)
-            var maxDescent = 0; // max (Height - BearingY) (below baseline)
+            var maxAscent = 0f;
+            var maxDescent = 0f;
             var first = true;
             foreach (var mc in line.EnumerateRunes())
             {
-                var g = _fontAtlas.GetGlyph(fontFamily, fontSize, mc);
-                if (first && g.Width > 0) { firstBearingX = g.BearingX; first = false; }
-                if (g.Width > 0) { lastRightEdge = advanceSum + g.BearingX + g.Width; }
-                if (g.BearingY > maxAscent) maxAscent = g.BearingY;
-                var descent = g.Height - g.BearingY;
+                // Use bitmap atlas metrics for color glyphs (emoji)
+                var isEmoji = mc.Value >= 0x1F000
+                    || (mc.Value >= 0x2600 && mc.Value <= 0x27BF)
+                    || (mc.Value >= 0xFE00 && mc.Value <= 0xFE0F)
+                    || mc.Value == 0x200D;
+                float scaledBearingX, scaledBearingY, scaledWidth, scaledHeight, scaledAdvance;
+                if (isEmoji && _fontAtlas is not null)
+                {
+                    var bg = _fontAtlas.GetGlyph(fontFamily, fontSize, mc);
+                    var bScale = VkFontAtlas.GetGlyphScale(fontSize);
+                    scaledBearingX = bg.BearingX * bScale;
+                    scaledBearingY = bg.BearingY * bScale;
+                    scaledWidth = bg.Width * bScale;
+                    scaledHeight = bg.Height * bScale;
+                    scaledAdvance = bg.AdvanceX * bScale;
+                }
+                else
+                {
+                    var g = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, mc);
+                    scaledBearingX = g.BearingX * glyphScale;
+                    scaledBearingY = g.BearingY * glyphScale;
+                    scaledWidth = g.Width * glyphScale;
+                    scaledHeight = g.Height * glyphScale;
+                    scaledAdvance = g.AdvanceX * glyphScale;
+                }
+                if (first && scaledWidth > 0) { firstBearingX = scaledBearingX; first = false; }
+                if (scaledWidth > 0) { lastRightEdge = advanceSum + scaledBearingX + scaledWidth; }
+                if (scaledBearingY > maxAscent) maxAscent = scaledBearingY;
+                var descent = scaledHeight - scaledBearingY;
                 if (descent > maxDescent) maxDescent = descent;
-                advanceSum += g.AdvanceX;
+                advanceSum += scaledAdvance;
             }
             var visualWidth = first ? advanceSum : lastRightEdge - firstBearingX;
 
@@ -842,23 +936,97 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             };
             var penY = startY + lineIdx * lineHeight;
 
-            // Place baseline so the visual bounds (ascent + descent) are centered in the line
             var baseline = penY + (lineHeight + maxAscent - maxDescent) / 2f;
+
+            var inSdfMode = true; // track current pipeline to minimize rebinds
 
             foreach (var ch in line.EnumerateRunes())
             {
-                // skipUnflushed: true — skip quads for glyphs not yet uploaded to GPU
-                var glyph = _fontAtlas.GetGlyph(fontFamily, fontSize, ch, skipUnflushed: true);
-                if (glyph.Width == 0)
+                // Color glyphs (emoji, symbols) can't render through the single-channel
+                // SDF atlas. Fall back to the RGBA bitmap atlas + TexturedPipeline.
+                var isColorGlyph = ch.Value >= 0x1F000 // Supplementary symbols & emoji
+                    || (ch.Value >= 0x2600 && ch.Value <= 0x27BF) // Misc symbols, Dingbats
+                    || (ch.Value >= 0xFE00 && ch.Value <= 0xFE0F) // Variation selectors
+                    || (ch.Value >= 0x200D && ch.Value <= 0x200D); // ZWJ
+
+                if (isColorGlyph && _fontAtlas is not null)
                 {
-                    penX += glyph.AdvanceX;
+                    // Switch to bitmap pipeline for this glyph
+                    if (inSdfMode)
+                    {
+                        api.vkCmdBindPipeline(_currentCmd, VkPipelineBindPoint.Graphics, _pipelines.TexturedPipeline);
+                        var bitmapSet = Surface.DescriptorSet;
+                        api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
+                            Surface.PipelineLayout, 0, 1, &bitmapSet, 0, null);
+                        // Reset sdfEdge to 0 (not used by TexturedPipeline, but keep push constants clean)
+                        _pushConstants[20] = 0f;
+                        inSdfMode = false;
+                    }
+
+                    var bitmapGlyph = _fontAtlas.GetGlyph(fontFamily, fontSize, ch, skipUnflushed: true);
+                    if (bitmapGlyph.Width == 0)
+                    {
+                        var bitmapScale = VkFontAtlas.GetGlyphScale(fontSize);
+                        penX += bitmapGlyph.AdvanceX * bitmapScale;
+                        continue;
+                    }
+
+                    var bScale = VkFontAtlas.GetGlyphScale(fontSize);
+                    var bgx0 = penX + bitmapGlyph.BearingX * bScale;
+                    var bgy0 = baseline - bitmapGlyph.BearingY * bScale;
+                    var bgx1 = bgx0 + bitmapGlyph.Width * bScale;
+                    var bgy1 = bgy0 + bitmapGlyph.Height * bScale;
+
+                    ReadOnlySpan<float> bVerts =
+                    [
+                        bgx0, bgy0, bitmapGlyph.U0, bitmapGlyph.V0,
+                        bgx1, bgy0, bitmapGlyph.U1, bitmapGlyph.V0,
+                        bgx1, bgy1, bitmapGlyph.U1, bitmapGlyph.V1,
+                        bgx0, bgy0, bitmapGlyph.U0, bitmapGlyph.V0,
+                        bgx1, bgy1, bitmapGlyph.U1, bitmapGlyph.V1,
+                        bgx0, bgy1, bitmapGlyph.U0, bitmapGlyph.V1
+                    ];
+
+                    var bOffset = Surface.WriteVertices(bVerts);
+                    if (bOffset == uint.MaxValue) break;
+
+                    fixed (float* pPC = _pushConstants)
+                        api.vkCmdPushConstants(_currentCmd, Surface.PipelineLayout,
+                            VkShaderStageFlags.Vertex | VkShaderStageFlags.Fragment, 0, 84, pPC);
+
+                    var bBuf = Surface.VertexBuffer;
+                    var bOff = (ulong)bOffset;
+                    api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &bBuf, &bOff);
+                    api.vkCmdDraw(_currentCmd, 6, 1, 0, 0);
+
+                    penX += bitmapGlyph.AdvanceX * bScale;
                     continue;
                 }
 
-                var gx0 = penX + glyph.BearingX;
-                var gy0 = baseline - glyph.BearingY;
-                var gx1 = gx0 + glyph.Width;
-                var gy1 = gy0 + glyph.Height;
+                // SDF path for regular text glyphs
+                if (!inSdfMode)
+                {
+                    // Switch back to SDF pipeline
+                    api.vkCmdBindPipeline(_currentCmd, VkPipelineBindPoint.Graphics, _pipelines.SdfPipeline);
+                    var sdfSet = _sdfFontAtlas.DescriptorSet;
+                    api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
+                        Surface.PipelineLayout, 0, 1, &sdfSet, 0, null);
+                    _pushConstants[20] = 1.5f / (4f * glyphScale * fontSize / 48f + 0.001f);
+                    if (_pushConstants[20] > 0.5f) _pushConstants[20] = 0.5f;
+                    inSdfMode = true;
+                }
+
+                var glyph = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, ch, skipUnflushed: true);
+                if (glyph.Width == 0)
+                {
+                    penX += glyph.AdvanceX * glyphScale;
+                    continue;
+                }
+
+                var gx0 = penX + glyph.BearingX * glyphScale;
+                var gy0 = baseline - glyph.BearingY * glyphScale;
+                var gx1 = gx0 + glyph.Width * glyphScale;
+                var gy1 = gy0 + glyph.Height * glyphScale;
 
                 ReadOnlySpan<float> vertices =
                 [
@@ -882,13 +1050,15 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
                 api.vkCmdDraw(_currentCmd, 6, 1, 0, 0);
 
-                penX += glyph.AdvanceX;
+                penX += glyph.AdvanceX * glyphScale;
             }
         }
     }
 
     public override void Dispose()
     {
+        _sdfFontAtlas?.Dispose();
+        _sdfFontAtlas = null;
         _fontAtlas?.Dispose();
         _fontAtlas = null;
         _pipelines?.Dispose();
