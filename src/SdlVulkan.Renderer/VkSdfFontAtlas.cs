@@ -24,6 +24,13 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
+    // Optional disk-persistent cache of SDF bitmaps. When supplied, every freshly
+    // rasterized glyph is appended to disk, and the first GetGlyph/PreRasterizeBatch
+    // call for a font bulk-loads its existing entries — making re-opens of the same
+    // document near-instant after the first session.
+    private readonly SdfGlyphDiskCache? _diskCache;
+    private readonly HashSet<string> _diskLoadedFonts = new();
+
     private const int MaxAtlasSize = 4096;
     private const float SdfSpread = 4f;
 
@@ -89,10 +96,13 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     public VkDescriptorSet DescriptorSet => _descriptorSet;
     public bool IsDirty => _needsEviction || (_dirtyX0 < _dirtyX1 && _dirtyY0 < _dirtyY1);
 
-    public VkSdfFontAtlas(VulkanContext ctx, ManagedFontRasterizer rasterizer, int initialWidth = DefaultInitialAtlasDim, int initialHeight = DefaultInitialAtlasDim)
+    public VkSdfFontAtlas(VulkanContext ctx, ManagedFontRasterizer rasterizer,
+        SdfGlyphDiskCache? diskCache = null,
+        int initialWidth = DefaultInitialAtlasDim, int initialHeight = DefaultInitialAtlasDim)
     {
         _ctx = ctx;
         _rasterizer = rasterizer;
+        _diskCache = diskCache;
         _atlasWidth = initialWidth;
         _atlasHeight = initialHeight;
         _staging = new byte[initialWidth * initialHeight]; // 1 byte per pixel
@@ -121,6 +131,10 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     public GlyphInfo GetGlyph(string fontPath, float fontSize, Rune character,
         bool skipUnflushed = false, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto)
     {
+        // First-time use of a font with a disk cache configured: bulk-import every
+        // previously-rasterized glyph for it. Idempotent and noop after the first call.
+        EnsureFontLoadedFromDisk(fontPath);
+
         // All SDF glyphs are rasterized at SdfRasterSize; the caller scales the quad
         var key = new GlyphKey(fontPath, SdfRasterSize, character, charCode);
         if (_glyphs.TryGetValue(key, out var existing))
@@ -133,6 +147,35 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         if (skipUnflushed && result.Width > 0)
             return result with { Width = 0 };
         return result;
+    }
+
+    /// <summary>
+    /// If a disk cache is configured and we haven't yet imported <paramref name="fontPath"/>'s
+    /// entries this session, read every cached SDF bitmap for the font and insert it into
+    /// the atlas. Each loaded glyph goes through <see cref="InsertRasterized"/> — same
+    /// path a freshly rasterized one would take — so it shows up in <c>_unflushedGlyphs</c>
+    /// for the next <see cref="Flush"/> just like a runtime rasterization would. Loaded
+    /// entries are NOT re-appended to disk (they're already there).
+    /// </summary>
+    private void EnsureFontLoadedFromDisk(string fontPath)
+    {
+        if (_diskCache is null) return;
+        if (!_diskLoadedFonts.Add(fontPath)) return;
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var entries = _diskCache.LoadEntriesForFont(fontPath);
+        if (entries.Count == 0) return;
+
+        var inserted = 0;
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var e = entries[i];
+            var key = new GlyphKey(fontPath, SdfRasterSize, e.Character, e.CharCode);
+            if (_glyphs.ContainsKey(key)) continue;
+            InsertRasterized(key, e.Bitmap);
+            inserted++;
+        }
+        Console.Error.WriteLine($"[SdfDiskCache] {fontPath}: loaded {inserted}/{entries.Count} glyphs in {sw.ElapsedMilliseconds} ms");
     }
 
     public void Flush(VkCommandBuffer cmd)
@@ -226,7 +269,10 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         var bitmap = charCode >= 0
             ? _rasterizer.RasterizeGlyphSdfWithCharCode(key.Font, key.Size, key.Character, (uint)charCode, hint, SdfSpread)
             : _rasterizer.RasterizeGlyphSdf(key.Font, key.Size, key.Character, SdfSpread);
-        return InsertRasterized(key, bitmap);
+        var glyphInfo = InsertRasterized(key, bitmap);
+        // Persist for the next session. AppendGlyph silently skips invalid/empty bitmaps.
+        _diskCache?.AppendGlyph(key.Font, charCode, key.Character, hint, in bitmap);
+        return glyphInfo;
     }
 
     /// <summary>
@@ -312,6 +358,20 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     {
         if (keys.Count == 0) return;
 
+        // Phase 0: warm the disk cache for every font referenced in this batch. Each call
+        // is idempotent (single load per font per session) and bulk-inserts cached glyphs
+        // into _glyphs, so Phase 1's "is it cached?" check will hit them automatically.
+        if (_diskCache is not null)
+        {
+            string? lastFont = null;
+            foreach (var (font, _, _, _) in keys)
+            {
+                if (ReferenceEquals(lastFont, font)) continue; // cheap consecutive-dup skip
+                EnsureFontLoadedFromDisk(font);
+                lastFont = font;
+            }
+        }
+
         // Phase 1: identify keys that need rasterization (not already cached, not whitespace).
         // Whitespace and already-cached entries are handled separately.
         var toRasterize = new List<(GlyphKey AtlasKey, int CharCode, GlyphMapHint Hint)>(keys.Count);
@@ -342,6 +402,26 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         // are not thread-safe and Grow() must run in isolation.
         for (var i = 0; i < toRasterize.Count; i++)
             InsertRasterized(toRasterize[i].AtlasKey, bitmaps[i]);
+
+        // Phase 3b: persist newly rasterized glyphs to disk, grouped by font path
+        // so the disk cache only opens each per-font file once. Whole-batch flush
+        // is a single Write call per entry plus one fsync per file.
+        if (_diskCache is not null && toRasterize.Count > 0)
+        {
+            var byFont = new Dictionary<string, List<(int, Rune, GlyphMapHint, SdfGlyphBitmap)>>();
+            for (var i = 0; i < toRasterize.Count; i++)
+            {
+                var (atlasKey, charCode, hint) = toRasterize[i];
+                if (!byFont.TryGetValue(atlasKey.Font, out var list))
+                {
+                    list = new List<(int, Rune, GlyphMapHint, SdfGlyphBitmap)>();
+                    byFont[atlasKey.Font] = list;
+                }
+                list.Add((charCode, atlasKey.Character, hint, bitmaps[i]));
+            }
+            foreach (var (font, list) in byFont)
+                _diskCache.AppendGlyphs(font, list);
+        }
 
         // Phase 4: handle whitespace keys through the normal serial path (they recurse
         // into GetGlyph for the reference glyph and so can't go through the parallel
