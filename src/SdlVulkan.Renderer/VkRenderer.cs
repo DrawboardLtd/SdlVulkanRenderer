@@ -26,13 +26,13 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // SDF batches share a single fontSize (drives edge-softness push constant).
     private float _glyphBatchFontSize;
 
-    public VkRenderer(VulkanContext ctx, uint width, uint height) : base(ctx)
+    public VkRenderer(VulkanContext ctx, uint width, uint height, SdfGlyphDiskCache? sdfDiskCache = null) : base(ctx)
     {
         _width = width;
         _height = height;
         _pipelines = VkPipelineSet.Create(ctx);
         _fontAtlas = new VkFontAtlas(ctx);
-        _sdfFontAtlas = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer);
+        _sdfFontAtlas = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache);
         UpdateProjection();
     }
 
