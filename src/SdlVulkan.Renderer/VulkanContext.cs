@@ -418,14 +418,18 @@ public sealed unsafe partial class VulkanContext : IDisposable
 
         var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, _inFlightFences[_currentFrame]);
         RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
-        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) returns VK_ERROR_INITIALIZATION_FAILED from
-        // vkQueueSubmit on essentially every frame, yet the submitted work still executes and the fence +
-        // semaphore are signaled normally (visuals are correct; the next BeginFrame's fence wait and this
-        // frame's present-wait both proceed). INITIALIZATION_FAILED is not even a spec-legal return for
-        // vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST are), so it cannot
-        // denote a real resource failure here — it is a benign driver quirk. Tolerate it and proceed to
-        // present, instead of throwing → rebuilding the swapchain every single frame (a 100%-of-frames
-        // recovery storm that halved throughput). Genuinely fatal codes still throw via CheckResult.
+        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) can return VK_ERROR_INITIALIZATION_FAILED from
+        // vkQueueSubmit even though the work executes and the fence + semaphore signal normally. That is not
+        // a spec-legal return for vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST
+        // are), so it can NEVER denote a real failure here — a genuine failure arrives as one of those and
+        // still throws via CheckResult below.
+        //
+        // The ROOT CAUSE of the per-frame storm was an unsynchronized atlas image swap in
+        // VkSdfFontAtlas.Grow / VkFontAtlas.Grow (fixed there with a vkDeviceWaitIdle before the swap). This
+        // tolerance is KEPT DELIBERATELY as defense-in-depth: it's free, it cannot mask a real error, and it
+        // breaks the throw -> rebuild-swapchain-every-frame feedback loop for ANY other latent trigger (that
+        // recovery churn was itself what sustained the storm). The RenderDiag.Vk call above still logs every
+        // occurrence in DEBUG, so a new trigger stays visible without freezing the app.
         if (submitResult != VkResult.ErrorInitializationFailed)
             submitResult.CheckResult();
 

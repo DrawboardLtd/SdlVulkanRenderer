@@ -314,6 +314,13 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         }
 
         var api = _ctx.DeviceApi;
+        // Drain the GPU before swapping the atlas image — same in-flight use-after-free + in-use-descriptor
+        // hazard as VkSdfFontAtlas.Grow: with MaxFramesInFlight=2, frame N-1 may still be sampling the old
+        // image through this descriptor when frame N grows, and the Adreno X1-85 punishes that by failing
+        // the next vkQueueSubmit. This was historically masked by the per-Flush vkDeviceWaitIdle that the
+        // upload-ring refactor removed — that drain ran every frame, so it had been incidentally protecting
+        // Grow too. Grows are rare (the atlas only doubles), so a targeted device idle here is cheap.
+        api.vkDeviceWaitIdle();
         api.vkDestroyImageView(_imageView);
         api.vkDestroyImage(_image);
         api.vkFreeMemory(_imageMemory);
