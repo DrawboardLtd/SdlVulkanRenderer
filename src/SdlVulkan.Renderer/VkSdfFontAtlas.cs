@@ -508,6 +508,14 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         }
 
         var api = _ctx.DeviceApi;
+        // Drain the GPU before swapping the atlas image. BeginFrame only waited on the fence from
+        // MaxFramesInFlight-2 frames ago, so frame N-1 may still be in flight — sampling THIS image
+        // through THIS descriptor set. Destroying the image / rebinding the descriptor underneath it is a
+        // use-after-free + in-use-descriptor hazard: lenient desktop drivers tolerate it, but the Adreno
+        // X1-85 tiler responds by failing the next vkQueueSubmit (the INITIALIZATION_FAILED storm we
+        // chased — it began on the frame right after the first grow). Grows are rare (a handful per
+        // session, the atlas only doubles), so a full device idle here is cheap insurance.
+        api.vkDeviceWaitIdle();
         api.vkDestroyImageView(_imageView);
         api.vkDestroyImage(_image);
         api.vkFreeMemory(_imageMemory);
