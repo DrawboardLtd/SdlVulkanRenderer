@@ -31,6 +31,22 @@ public sealed unsafe partial class VulkanContext : IDisposable
     public VkDescriptorSet DescriptorSet { get; private set; }
     public VkPipelineLayout PipelineLayout { get; }
 
+    private uint _maxImageDimension2D;
+    /// <summary>Device <c>maxImageDimension2D</c> limit (queried lazily, then cached). Consumers cap
+    /// atlas/texture sizes against this so they never request an image larger than the GPU allows.</summary>
+    public uint MaxImageDimension2D
+    {
+        get
+        {
+            if (_maxImageDimension2D == 0)
+            {
+                InstanceApi.vkGetPhysicalDeviceProperties(PhysicalDevice, out var props);
+                _maxImageDimension2D = props.limits.maxImageDimension2D;
+            }
+            return _maxImageDimension2D;
+        }
+    }
+
     // Swapchain state
     public VkSwapchainKHR Swapchain { get; private set; }
     public VkFormat SwapchainFormat { get; private set; }

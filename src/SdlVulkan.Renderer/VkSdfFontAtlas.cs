@@ -35,9 +35,11 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     // ~1450 glyphs; a glyph-heavy structural drawing (several embedded fonts + symbols) needs
     // ~1500+, which thrashed the 4096² cap — constant EvictAll → caption flicker AND repeated
     // synchronous glyph reloads on the render thread → page-change stalls. 8192² (~5800 glyphs,
-    // ~67 MB R8 when grown) holds the working set with headroom. Requires device
-    // maxImageDimension2D ≥ 8192 (Adreno X1-85 reports 16384).
+    // ~67 MB R8 when grown) holds the working set with headroom. The effective cap (_maxAtlasSize)
+    // is clamped to the device's maxImageDimension2D so this is safe on every GPU / consumer.
     private const int MaxAtlasSize = 8192;
+    // MaxAtlasSize clamped to the device limit (set in the ctor). Use this, not the const, for grows.
+    private readonly int _maxAtlasSize;
     private const float SdfSpread = 4f;
 
     /// <summary>
@@ -109,6 +111,8 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         _ctx = ctx;
         _rasterizer = rasterizer;
         _diskCache = diskCache;
+        // Desired cap, but never larger than the GPU can allocate.
+        _maxAtlasSize = Math.Min(MaxAtlasSize, (int)ctx.MaxImageDimension2D);
         _atlasWidth = initialWidth;
         _atlasHeight = initialHeight;
         _staging = new byte[initialWidth * initialHeight]; // 1 byte per pixel
@@ -311,7 +315,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
 
         if (_cursorY + glyphHeight > _atlasHeight)
         {
-            if (_atlasWidth < MaxAtlasSize || _atlasHeight < MaxAtlasSize)
+            if (_atlasWidth < _maxAtlasSize || _atlasHeight < _maxAtlasSize)
             {
                 Grow();
                 return InsertRasterized(key, bitmap);
@@ -454,8 +458,8 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         var oldWidth = _atlasWidth;
         var oldHeight = _atlasHeight;
 
-        _atlasWidth = Math.Min(_atlasWidth * 2, MaxAtlasSize);
-        _atlasHeight = Math.Min(_atlasHeight * 2, MaxAtlasSize);
+        _atlasWidth = Math.Min(_atlasWidth * 2, _maxAtlasSize);
+        _atlasHeight = Math.Min(_atlasHeight * 2, _maxAtlasSize);
 
         var newStaging = new byte[_atlasWidth * _atlasHeight];
         for (var row = 0; row < oldHeight; row++)
