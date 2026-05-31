@@ -31,7 +31,13 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     private readonly SdfGlyphDiskCache? _diskCache;
     private readonly HashSet<string> _diskLoadedFonts = new();
 
-    private const int MaxAtlasSize = 4096;
+    // The SDF atlas grows by doubling up to this cap. At 128px raster a 4096² atlas holds only
+    // ~1450 glyphs; a glyph-heavy structural drawing (several embedded fonts + symbols) needs
+    // ~1500+, which thrashed the 4096² cap — constant EvictAll → caption flicker AND repeated
+    // synchronous glyph reloads on the render thread → page-change stalls. 8192² (~5800 glyphs,
+    // ~67 MB R8 when grown) holds the working set with headroom. Requires device
+    // maxImageDimension2D ≥ 8192 (Adreno X1-85 reports 16384).
+    private const int MaxAtlasSize = 8192;
     private const float SdfSpread = 4f;
 
     /// <summary>
@@ -160,7 +166,15 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     private void EnsureFontLoadedFromDisk(string fontPath)
     {
         if (_diskCache is null) return;
-        if (!_diskLoadedFonts.Add(fontPath)) return;
+        if (_diskLoadedFonts.Contains(fontPath)) return;
+        // Don't commit the "loaded" guard until the cache can actually resolve this font's hash. For a
+        // "mem:" subset font that means RegisterMemoryFont must have run first; if it hasn't yet (the
+        // resolver registers during parse, which can race the first glyph use), bail WITHOUT marking —
+        // so a later call retries once the font is registered. Previously we marked unconditionally,
+        // so a single premature call permanently blocked the disk load → every glyph re-rasterized and
+        // re-appended each session (the 2.7× .sdfg duplication + a needless ~1s cold rasterize pass).
+        if (!_diskCache.HasHashFor(fontPath)) return;
+        _diskLoadedFonts.Add(fontPath);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var entries = _diskCache.LoadEntriesForFont(fontPath);
@@ -302,6 +316,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
                 Grow();
                 return InsertRasterized(key, bitmap);
             }
+            // Log once per full-episode (not per rejected glyph) — under thrash this fires every frame.
+            if (!_needsEviction)
+                RenderDiag.Log("sdf.full", $"atlas full {_atlasWidth}x{_atlasHeight} glyphs={_glyphs.Count} — will evict next frame");
             _needsEviction = true;
             return default;
         }
@@ -468,11 +485,19 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
 
         _dirtyX0 = 0; _dirtyY0 = 0;
         _dirtyX1 = _atlasWidth; _dirtyY1 = _atlasHeight;
+        RenderDiag.Log("sdf.grow", $"{oldWidth}x{oldHeight}->{_atlasWidth}x{_atlasHeight} glyphs={_glyphs.Count}");
     }
 
     private void EvictAll()
     {
+        RenderDiag.Log("sdf.evict", $"wiping {_glyphs.Count} glyphs at {_atlasWidth}x{_atlasHeight}");
         _glyphs.Clear();
+        // Clear the disk-loaded guard too: after eviction the next use of a font should RE-LOAD its
+        // cached glyphs from disk (cheap bulk read) instead of re-rasterizing each (~10ms) AND
+        // re-appending them as duplicates. Leaving this set meant every eviction cycle re-rasterized
+        // every glyph and grew the .sdfg file — the source of the observed 2.7× disk duplication and
+        // the repeated large atlas flushes that fragment the LOH.
+        _diskLoadedFonts.Clear();
         _cursorX = 0; _cursorY = 0; _rowHeight = 0;
         _staging = new byte[_atlasWidth * _atlasHeight];
         _dirtyX0 = 0; _dirtyY0 = 0;

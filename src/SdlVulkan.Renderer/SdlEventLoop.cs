@@ -17,6 +17,14 @@ public sealed class SdlEventLoop(SdlVulkanWindow window, VkRenderer renderer)
     private bool _needsRedraw = true;
     private bool _running;
     private float _mouseX, _mouseY;
+
+    // Swapchain-recovery storm tracking. When the GPU keeps throwing mid-frame (e.g. the swapchain's
+    // WSI allocations get evicted under memory pressure), naive recovery re-submits ~14×/s, which
+    // hammers the GPU and compounds the pressure into a permanent freeze. We cap the retry rate with
+    // an increasing backoff and skip re-notifying OnResize when the window size hasn't actually changed.
+    private long _lastRecoverTick;
+    private int _recoverStreak;
+    private uint _lastRecoverW, _lastRecoverH;
     private ulong _lastMouseRedrawCounter;
     private static readonly ulong MouseRedrawInterval = GetPerformanceFrequency() / 30; // ~30fps
 
@@ -275,13 +283,33 @@ public sealed class SdlEventLoop(SdlVulkanWindow window, VkRenderer renderer)
                 Console.Error.WriteLine($"[SdlEventLoop] Vulkan error mid-frame: {vk.Result}. Recovering swapchain.");
                 try
                 {
+                    // Track consecutive recoveries (errors within 1s of each other) so we can back off
+                    // a runaway recover→fail→recover loop instead of spinning at frame rate.
+                    var now = Environment.TickCount64;
+                    _recoverStreak = (now - _lastRecoverTick < 1000) ? _recoverStreak + 1 : 0;
+                    _lastRecoverTick = now;
+
                     window.GetSizeInPixels(out var sw, out var sh);
                     if (sw > 0 && sh > 0)
                     {
                         renderer.RecoverFromGpuError();
-                        OnResize?.Invoke((uint)sw, (uint)sh);
+                        // Only re-run layout when the size actually changed — during a recovery storm
+                        // the size is unchanged, and re-notifying every cycle is pure churn.
+                        if ((uint)sw != _lastRecoverW || (uint)sh != _lastRecoverH)
+                        {
+                            OnResize?.Invoke((uint)sw, (uint)sh);
+                            _lastRecoverW = (uint)sw;
+                            _lastRecoverH = (uint)sh;
+                        }
                     }
                     _needsRedraw = true;
+
+                    // If recovery keeps failing, throttle the retry rate with an increasing sleep (capped
+                    // at 1s) so we don't hammer the GPU. The loop still polls events between attempts, so
+                    // the window stays closable. fix to VkFontAtlas removes the usual SOURCE of these
+                    // errors; this is the safety net for genuine memory-pressure / device-loss storms.
+                    if (_recoverStreak >= 4)
+                        System.Threading.Thread.Sleep((int)Math.Min(1000, 100 * (_recoverStreak - 3)));
                 }
                 catch (Exception inner)
                 {

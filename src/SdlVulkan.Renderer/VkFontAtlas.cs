@@ -31,6 +31,16 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     private int _dirtyX0, _dirtyY0, _dirtyX1, _dirtyY1;
     private bool _needsEviction;
 
+    // Set whenever CreateImage allocates a fresh VkImage (initial + every Grow). The image starts
+    // in VK_IMAGE_LAYOUT_UNDEFINED; the first Flush must transition from there. Previously CreateImage
+    // did this via ctx.ExecuteOneShot — a SECOND vkQueueSubmit to the graphics queue while the frame's
+    // command buffer is already recording (CreateImage runs inside Grow → RasterizeGlyph → OnPreFlush,
+    // which is after vkBeginCommandBuffer). Some drivers (Nvidia/Intel) then return
+    // VK_ERROR_INITIALIZATION_FAILED from the next vkQueueSubmit, which spins the swapchain-recovery
+    // loop. Deferring the transition into the frame's own command buffer (as VkSdfFontAtlas does)
+    // avoids the side-submit entirely.
+    private bool _needsInitialTransition;
+
     private VkImage _image;
     private VkDeviceMemory _imageMemory;
     private VkImageView _imageView;
@@ -158,7 +168,12 @@ internal sealed unsafe class VkFontAtlas : IDisposable
             Buffer.MemoryCopy(pRgba, mapped, bufferSize, bufferSize);
         _ctx.DeviceApi.vkUnmapMemory(_uploadMemories[slot]);
 
-        VulkanHelpers.TransitionImageLayout(_ctx.DeviceApi, cmd, _image, VkImageLayout.ShaderReadOnlyOptimal, VkImageLayout.TransferDstOptimal);
+        // First Flush after CreateImage: the image is still in Undefined layout, so transition from
+        // there (a fresh image has no prior contents to preserve). Subsequent flushes come from
+        // ShaderReadOnly. This replaces the side-submit that CreateImage used to do.
+        var srcLayout = _needsInitialTransition ? VkImageLayout.Undefined : VkImageLayout.ShaderReadOnlyOptimal;
+        VulkanHelpers.TransitionImageLayout(_ctx.DeviceApi, cmd, _image, srcLayout, VkImageLayout.TransferDstOptimal);
+        _needsInitialTransition = false;
 
         VkBufferImageCopy region = new()
         {
@@ -346,8 +361,9 @@ internal sealed unsafe class VkFontAtlas : IDisposable
         api.vkAllocateMemory(&allocInfo, null, out _imageMemory).CheckResult();
         api.vkBindImageMemory(_image, _imageMemory, 0);
 
-        _ctx.ExecuteOneShot(cmd =>
-            VulkanHelpers.TransitionImageLayout(api, cmd, _image, VkImageLayout.Undefined, VkImageLayout.ShaderReadOnlyOptimal));
+        // Defer the Undefined→ShaderReadOnly transition into the next Flush (the frame's own command
+        // buffer) instead of side-submitting here — see _needsInitialTransition above.
+        _needsInitialTransition = true;
 
         var viewCI = new VkImageViewCreateInfo(
             _image, VkImageViewType.Image2D, VkFormat.R8G8B8A8Unorm,

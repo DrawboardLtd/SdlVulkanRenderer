@@ -387,7 +387,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
             pSignalSemaphores = &signalSemaphore
         };
 
-        DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, _inFlightFences[_currentFrame]).CheckResult();
+        var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, _inFlightFences[_currentFrame]);
+        RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
+        submitResult.CheckResult();
 
         var swapchain = Swapchain;
         var imageIndex = _currentImageIndex;

@@ -52,9 +52,32 @@ public sealed class SdfGlyphDiskCache : IDisposable
     // (anything from a PDF) would skip the disk cache entirely.
     private readonly ConcurrentDictionary<string, ulong> _memoryFontHashes = new();
     // Lazy<> guarantees single-init per font even under concurrent first-access — avoids
-    // racing two FileStreams open in append mode and writing duplicate headers.
+    // racing two FileStreams open in append mode and writing duplicate headers. With the
+    // background writer below, this is now only touched on the writer thread.
     private readonly ConcurrentDictionary<string, Lazy<FileStream?>> _appendStreams = new();
-    private bool _disposed;
+    private volatile bool _disposed;
+
+    // All disk WRITES run on this single background thread, so the render thread never blocks on
+    // Write()/Flush() (the fsync is the cold-open hitch). AppendGlyph/AppendGlyphs serialize the
+    // entry in-memory on the caller's thread (cheap, no I/O) and hand the bytes off to the queue;
+    // the writer owns the FileStreams and coalesces fsyncs. Reads stay synchronous on the caller —
+    // a read happens once per font on first use, before any write for that font, so they never race.
+    // Bounded so a slow disk / memory pressure can't let the queue grow without limit (~1024 × ~2 KB
+    // ≈ 2 MB cap). TryAdd never blocks the caller; on overflow the glyph is dropped (re-rasterized
+    // next session). The disk cache is best-effort by design.
+    private const int WriteQueueCapacity = 1024;
+    private readonly BlockingCollection<(string Font, byte[] Bytes)> _writeQueue = new(WriteQueueCapacity);
+    private readonly Thread _writerThread;
+    // Set if the writer thread dies (any non-IOException) so producers stop enqueuing into a dead queue.
+    private volatile bool _writerDead;
+    private long _droppedWrites;
+
+    private volatile bool _pauseWrites;
+
+    /// <summary>When true, appends no-op — the host sets this under critical memory pressure so this
+    /// session's glyph rasterizations aren't written to disk (no write traffic competing with OS swap).
+    /// Glyphs still render from the in-memory atlas; they just won't be persisted for next session.</summary>
+    public bool PauseWrites { get => _pauseWrites; set => _pauseWrites = value; }
 
     public SdfGlyphDiskCache(string cacheDir, float rasterSize, float spread)
     {
@@ -62,6 +85,8 @@ public sealed class SdfGlyphDiskCache : IDisposable
         RasterSize = rasterSize;
         Spread = spread;
         Directory.CreateDirectory(cacheDir);
+        _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "SdfGlyphDiskWriter" };
+        _writerThread.Start();
     }
 
     /// <summary>
@@ -83,6 +108,11 @@ public sealed class SdfGlyphDiskCache : IDisposable
     /// if no cache exists, the file is corrupted, the header parameters (raster size,
     /// spread) don't match this session, or the font file is missing/unreadable.
     /// </summary>
+    /// <summary>True once a content hash is resolvable for this font id — i.e. a file font that exists,
+    /// or a <c>mem:</c> id that has been registered via <see cref="RegisterMemoryFont"/>. Callers use
+    /// this to avoid committing a font to a "already loaded" guard before its bytes are even available.</summary>
+    public bool HasHashFor(string fontPath) => !_disposed && TryGetFontHash(fontPath, out _);
+
     public IReadOnlyList<DiskGlyphEntry> LoadEntriesForFont(string fontPath)
     {
         if (_disposed) return [];
@@ -109,49 +139,102 @@ public sealed class SdfGlyphDiskCache : IDisposable
     /// </summary>
     public void AppendGlyph(string fontPath, int charCode, Rune character, GlyphMapHint hint, in SdfGlyphBitmap bitmap)
     {
-        if (_disposed) return;
+        if (_disposed || PauseWrites) return;
         if (!IsAppendable(in bitmap)) return;
-        if (!TryGetFontHash(fontPath, out _)) return;
-
-        var stream = GetOrOpenAppendStream(fontPath);
-        if (stream is null) return;
-
-        try
-        {
-            WriteEntry(stream, charCode, character, hint, in bitmap);
-            stream.Flush();
-        }
-        catch (IOException)
-        {
-            // Disk full, lock contention, etc. Caching is best-effort.
-        }
+        // Serialize in-memory on the caller (cheap), hand off to the writer thread. The font-hash
+        // resolution + file open happen on the writer thread (OpenStream), keeping the caller's
+        // thread free of any disk I/O — including the first-use font-hash file read.
+        Enqueue(fontPath, SerializeEntry(charCode, character, hint, in bitmap));
     }
 
     /// <summary>
     /// Batch append for use after a parallel rasterization pass. Same per-entry filtering
-    /// as <see cref="AppendGlyph"/> — small or null bitmaps are silently skipped.
+    /// as <see cref="AppendGlyph"/> — small or null bitmaps are silently skipped. The whole
+    /// batch is packed into one buffer so the writer thread takes a single hand-off.
     /// </summary>
     public void AppendGlyphs(string fontPath, IReadOnlyList<(int CharCode, Rune Character, GlyphMapHint Hint, SdfGlyphBitmap Bitmap)> entries)
     {
-        if (_disposed || entries.Count == 0) return;
-        if (!TryGetFontHash(fontPath, out _)) return;
+        if (_disposed || PauseWrites || entries.Count == 0) return;
 
-        var stream = GetOrOpenAppendStream(fontPath);
-        if (stream is null) return;
+        using var ms = new MemoryStream();
+        foreach (var e in entries)
+        {
+            if (!IsAppendable(in e.Bitmap)) continue;
+            var b = SerializeEntry(e.CharCode, e.Character, e.Hint, in e.Bitmap);
+            ms.Write(b, 0, b.Length);
+        }
+        if (ms.Length > 0) Enqueue(fontPath, ms.ToArray());
+    }
 
+    // Hands a serialized payload to the background writer. Never blocks the caller (render thread):
+    // TryAdd drops the glyph if the bounded queue is full or the writer is gone — caching is best-effort.
+    private void Enqueue(string fontPath, byte[] bytes)
+    {
+        if (_disposed || _writerDead || _writeQueue.IsAddingCompleted) return;
         try
         {
-            for (var i = 0; i < entries.Count; i++)
+            if (!_writeQueue.TryAdd((fontPath, bytes)))
             {
-                var e = entries[i];
-                if (!IsAppendable(in e.Bitmap)) continue;
-                WriteEntry(stream, e.CharCode, e.Character, e.Hint, in e.Bitmap);
+                var n = Interlocked.Increment(ref _droppedWrites);
+                // Log only at powers of two so a sustained overflow doesn't spam the console.
+                if ((n & (n - 1)) == 0)
+                    Console.Error.WriteLine($"[SdfDiskCache] write queue full — dropped {n} glyph write(s) (best-effort cache)");
             }
-            stream.Flush();
         }
-        catch (IOException)
+        catch (InvalidOperationException ex)
         {
-            // Best-effort.
+            // CompleteAdding raced with this TryAdd during shutdown — the glyph just won't be cached.
+            Console.Error.WriteLine($"[SdfDiskCache] dropped glyph write during shutdown: {ex.Message}");
+        }
+    }
+
+    // Single consumer of the write queue. Owns the per-font append streams, writes serialized
+    // payloads, and coalesces fsync-free flushes (flush only once we've caught up with the queue).
+    private void WriterLoop()
+    {
+        var dirty = new HashSet<FileStream>();
+        try
+        {
+            foreach (var (font, bytes) in _writeQueue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    var stream = GetOrOpenAppendStream(font);
+                    if (stream is null) continue;
+                    stream.Write(bytes, 0, bytes.Length);
+                    dirty.Add(stream);
+                    if (_writeQueue.Count == 0 && dirty.Count > 0)
+                    {
+                        foreach (var s in dirty) s.Flush();
+                        dirty.Clear();
+                    }
+                }
+                catch (IOException ex)
+                {
+                    // Disk full, lock contention, etc. Caching is best-effort.
+                    Console.Error.WriteLine($"[SdfDiskCache] write failed for {font}: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // A non-IOException (OOM, ObjectDisposed, etc.) would otherwise kill this thread silently
+            // and leave producers enqueuing into a queue with no consumer → unbounded heap growth.
+            // Mark dead and complete the queue so Enqueue() short-circuits.
+            Console.Error.WriteLine($"[SdfDiskCache] writer thread died: {ex.GetType().Name}: {ex.Message}");
+            _writerDead = true;
+            // Dispose() only disposes the queue after Join()ing this thread, so CompleteAdding is safe
+            // here (and is idempotent if Dispose already called it).
+            _writeQueue.CompleteAdding();
+        }
+        finally
+        {
+            // Drain: flush + close every open stream so the last burst is durable.
+            foreach (var lazy in _appendStreams.Values)
+            {
+                try { if (lazy.IsValueCreated) lazy.Value?.Dispose(); }
+                catch (IOException ex) { Console.Error.WriteLine($"[SdfDiskCache] stream close failed: {ex.Message}"); }
+            }
         }
     }
 
@@ -159,15 +242,11 @@ public sealed class SdfGlyphDiskCache : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var lazy in _appendStreams.Values)
-        {
-            try
-            {
-                if (lazy.IsValueCreated) lazy.Value?.Dispose();
-            }
-            catch { /* swallow on shutdown */ }
-        }
-        _appendStreams.Clear();
+        _writeQueue.CompleteAdding();
+        // Let the writer drain the queue and close the files. Bounded so a stuck disk can't hang exit.
+        try { _writerThread.Join(TimeSpan.FromSeconds(5)); }
+        catch (Exception ex) { Console.Error.WriteLine($"[SdfDiskCache] writer join failed: {ex.Message}"); }
+        _writeQueue.Dispose();
     }
 
     private static bool IsAppendable(in SdfGlyphBitmap bitmap)
@@ -236,7 +315,9 @@ public sealed class SdfGlyphDiskCache : IDisposable
         fs.Write(hdr);
     }
 
-    private static void WriteEntry(FileStream fs, int charCode, Rune character, GlyphMapHint hint, in SdfGlyphBitmap bitmap)
+    // Serializes one glyph entry to a self-contained byte buffer (length-prefixed). Runs on the
+    // caller's thread (pure in-memory) so the writer thread only does the actual disk write.
+    private static byte[] SerializeEntry(int charCode, Rune character, GlyphMapHint hint, in SdfGlyphBitmap bitmap)
     {
         var alphaLen = bitmap.Width * bitmap.Height;
         // entryLen prefix covers everything after itself: 32-byte metadata block + alpha pixels.
@@ -255,7 +336,7 @@ public sealed class SdfGlyphDiskCache : IDisposable
         BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(28, 4), bitmap.BearingX);
         BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(32, 4), bitmap.BearingY);
         bitmap.Alpha.AsSpan(0, alphaLen).CopyTo(sp.Slice(36, alphaLen));
-        fs.Write(buf, 0, buf.Length);
+        return buf;
     }
 
     private List<DiskGlyphEntry> ReadFile(FileStream fs, ulong expectedFontHash)
