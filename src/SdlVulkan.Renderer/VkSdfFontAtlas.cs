@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using DIR.Lib;
 using Vortice.Vulkan;
@@ -30,6 +31,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     // document near-instant after the first session.
     private readonly SdfGlyphDiskCache? _diskCache;
     private readonly HashSet<string> _diskLoadedFonts = new();
+    // Completed background .sdfg reads awaiting render-thread insertion (DrainPendingDiskLoads).
+    // Keeps the (potentially ~100ms) synchronous disk read off the render thread.
+    private readonly ConcurrentQueue<(string Font, IReadOnlyList<DiskGlyphEntry> Entries)> _pendingDiskLoads = new();
 
     // The SDF atlas grows by doubling up to this cap. At 128px raster a 4096² atlas holds only
     // ~1450 glyphs; a glyph-heavy structural drawing (several embedded fonts + symbols) needs
@@ -131,6 +135,25 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             EvictAll();
             _needsEviction = false;
         }
+        DrainPendingDiskLoads();
+    }
+
+    // Inserts glyphs whose .sdfg read completed on a background thread (see EnsureFontLoadedFromDisk).
+    // Render-thread only — InsertRasterized mutates atlas/staging/cursor state.
+    private void DrainPendingDiskLoads()
+    {
+        while (_pendingDiskLoads.TryDequeue(out var load))
+        {
+            var inserted = 0;
+            foreach (var e in load.Entries)
+            {
+                var key = new GlyphKey(load.Font, SdfRasterSize, e.Character, e.CharCode);
+                if (_glyphs.ContainsKey(key)) continue;
+                InsertRasterized(key, e.Bitmap);
+                inserted++;
+            }
+            RenderDiag.Log("sdf.diskload", $"{load.Font}: inserted {inserted}/{load.Entries.Count} (async)");
+        }
     }
 
     /// <summary>
@@ -180,20 +203,24 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         if (!_diskCache.HasHashFor(fontPath)) return;
         _diskLoadedFonts.Add(fontPath);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var entries = _diskCache.LoadEntriesForFont(fontPath);
-        if (entries.Count == 0) return;
-
-        var inserted = 0;
-        for (var i = 0; i < entries.Count; i++)
+        // Read + deserialize the .sdfg on a BACKGROUND thread — a large/old UI-font cache can take
+        // ~100ms, and that must never block the render thread. The decoded entries come back via
+        // _pendingDiskLoads and are inserted into the atlas on the render thread by
+        // DrainPendingDiskLoads(). Glyphs needed before the read lands are rasterized on-demand and
+        // de-duped (by key) when the batch arrives.
+        var cache = _diskCache;
+        Task.Run(() =>
         {
-            var e = entries[i];
-            var key = new GlyphKey(fontPath, SdfRasterSize, e.Character, e.CharCode);
-            if (_glyphs.ContainsKey(key)) continue;
-            InsertRasterized(key, e.Bitmap);
-            inserted++;
-        }
-        Console.Error.WriteLine($"[SdfDiskCache] {fontPath}: loaded {inserted}/{entries.Count} glyphs in {sw.ElapsedMilliseconds} ms");
+            try
+            {
+                var entries = cache.LoadEntriesForFont(fontPath);
+                if (entries.Count > 0) _pendingDiskLoads.Enqueue((fontPath, entries));
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[SdfDiskCache] async load failed for {fontPath}: {ex.Message}");
+            }
+        });
     }
 
     public void Flush(VkCommandBuffer cmd)
