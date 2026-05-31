@@ -16,6 +16,10 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// </summary>
     public const int MaxFramesInFlight = 2;
     private const uint MaxDescriptorSets = 512; // font atlas + textures
+    // Cap the per-frame in-flight fence wait (ns) so a never-signaled fence can't hard-freeze the loop.
+    // 2s is hundreds of times a normal frame; only a stuck GPU / non-signaling driver reaches it, and a
+    // timeout is routed into the same GPU-error recovery the event loop uses (recreate sync + swapchain).
+    private const ulong FenceWaitTimeoutNs = 2_000_000_000UL;
 
     public VkInstance Instance { get; }
     public VkInstanceApi InstanceApi { get; }
@@ -332,7 +336,16 @@ public sealed unsafe partial class VulkanContext : IDisposable
     {
         resized = false;
         var fence = _inFlightFences[_currentFrame];
-        DeviceApi.vkWaitForFences(1, &fence, true, ulong.MaxValue);
+        // Bounded wait. We rely on the submit signaling this fence — including on drivers (Adreno
+        // X1-85) where vkQueueSubmit returns a bogus error yet still signals normally. If a fence is
+        // genuinely never signaled, an unbounded wait here would hard-freeze the loop with no escape,
+        // so cap it and throw on timeout: the event loop's catch routes that into RecoverFromGpuError
+        // (recreate sync objects + swapchain) exactly like a submit failure. A real device-loss comes
+        // back as a negative result (DEVICE_LOST), which CheckResult turns into the same recovery path.
+        var waitResult = DeviceApi.vkWaitForFences(1, &fence, true, FenceWaitTimeoutNs);
+        if (waitResult == VkResult.Timeout)
+            throw new VkException(waitResult, "in-flight fence wait timed out (>2s) — recovering");
+        waitResult.CheckResult();
 
         var result = DeviceApi.vkAcquireNextImageKHR(Swapchain, ulong.MaxValue,
             _imageAvailableSemaphores[_currentFrame], VkFence.Null, out _currentImageIndex);
