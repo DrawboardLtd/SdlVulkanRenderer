@@ -405,7 +405,16 @@ public sealed unsafe partial class VulkanContext : IDisposable
 
         var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, _inFlightFences[_currentFrame]);
         RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
-        submitResult.CheckResult();
+        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) returns VK_ERROR_INITIALIZATION_FAILED from
+        // vkQueueSubmit on essentially every frame, yet the submitted work still executes and the fence +
+        // semaphore are signaled normally (visuals are correct; the next BeginFrame's fence wait and this
+        // frame's present-wait both proceed). INITIALIZATION_FAILED is not even a spec-legal return for
+        // vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST are), so it cannot
+        // denote a real resource failure here — it is a benign driver quirk. Tolerate it and proceed to
+        // present, instead of throwing → rebuilding the swapchain every single frame (a 100%-of-frames
+        // recovery storm that halved throughput). Genuinely fatal codes still throw via CheckResult.
+        if (submitResult != VkResult.ErrorInitializationFailed)
+            submitResult.CheckResult();
 
         var swapchain = Swapchain;
         var imageIndex = _currentImageIndex;
@@ -418,7 +427,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
             pImageIndices = &imageIndex
         };
 
-        DeviceApi.vkQueuePresentKHR(GraphicsQueue, &presentInfo);
+        // Present is intentionally not CheckResult'd — ErrorOutOfDateKHR/SuboptimalKHR on resize are
+        // handled by the next BeginFrame's acquire. Log it (DEBUG only) so we can confirm present is
+        // actually succeeding now that submit no longer throws on the benign Adreno quirk above.
+        var presentResult = DeviceApi.vkQueuePresentKHR(GraphicsQueue, &presentInfo);
+        RenderDiag.Vk("present", presentResult, $"frame={_currentFrame} img={_currentImageIndex}");
         _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
     }
 
