@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DIR.Lib;
 using Vortice.Vulkan;
 using static SDL3.SDL;
@@ -27,6 +28,15 @@ public sealed class SdlEventLoop(SdlVulkanWindow window, VkRenderer renderer)
     private uint _lastRecoverW, _lastRecoverH;
     private ulong _lastMouseRedrawCounter;
     private static readonly ulong MouseRedrawInterval = GetPerformanceFrequency() / 30; // ~30fps
+
+    // Slow-frame diagnostics: a rolling average of real frame time (BeginFrame->EndFrame) plus a
+    // threshold, so ANY stall (atlas evict/grow drain, heavy tessellation, a present hitch) logs one
+    // [rdiag] frame.slow line. This makes jank visible without having to catch a periodically-sampled
+    // frame — the gap that hid the glyph-atlas thrash on big CJK / multi-font documents.
+    private double _frameAvgMs;
+    private const double SlowFrameFloorMs = 40;  // stay quiet below this — normal frames don't log
+    private const double SlowFrameFactor = 3;    // flag a spike that's >3x the rolling average...
+    private const double HardStallMs = 150;      // ...or any outright freeze, regardless of average
 
     // Touch/finger tracking for pinch-to-zoom
     private readonly Dictionary<long, (float X, float Y)> _activeFingers = new();
@@ -251,6 +261,7 @@ public sealed class SdlEventLoop(SdlVulkanWindow window, VkRenderer renderer)
 
             try
             {
+                var frameStart = Stopwatch.GetTimestamp();
                 if (!renderer.BeginFrame(BackgroundColor))
                 {
                     window.GetSizeInPixels(out var sw, out var sh);
@@ -266,6 +277,14 @@ public sealed class SdlEventLoop(SdlVulkanWindow window, VkRenderer renderer)
                 OnRender?.Invoke();
 
                 renderer.EndFrame();
+
+                // Whole-frame time (the BeginFrame atlas evict/grow drain included). Flag a frame
+                // that's over the floor AND a big spike over the rolling average, or any hard freeze.
+                var frameMs = Stopwatch.GetElapsedTime(frameStart).TotalMilliseconds;
+                var prevAvg = _frameAvgMs;
+                _frameAvgMs = prevAvg <= 0 ? frameMs : prevAvg * 0.9 + frameMs * 0.1;
+                if (frameMs > SlowFrameFloorMs && (prevAvg <= 0 || frameMs > prevAvg * SlowFrameFactor || frameMs > HardStallMs))
+                    RenderDiag.Log("frame.slow", $"{frameMs:F0}ms avg={prevAvg:F0}ms");
 
                 if (renderer.FontAtlasDirty)
                     _needsRedraw = true;
