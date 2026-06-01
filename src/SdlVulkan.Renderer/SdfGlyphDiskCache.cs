@@ -31,7 +31,13 @@ public sealed class SdfGlyphDiskCache : IDisposable
 {
     // "SDFG" stored little-endian — visible as the ASCII tag in a hex dump.
     private const uint Magic = 0x47464453;
-    private const uint FormatVersion = 1;
+    // v2: SharpAstro.Fonts fixed EmbeddedSubset glyph selection for raw-keyed (3,0) CJK
+    // subsets (mPDF IPAMincho/IPAGothic etc.). The cached SDF bitmap is keyed by
+    // (charCode, character, hint) but was rasterized from the GID the OLD selection chose —
+    // so v1 caches hold the garbled glyphs. Bumping the version invalidates every stale
+    // .sdfg (header mismatch → truncate + rewrite), forcing a re-rasterize with the fixed
+    // glyph mapping. Bump this whenever the charCode→GID mapping logic changes.
+    private const uint FormatVersion = 2;
     // Header: magic(4) + version(4) + rasterSize(4) + spread(4) + fontHash(8) + reserved(8) = 32 bytes.
     private const int HeaderSize = 32;
     // Per-entry metadata size *after* the 4-byte length prefix:
