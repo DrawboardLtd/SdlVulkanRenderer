@@ -35,6 +35,20 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     // Keeps the (potentially ~100ms) synchronous disk read off the render thread.
     private readonly ConcurrentQueue<(string Font, IReadOnlyList<DiskGlyphEntry> Entries)> _pendingDiskLoads = new();
 
+    // Async SDF rasterization. The ~10ms-per-glyph distance-field computation runs OFF the render
+    // thread: PreRasterizeBatch (and a draw-path miss) claims a key in _rasterizeInFlight, a background
+    // task rasterizes it, and the finished bitmap lands in _pendingRasterized for the render thread to
+    // insert — bounded — in BeginFrame. This keeps the render loop responsive on glyph-heavy (CJK) docs
+    // where the old synchronous prewarm stalled a frame for seconds; glyphs now fill in progressively
+    // over a handful of frames. _rasterizeInFlight dedups: the visible-glyph set is re-offered every
+    // frame, so a key must be rasterized at most once.
+    private readonly ConcurrentDictionary<GlyphKey, byte> _rasterizeInFlight = new();
+    private readonly ConcurrentQueue<(GlyphKey Key, int CharCode, GlyphMapHint Hint, SdfGlyphBitmap Bitmap)> _pendingRasterized = new();
+    // Max glyphs inserted (staging blit + dirty-region upload) per frame from the rasterized queue.
+    // Bounds per-frame upload so a 2000-glyph CJK page drains over ~frames (IsDirty keeps the loop
+    // awake until empty), never in one stall.
+    private const int MaxGlyphInsertsPerFrame = 96;
+
     // The SDF atlas grows by doubling up to this cap. At 128px raster a 4096² atlas holds only
     // ~1450 glyphs; a glyph-heavy structural drawing (several embedded fonts + symbols) needs
     // ~1500+, which thrashed the 4096² cap — constant EvictAll → caption flicker AND repeated
@@ -104,6 +118,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         get
         {
             if (_needsEviction) return true;
+            // Pending async rasterization (or not-yet-inserted results) means the page isn't final —
+            // report dirty so the event loop keeps redrawing and the deferred glyphs pop in.
+            if (!_pendingRasterized.IsEmpty || !_rasterizeInFlight.IsEmpty) return true;
             foreach (var p in _pages)
                 if (p.DirtyX0 < p.DirtyX1 && p.DirtyY0 < p.DirtyY1) return true;
             return false;
@@ -188,6 +205,33 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             _needsEviction = false;
         }
         DrainPendingDiskLoads();
+        DrainPendingRasterized();
+    }
+
+    // Inserts up to MaxGlyphInsertsPerFrame background-rasterized glyphs into the atlas. Render-thread
+    // only (InsertRasterized mutates atlas/staging/cursor). Bounded per frame so the staging blit +
+    // dirty-region upload never spike; the remainder drains on later frames (IsDirty keeps the loop
+    // awake). Newly inserted glyphs are persisted to disk here (the background task only rasterizes).
+    private void DrainPendingRasterized()
+    {
+        var inserted = 0;
+        while (inserted < MaxGlyphInsertsPerFrame && _pendingRasterized.TryDequeue(out var r))
+        {
+            _rasterizeInFlight.TryRemove(r.Key, out _);
+            if (_glyphs.ContainsKey(r.Key)) continue;       // raced with a disk load / duplicate
+            var info = InsertRasterized(r.Key, r.Bitmap);
+            if (info.Width > 0)
+                _diskCache?.AppendGlyph(r.Key.Font, r.CharCode, r.Key.Character, r.Hint, in r.Bitmap);
+            else if (!_needsEviction)
+                // Genuinely blank glyph (empty SDF — InsertRasterized doesn't record those). Cache a
+                // zero sentinel so the draw path / prewarm don't re-queue it every frame — otherwise
+                // _rasterizeInFlight never settles and IsDirty pins the loop in a redraw busy-spin.
+                _glyphs[r.Key] = default;
+            inserted++;
+            // Page cap hit (InsertRasterized set _needsEviction): stop; BeginFrame evicts next frame
+            // and the remaining queued glyphs (or their re-requests) land afterwards.
+            if (_needsEviction) break;
+        }
     }
 
     // Inserts glyphs whose .sdfg read completed on a background thread (see EnsureFontLoadedFromDisk).
@@ -214,7 +258,8 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     public static float GetGlyphScale(float requestedFontSize) => requestedFontSize / SdfRasterSize;
 
     public GlyphInfo GetGlyph(string fontPath, float fontSize, Rune character,
-        bool skipUnflushed = false, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto)
+        bool skipUnflushed = false, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto,
+        bool rasterizeOnMiss = true)
     {
         // First-time use of a font with a disk cache configured: bulk-import every
         // previously-rasterized glyph for it. Idempotent and noop after the first call.
@@ -228,10 +273,45 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
                 return existing with { Width = 0 };
             return existing;
         }
+        if (!rasterizeOnMiss)
+        {
+            // Draw path: NEVER rasterize on the render thread. Queue the glyph for background
+            // rasterization (deduped) and skip drawing it this frame — it appears once the
+            // background result is inserted (DrainPendingRasterized). Width==0 -> caller skips it.
+            // Whitespace carries no ink and is warmed synchronously by PreRasterizeBatch, so it
+            // never needs queuing here.
+            if (!Rune.IsWhiteSpace(character) && _rasterizeInFlight.TryAdd(key, 0))
+                QueueRasterizeAsync(key, charCode, hint);
+            return default;
+        }
         var result = RasterizeGlyph(key, charCode, hint);
         if (skipUnflushed && result.Width > 0)
             return result with { Width = 0 };
         return result;
+    }
+
+    // Rasterize one glyph on a background thread and enqueue the result for render-thread insertion.
+    // Caller must have already claimed the key in _rasterizeInFlight. Used for the rare draw-path miss
+    // (a glyph the per-frame prewarm batch didn't cover); the bulk path is PreRasterizeBatch.
+    private void QueueRasterizeAsync(GlyphKey key, int charCode, GlyphMapHint hint)
+    {
+        Task.Run(() =>
+        {
+            try
+            {
+                var bitmap = charCode >= 0
+                    ? _rasterizer.RasterizeGlyphSdfWithCharCode(key.Font, key.Size, key.Character, (uint)charCode, hint, SdfSpread)
+                    : _rasterizer.RasterizeGlyphSdf(key.Font, key.Size, key.Character, SdfSpread);
+                _pendingRasterized.Enqueue((key, charCode, hint, bitmap));
+            }
+            catch (Exception ex)
+            {
+                // Don't leave the key permanently claimed if rasterization throws — release it so a
+                // later frame can retry; otherwise the glyph would never appear.
+                _rasterizeInFlight.TryRemove(key, out _);
+                Console.Error.WriteLine($"[SdfAtlas] async rasterize failed for '{key.Character}': {ex.Message}");
+            }
+        });
     }
 
     /// <summary>
@@ -482,60 +562,51 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             }
         }
 
-        // Phase 1: identify keys that need rasterization (not already cached, not whitespace).
-        // Whitespace and already-cached entries are handled separately.
-        var toRasterize = new List<(GlyphKey AtlasKey, int CharCode, GlyphMapHint Hint)>(keys.Count);
-        var seenThisBatch = new HashSet<GlyphKey>();
+        // Phase 1: claim the keys that need rasterization (not cached, not whitespace, not already
+        // queued/in-flight). TryAdd both dedups within this batch AND stakes the key, so the SAME
+        // visible-glyph set re-offered next frame doesn't re-rasterize what's already pending.
+        var toRasterize = new List<(GlyphKey AtlasKey, int CharCode, GlyphMapHint Hint)>();
         foreach (var (font, ch, charCode, hint) in keys)
         {
+            if (Rune.IsWhiteSpace(ch)) continue;            // warmed synchronously in Phase 3
             var atlasKey = new GlyphKey(font, SdfRasterSize, ch, charCode);
             if (_glyphs.ContainsKey(atlasKey)) continue;
-            if (Rune.IsWhiteSpace(ch)) continue;          // serial fallback below
-            if (!seenThisBatch.Add(atlasKey)) continue;    // dedup duplicates within the batch
+            if (!_rasterizeInFlight.TryAdd(atlasKey, 0)) continue;
             toRasterize.Add((atlasKey, charCode, hint));
         }
 
-        // Phase 2: parallel SDF rasterization. Each iteration calls into
-        // ManagedFontRasterizer which is documented thread-safe for concurrent
-        // RasterizeGlyphSdf*() calls — it only mutates a ConcurrentDictionary<string, OpenTypeFont>
-        // font cache, and per-glyph rendering allocates only the result bitmap.
-        var bitmaps = new SdfGlyphBitmap[toRasterize.Count];
-        Parallel.For(0, toRasterize.Count, i =>
+        // Phase 2: rasterize OFF the render thread. SDF distance-field computation is the ~10ms/glyph
+        // cost; running it inline here was the multi-second frame stall on glyph-heavy (CJK) pages.
+        // One background task rasterizes the whole batch in parallel (ManagedFontRasterizer is
+        // documented thread-safe — it only touches a ConcurrentDictionary font cache + a per-call
+        // result bitmap) and enqueues each finished bitmap to _pendingRasterized. The render thread
+        // inserts them bounded-per-frame in BeginFrame -> DrainPendingRasterized; IsDirty stays true
+        // until the queue empties, so the loop keeps redrawing and glyphs fill in progressively.
+        // Disk persistence happens at insertion time, not here.
+        if (toRasterize.Count > 0)
         {
-            var (atlasKey, charCode, hint) = toRasterize[i];
-            bitmaps[i] = charCode >= 0
-                ? _rasterizer.RasterizeGlyphSdfWithCharCode(atlasKey.Font, atlasKey.Size, atlasKey.Character, (uint)charCode, hint, SdfSpread)
-                : _rasterizer.RasterizeGlyphSdf(atlasKey.Font, atlasKey.Size, atlasKey.Character, SdfSpread);
-        });
-
-        // Phase 3: serial atlas insertion. Per-page cursor / staging / _glyphs / _unflushedGlyphs
-        // are not thread-safe and page allocation must run in isolation.
-        for (var i = 0; i < toRasterize.Count; i++)
-            InsertRasterized(toRasterize[i].AtlasKey, bitmaps[i]);
-
-        // Phase 3b: persist newly rasterized glyphs to disk, grouped by font path
-        // so the disk cache only opens each per-font file once. Whole-batch flush
-        // is a single Write call per entry plus one fsync per file.
-        if (_diskCache is not null && toRasterize.Count > 0)
-        {
-            var byFont = new Dictionary<string, List<(int, Rune, GlyphMapHint, SdfGlyphBitmap)>>();
-            for (var i = 0; i < toRasterize.Count; i++)
+            var work = toRasterize;
+            Task.Run(() => Parallel.For(0, work.Count, i =>
             {
-                var (atlasKey, charCode, hint) = toRasterize[i];
-                if (!byFont.TryGetValue(atlasKey.Font, out var list))
+                var (atlasKey, charCode, hint) = work[i];
+                try
                 {
-                    list = new List<(int, Rune, GlyphMapHint, SdfGlyphBitmap)>();
-                    byFont[atlasKey.Font] = list;
+                    var bitmap = charCode >= 0
+                        ? _rasterizer.RasterizeGlyphSdfWithCharCode(atlasKey.Font, atlasKey.Size, atlasKey.Character, (uint)charCode, hint, SdfSpread)
+                        : _rasterizer.RasterizeGlyphSdf(atlasKey.Font, atlasKey.Size, atlasKey.Character, SdfSpread);
+                    _pendingRasterized.Enqueue((atlasKey, charCode, hint, bitmap));
                 }
-                list.Add((charCode, atlasKey.Character, hint, bitmaps[i]));
-            }
-            foreach (var (font, list) in byFont)
-                _diskCache.AppendGlyphs(font, list);
+                catch (Exception ex)
+                {
+                    // Release the claim so a later frame can retry; otherwise the glyph never appears.
+                    _rasterizeInFlight.TryRemove(atlasKey, out _);
+                    Console.Error.WriteLine($"[SdfAtlas] batch rasterize failed for '{atlasKey.Character}': {ex.Message}");
+                }
+            }));
         }
 
-        // Phase 4: handle whitespace keys through the normal serial path (they recurse
-        // into GetGlyph for the reference glyph and so can't go through the parallel
-        // phase). This is cheap — whitespace lookups are constant-time once 'n' is cached.
+        // Phase 3: whitespace keys are cheap (their info derives from the 'n' reference glyph) and
+        // need GetGlyph reentry, so warm them synchronously — there are only a handful per font.
         foreach (var (font, ch, charCode, hint) in keys)
         {
             if (Rune.IsWhiteSpace(ch)) GetGlyph(font, SdfRasterSize, ch, charCode: charCode, hint: hint);
@@ -546,6 +617,11 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     {
         RenderDiag.Log("sdf.evict", $"wiping {_glyphs.Count} glyphs across {_pages.Count} page(s)");
         _glyphs.Clear();
+        // Drop pending async rasterization too. A background task still running may enqueue a stale
+        // result afterwards — harmless: DrainPendingRasterized re-checks _glyphs and the key isn't
+        // claimed anymore, so at worst the glyph is re-rasterized once. Re-requested on next draw.
+        _pendingRasterized.Clear();
+        _rasterizeInFlight.Clear();
         // Clear the disk-loaded guard too: after eviction the next use of a font should RE-LOAD its
         // cached glyphs from disk (cheap bulk read) instead of re-rasterizing each (~10ms) AND
         // re-appending them as duplicates. Leaving this set meant every eviction cycle re-rasterized
