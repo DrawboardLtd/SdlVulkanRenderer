@@ -43,14 +43,19 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
     /// <summary>
     /// Multi-window path used by <see cref="SdlVulkanApp"/>: creates a window + surface against an
     /// already-created shared instance. Does not init or quit SDL — the app owns that.
+    /// <paramref name="maximized"/> defaults true (the main window); a torn-out tab passes false so its
+    /// new window opens floating, to be positioned at the cursor.
     /// </summary>
-    internal static SdlVulkanWindow CreateForApp(VkInstance instance, string title, int width, int height)
-        => CreateInternal(instance, title, width, height, ownsSdl: false);
+    internal static SdlVulkanWindow CreateForApp(VkInstance instance, string title, int width, int height,
+        bool maximized = true)
+        => CreateInternal(instance, title, width, height, ownsSdl: false, maximized: maximized);
 
-    private static SdlVulkanWindow CreateInternal(VkInstance instance, string title, int width, int height, bool ownsSdl)
+    private static SdlVulkanWindow CreateInternal(VkInstance instance, string title, int width, int height,
+        bool ownsSdl, bool maximized = true)
     {
-        var window = CreateWindow(title, width, height,
-            WindowFlags.Vulkan | WindowFlags.Resizable | WindowFlags.Maximized);
+        var flags = WindowFlags.Vulkan | WindowFlags.Resizable;
+        if (maximized) flags |= WindowFlags.Maximized;
+        var window = CreateWindow(title, width, height, flags);
         if (window == nint.Zero)
             throw new InvalidOperationException($"SDL_CreateWindow failed: {GetError()}");
 
@@ -100,6 +105,35 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
     {
         var flags = GetWindowFlags(Handle);
         SetWindowFullscreen(Handle, (flags & WindowFlags.Fullscreen) == 0);
+    }
+
+    // --- Window placement / state (used by tab tear-out to float a new window at the cursor) ---
+
+    /// <summary>True if the window is currently maximized.</summary>
+    public bool IsMaximized => (GetWindowFlags(Handle) & WindowFlags.Maximized) != 0;
+
+    /// <summary>Restores the window to its floating (un-maximized / un-minimized) size and position.</summary>
+    public void Restore() => RestoreWindow(Handle);
+
+    /// <summary>Maximizes the window.</summary>
+    public void Maximize() => MaximizeWindow(Handle);
+
+    /// <summary>Sets the window's top-left position in desktop coordinates.</summary>
+    public void SetPosition(int x, int y) => SetWindowPosition(Handle, x, y);
+
+    /// <summary>Gets the window's top-left position in desktop coordinates.</summary>
+    public void GetPosition(out int x, out int y) => GetWindowPosition(Handle, out x, out y);
+
+    /// <summary>Sets the window's logical (point) size.</summary>
+    public void SetSize(int width, int height) => SetWindowSize(Handle, width, height);
+
+    /// <summary>The global mouse position in desktop coordinates (across all displays), as integer
+    /// pixels. Used to place a torn-out window under the cursor.</summary>
+    public static void GetGlobalMousePosition(out int x, out int y)
+    {
+        GetGlobalMouseState(out var fx, out var fy);
+        x = (int)fx;
+        y = (int)fy;
     }
 
     // SDL cursor functions are documented as main-thread-only, so concurrent
