@@ -43,18 +43,25 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
     /// <summary>
     /// Multi-window path used by <see cref="SdlVulkanApp"/>: creates a window + surface against an
     /// already-created shared instance. Does not init or quit SDL — the app owns that.
-    /// <paramref name="maximized"/> defaults true (the main window); a torn-out tab passes false so its
-    /// new window opens floating, to be positioned at the cursor.
+    /// <paramref name="maximized"/> defaults true (the main window). A tab being torn out is dragged as
+    /// a small <paramref name="borderless"/> + <paramref name="alwaysOnTop"/> + non-<paramref
+    /// name="focusable"/> "chip" window that <see cref="SetBordered"/>/<see cref="SetAlwaysOnTop"/>-morphs
+    /// into a normal document window on drop.
     /// </summary>
     internal static SdlVulkanWindow CreateForApp(VkInstance instance, string title, int width, int height,
-        bool maximized = true)
-        => CreateInternal(instance, title, width, height, ownsSdl: false, maximized: maximized);
+        bool maximized = true, bool borderless = false, bool alwaysOnTop = false, bool focusable = true)
+        => CreateInternal(instance, title, width, height, ownsSdl: false,
+            maximized: maximized, borderless: borderless, alwaysOnTop: alwaysOnTop, focusable: focusable);
 
     private static SdlVulkanWindow CreateInternal(VkInstance instance, string title, int width, int height,
-        bool ownsSdl, bool maximized = true)
+        bool ownsSdl, bool maximized = true, bool borderless = false, bool alwaysOnTop = false,
+        bool focusable = true)
     {
         var flags = WindowFlags.Vulkan | WindowFlags.Resizable;
         if (maximized) flags |= WindowFlags.Maximized;
+        if (borderless) flags |= WindowFlags.Borderless;
+        if (alwaysOnTop) flags |= WindowFlags.AlwaysOnTop;
+        if (!focusable) flags |= WindowFlags.NotFocusable;
         var window = CreateWindow(title, width, height, flags);
         if (window == nint.Zero)
             throw new InvalidOperationException($"SDL_CreateWindow failed: {GetError()}");
@@ -126,6 +133,17 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
 
     /// <summary>Sets the window's logical (point) size.</summary>
     public void SetSize(int width, int height) => SetWindowSize(Handle, width, height);
+
+    /// <summary>Adds or removes the OS window border/title bar. Used to morph a borderless drag "chip"
+    /// into a normal bordered document window when a torn-out tab is dropped.</summary>
+    public void SetBordered(bool bordered) => SetWindowBordered(Handle, bordered);
+
+    /// <summary>Toggles the always-on-top flag. The drag chip floats on top; dropped, it drops back to
+    /// normal stacking.</summary>
+    public void SetAlwaysOnTop(bool onTop) => SetWindowAlwaysOnTop(Handle, onTop);
+
+    /// <summary>Toggles whether the window is user-resizable.</summary>
+    public void SetResizable(bool resizable) => SetWindowResizable(Handle, resizable);
 
     /// <summary>The global mouse position in desktop coordinates (across all displays), as integer
     /// pixels. Used to place a torn-out window under the cursor.</summary>
