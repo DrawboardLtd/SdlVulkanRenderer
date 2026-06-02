@@ -53,9 +53,9 @@ public sealed class SdlVulkanApp : IDisposable
     /// device from this window's surface. Build the window's context with
     /// <see cref="VulkanContext.CreateForSharedDevice"/> passing <see cref="Device"/>.
     /// </summary>
-    public SdlVulkanWindow CreateWindow(string title, int width, int height)
+    public SdlVulkanWindow CreateWindow(string title, int width, int height, bool maximized = true)
     {
-        var window = SdlVulkanWindow.CreateForApp(Instance, title, width, height);
+        var window = SdlVulkanWindow.CreateForApp(Instance, title, width, height, maximized);
         // The app owns the instance, so the shared device must not destroy it (ownsInstance: false) —
         // it outlives any single device and backs every window's surface.
         _device ??= VulkanDevice.Create(Instance, window.Surface, _msaaSamples, ownsInstance: false);
