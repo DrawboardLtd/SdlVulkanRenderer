@@ -145,6 +145,15 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
     /// <summary>Toggles whether the window is user-resizable.</summary>
     public void SetResizable(bool resizable) => SetWindowResizable(Handle, resizable);
 
+    /// <summary>Toggles whether the window can take input focus. A drag chip is created non-focusable
+    /// (so it doesn't steal focus mid-drag and stays off the taskbar); morphing it into a real document
+    /// window turns this back on so it activates and gets a taskbar button like any normal window.</summary>
+    public void SetFocusable(bool focusable) => SetWindowFocusable(Handle, focusable);
+
+    /// <summary>Brings the window to the front and gives it input focus. Used after a tear-out/relocate
+    /// so the resulting window surfaces where the user dropped it (and isn't lost off-screen/behind).</summary>
+    public void Raise() => RaiseWindow(Handle);
+
     /// <summary>The global mouse position in desktop coordinates (across all displays), as integer
     /// pixels. Used to place a torn-out window under the cursor.</summary>
     public static void GetGlobalMousePosition(out int x, out int y)
