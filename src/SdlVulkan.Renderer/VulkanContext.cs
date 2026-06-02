@@ -119,6 +119,28 @@ public sealed unsafe partial class VulkanContext : IDisposable
         return ctx;
     }
 
+    /// <summary>
+    /// Creates a window context that SHARES an existing <see cref="VulkanDevice"/> rather than
+    /// creating its own. This is the multi-window path: <see cref="SdlVulkanApp"/> builds the device
+    /// once (from the first window's surface) and hands it to every window's context here. The
+    /// context owns only its swapchain / sync / vertex ring / command buffers — not the device, which
+    /// the app disposes after the last window is gone. GPU resources built against the shared device
+    /// (page geometry buffers, image textures) stay valid across all windows that share it, so a
+    /// document session can move between windows without re-uploading them.
+    /// </summary>
+    public static VulkanContext CreateForSharedDevice(VulkanDevice device, VkSurfaceKHR surface,
+        uint width, uint height, uint vertexBufferSize = 4 * 1024 * 1024)
+    {
+        var ctx = new VulkanContext(device, surface, vertexBufferSize, ownsDevice: false);
+
+        ctx.CreateSyncObjects();
+        ctx.AllocateCommandBuffers();
+        ctx.CreateVertexBuffers();
+        ctx.CreateSwapchain(width, height);
+
+        return ctx;
+    }
+
     // --- Device-level operations, forwarded to the shared VulkanDevice ---
 
     /// <summary>Allocates a new descriptor set from the shared pool with the shared layout.</summary>
@@ -349,6 +371,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
             DeviceApi.vkDestroySemaphore(_renderFinishedSemaphores[i]);
             DeviceApi.vkDestroyFence(_inFlightFences[i]);
         }
+
+        // Return the per-frame command buffers to the shared pool. When this context owns the device
+        // the pool is destroyed just below anyway, but a shared-device window (one of several) must
+        // free them explicitly or they leak until the app tears the device down.
+        fixed (VkCommandBuffer* pCmds = _commandBuffers)
+            DeviceApi.vkFreeCommandBuffers(CommandPool, (uint)_commandBuffers.Length, pCmds);
 
         // The surface is per-window (created against the shared instance). Destroy it before the
         // device tears the instance down. The swapchain that referenced it is already gone above.

@@ -13,7 +13,13 @@ env:
   # frame stall). Internal change to VkSdfFontAtlas + the SDF draw path; the public VkRenderer API
   # is source-compatible (the optional sdfInitialAtlasDim param now sizes a page).
   # 5.1: VkRenderer overrides DIR.Lib's PushClip/PopClip → Vulkan scissor (needs DIR.Lib >= 4.4).
-  VERSION_PREFIX: 5.1.${{ github.run_number }}
+  # Major bump 5.1 -> 6.0: multi-window foundation. Device-level Vulkan state split out of
+  # VulkanContext into a shareable VulkanDevice; new SdlVulkanApp owns SDL + one VkInstance + one
+  # shared device across windows; SdlVulkanWindow gains an app-path factory + WindowId;
+  # VulkanContext.CreateForSharedDevice builds a swapchain against an existing device. Single-window
+  # source-compatible (Create / CreateOffscreen unchanged), but the new app/window/device layering
+  # is the intended multi-window entry point.
+  VERSION_PREFIX: 6.0.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release

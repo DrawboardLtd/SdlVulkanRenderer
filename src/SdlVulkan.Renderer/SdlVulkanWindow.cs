@@ -13,21 +13,42 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
     public VkInstance Instance { get; }
     public VkSurfaceKHR Surface { get; }
 
-    private SdlVulkanWindow(nint handle, VkInstance instance, VkSurfaceKHR surface)
+    /// <summary>The SDL window id this window's events carry (<c>SDL_GetWindowID</c>). Multi-window
+    /// event dispatch routes each SDL event to the matching window by this id.</summary>
+    public uint WindowId { get; }
+
+    // True only for the standalone Create() path, which initialized SDL itself and so must SDL_Quit
+    // on dispose. Windows made via CreateForApp share SdlVulkanApp's SDL lifecycle and must NOT quit
+    // SDL out from under their sibling windows.
+    private readonly bool _ownsSdl;
+
+    private SdlVulkanWindow(nint handle, VkInstance instance, VkSurfaceKHR surface, bool ownsSdl)
     {
         Handle = handle;
         Instance = instance;
         Surface = surface;
+        WindowId = GetWindowID(handle);
+        _ownsSdl = ownsSdl;
     }
 
+    /// <summary>
+    /// Standalone single-window path: initializes SDL, creates the Vulkan instance, then a window +
+    /// surface. The window owns the SDL lifecycle (SDL_Quit on dispose); the instance is torn down by
+    /// the owning <see cref="VulkanContext"/>/<see cref="VulkanDevice"/>. For multiple windows use
+    /// <see cref="SdlVulkanApp"/> instead, which owns one SDL lifecycle + instance + shared device.
+    /// </summary>
     public static SdlVulkanWindow Create(string title, int width, int height)
+        => CreateInternal(InitSdlAndCreateInstance(), title, width, height, ownsSdl: true);
+
+    /// <summary>
+    /// Multi-window path used by <see cref="SdlVulkanApp"/>: creates a window + surface against an
+    /// already-created shared instance. Does not init or quit SDL — the app owns that.
+    /// </summary>
+    internal static SdlVulkanWindow CreateForApp(VkInstance instance, string title, int width, int height)
+        => CreateInternal(instance, title, width, height, ownsSdl: false);
+
+    private static SdlVulkanWindow CreateInternal(VkInstance instance, string title, int width, int height, bool ownsSdl)
     {
-        if (!Init(InitFlags.Video | InitFlags.Events))
-            throw new InvalidOperationException($"SDL_Init failed: {GetError()}");
-
-        VulkanLoadLibrary(null);
-        vkInitialize().CheckResult();
-
         var window = CreateWindow(title, width, height,
             WindowFlags.Vulkan | WindowFlags.Resizable | WindowFlags.Maximized);
         if (window == nint.Zero)
@@ -36,14 +57,26 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
         // Pump events so the window manager processes the maximize before we read pixel size
         PumpEvents();
 
-        var instance = CreateVulkanInstance();
-
-        nint surfaceHandle;
-        if (!VulkanCreateSurface(window, instance.Handle, nint.Zero, out surfaceHandle))
+        if (!VulkanCreateSurface(window, instance.Handle, nint.Zero, out var surfaceHandle))
             throw new InvalidOperationException($"SDL_Vulkan_CreateSurface failed: {GetError()}");
         var surface = new VkSurfaceKHR((ulong)surfaceHandle);
 
-        return new SdlVulkanWindow(window, instance, surface);
+        return new SdlVulkanWindow(window, instance, surface, ownsSdl);
+    }
+
+    /// <summary>
+    /// Initializes SDL (video + events), loads Vulkan, and creates the shared instance. Called once
+    /// by the standalone <see cref="Create"/> path and once by <see cref="SdlVulkanApp.Create"/>.
+    /// </summary>
+    internal static VkInstance InitSdlAndCreateInstance()
+    {
+        if (!Init(InitFlags.Video | InitFlags.Events))
+            throw new InvalidOperationException($"SDL_Init failed: {GetError()}");
+
+        VulkanLoadLibrary(null);
+        vkInitialize().CheckResult();
+
+        return CreateVulkanInstance();
     }
 
     public void GetSizeInPixels(out int w, out int h) => GetWindowSizeInPixels(Handle, out w, out h);
@@ -112,7 +145,11 @@ public sealed unsafe class SdlVulkanWindow : IDisposable
             _cursorCache.Clear();
         }
         DestroyWindow(Handle);
-        Quit();
+
+        // Only the standalone Create() window initialized SDL and may shut it down. App-owned windows
+        // leave SDL_Quit to SdlVulkanApp, so closing one window doesn't tear SDL down for the others.
+        if (_ownsSdl)
+            Quit();
     }
 
     private static VkInstance CreateVulkanInstance()
