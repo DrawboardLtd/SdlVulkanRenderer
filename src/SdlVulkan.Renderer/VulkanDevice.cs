@@ -58,6 +58,11 @@ public sealed unsafe class VulkanDevice : IDisposable
 
     // Descriptor pool operations need external synchronization for multi-threaded access
     private readonly Lock _descriptorPoolLock = new();
+    // Whether this device's Dispose also destroys the VkInstance. True on the standalone and
+    // offscreen paths (the device was handed an instance it's expected to tear down). False under
+    // SdlVulkanApp, which owns the instance and shares one device across windows — there the app
+    // destroys the instance after the device is gone.
+    private readonly bool _ownsInstance;
     private bool _disposed;
 
     private VulkanDevice(
@@ -67,8 +72,9 @@ public sealed unsafe class VulkanDevice : IDisposable
         VkCommandPool commandPool, VkRenderPass renderPass,
         VkDescriptorPool descriptorPool, VkDescriptorSetLayout descriptorSetLayout,
         VkDescriptorSet descriptorSet, VkPipelineLayout pipelineLayout,
-        VkSampleCountFlags msaaSamples)
+        VkSampleCountFlags msaaSamples, bool ownsInstance)
     {
+        _ownsInstance = ownsInstance;
         Instance = instance;
         InstanceApi = instanceApi;
         PhysicalDevice = physicalDevice;
@@ -92,7 +98,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// provided they share this instance and the swapchain format/MSAA the render pass bakes in.
     /// </summary>
     public static VulkanDevice Create(VkInstance instance, VkSurfaceKHR surface,
-        VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1)
+        VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1, bool ownsInstance = true)
     {
         var instanceApi = GetApi(instance);
         var physicalDevice = PickPhysicalDevice(instanceApi, surface, out var queueFamily);
@@ -121,7 +127,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         var renderPass = CreateRenderPass(deviceApi, VkFormat.B8G8R8A8Unorm, msaaSamples);
 
         return CreateCommon(instance, instanceApi, physicalDevice, device, deviceApi,
-            graphicsQueue, queueFamily, renderPass, msaaSamples);
+            graphicsQueue, queueFamily, renderPass, msaaSamples, ownsInstance);
     }
 
     /// <summary>
@@ -130,7 +136,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// <c>ColorAttachmentOptimal</c> so the image can be transitioned for readback.
     /// </summary>
     public static VulkanDevice CreateOffscreen(VkInstance instance,
-        VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1)
+        VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1, bool ownsInstance = true)
     {
         var instanceApi = GetApi(instance);
         var physicalDevice = PickPhysicalDeviceOffscreen(instanceApi, out var queueFamily);
@@ -161,7 +167,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         var renderPass = CreateOffscreenRenderPass(deviceApi, VkFormat.B8G8R8A8Unorm, msaaSamples);
 
         return CreateCommon(instance, instanceApi, physicalDevice, device, deviceApi,
-            graphicsQueue, queueFamily, renderPass, msaaSamples);
+            graphicsQueue, queueFamily, renderPass, msaaSamples, ownsInstance);
     }
 
     // Shared tail of both factories: command pool, descriptor pool/layout/set, pipeline layout.
@@ -172,7 +178,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         VkInstance instance, VkInstanceApi instanceApi,
         VkPhysicalDevice physicalDevice, VkDevice device, VkDeviceApi deviceApi,
         VkQueue graphicsQueue, uint queueFamily, VkRenderPass renderPass,
-        VkSampleCountFlags msaaSamples)
+        VkSampleCountFlags msaaSamples, bool ownsInstance)
     {
         // Command pool
         VkCommandPoolCreateInfo poolCI = new()
@@ -242,7 +248,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         return new VulkanDevice(
             instance, instanceApi, physicalDevice, device, deviceApi,
             graphicsQueue, queueFamily, commandPool, renderPass,
-            descriptorPool, descriptorSetLayout, descriptorSet, pipelineLayout, msaaSamples);
+            descriptorPool, descriptorSetLayout, descriptorSet, pipelineLayout, msaaSamples, ownsInstance);
     }
 
     /// <summary>
@@ -393,7 +399,12 @@ public sealed unsafe class VulkanDevice : IDisposable
         DeviceApi.vkDestroyRenderPass(RenderPass);
         DeviceApi.vkDestroyCommandPool(CommandPool);
         DeviceApi.vkDestroyDevice();
-        InstanceApi.vkDestroyInstance();
+
+        // Only destroy the instance if we own it (standalone / offscreen). Under SdlVulkanApp the
+        // instance outlives this device — it backs the surfaces of any sibling windows — so the app
+        // tears it down after the last device is gone.
+        if (_ownsInstance)
+            InstanceApi.vkDestroyInstance();
     }
 
     private static VkPhysicalDevice PickPhysicalDevice(VkInstanceApi instanceApi, VkSurfaceKHR surface, out uint queueFamily)
