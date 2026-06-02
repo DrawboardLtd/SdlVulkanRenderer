@@ -384,6 +384,16 @@ public sealed unsafe class VulkanDevice : IDisposable
         DeviceApi.vkFreeMemory(memory);
     }
 
+    /// <summary>
+    /// Blocks until the device has finished all submitted work on every queue. Because one
+    /// <see cref="VulkanDevice"/> is shared across all of an <see cref="SdlVulkanApp"/>'s windows, this
+    /// is the safe quiesce point before moving a document's GPU resources (persistent vertex buffers,
+    /// image textures) from one window to another — e.g. tearing a tab out into its own window. Once
+    /// this returns, no in-flight command buffer from either window can still reference those resources,
+    /// so re-binding them to the destination window's renderer is race-free.
+    /// </summary>
+    public void WaitIdle() => DeviceApi.vkDeviceWaitIdle();
+
     public void Dispose()
     {
         if (_disposed) return;

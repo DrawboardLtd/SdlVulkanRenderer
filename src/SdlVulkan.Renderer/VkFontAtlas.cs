@@ -14,7 +14,14 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     internal readonly record struct GlyphInfo(float U0, float V0, float U1, float V1, int Width, int Height, float AdvanceX, int BearingX, int BearingY);
 
     private readonly VulkanContext _ctx;
-    internal readonly ManagedFontRasterizer Rasterizer = new();
+    // The glyph rasterizer. Normally this atlas creates and owns it, but a multi-window host injects a
+    // single PROCESS-OWNED rasterizer shared by every window's atlas (and the PDF parser). That shared
+    // instance must outlive any one window — a document tab can be torn out into another window, and its
+    // parser keeps rasterizing through this same instance — so an injected rasterizer is NOT disposed
+    // here (see _ownsRasterizer). Dispose() on this rasterizer only clears its font cache, which would
+    // otherwise pull every registered embedded font out from under a tab that outlived its origin window.
+    internal readonly ManagedFontRasterizer Rasterizer;
+    private readonly bool _ownsRasterizer;
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
@@ -58,9 +65,13 @@ internal sealed unsafe class VkFontAtlas : IDisposable
     public VkImageView ImageView => _imageView;
     public VkSampler Sampler => _sampler;
 
-    public VkFontAtlas(VulkanContext ctx, int initialWidth = 512, int initialHeight = 512)
+    public VkFontAtlas(VulkanContext ctx, ManagedFontRasterizer? rasterizer = null,
+        int initialWidth = 512, int initialHeight = 512)
     {
         _ctx = ctx;
+        // Use the injected (process-owned, shared) rasterizer when given; otherwise create and own one.
+        Rasterizer = rasterizer ?? new ManagedFontRasterizer();
+        _ownsRasterizer = rasterizer is null;
         _atlasWidth = initialWidth;
         _atlasHeight = initialHeight;
         _staging = new byte[initialWidth * initialHeight * 4];
@@ -194,7 +205,10 @@ internal sealed unsafe class VkFontAtlas : IDisposable
 
     public void Dispose()
     {
-        Rasterizer.Dispose();
+        // Only dispose the rasterizer if this atlas created it. An injected shared rasterizer is owned
+        // by the host (it outlives this window — see the Rasterizer field comment).
+        if (_ownsRasterizer)
+            Rasterizer.Dispose();
 
         var api = _ctx.DeviceApi;
 
