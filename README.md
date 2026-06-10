@@ -1,6 +1,6 @@
 # SdlVulkan.Renderer
 
-SDL3 + Vortice.Vulkan rendering library built on [DIR.Lib](https://github.com/SharpAstro/DIR.Lib) primitives.
+SDL3 + Vortice.Vulkan rendering library built on [DIR.Lib](https://github.com/DrawboardLtd/DeviceIndependentRenderingLibrary) primitives.
 
 ## Types
 
@@ -108,7 +108,7 @@ Containers: add the same two packages to your image. The offscreen path doesn't 
 
 ## Dependencies
 
-- [DIR.Lib](https://www.nuget.org/packages/DIR.Lib) — Rendering primitives + FreeType glyph rasterization
+- [DIR.Lib](https://github.com/DrawboardLtd/DeviceIndependentRenderingLibrary) — Rendering primitives + FreeType glyph rasterization (git submodule, not NuGet)
 - [SDL3-CS](https://www.nuget.org/packages/SDL3-CS) — SDL3 bindings
 - [Vortice.Vulkan](https://www.nuget.org/packages/Vortice.Vulkan) — Vulkan bindings
 - [Vortice.ShaderCompiler](https://www.nuget.org/packages/Vortice.ShaderCompiler) — GLSL to SPIR-V
