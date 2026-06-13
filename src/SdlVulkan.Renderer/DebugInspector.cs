@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -34,6 +35,11 @@ public sealed class DebugInspector : IDisposable
     private abstract record InspectorCommand
     {
         public TaskCompletionSource<string> Result { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>How long the socket side waits for this command to drain on the render
+        /// thread before giving up. A single command drains within a frame or two; a batch
+        /// runs one step per rendered frame, so it overrides this to scale with its length.</summary>
+        public virtual TimeSpan Timeout => TimeSpan.FromSeconds(10);
     }
     private sealed record PingCommand : InspectorCommand;
     private sealed record DescribeCommand : InspectorCommand;
@@ -44,9 +50,42 @@ public sealed class DebugInspector : IDisposable
     private sealed record KeyCommand(InputKey Key, InputModifier Mods) : InspectorCommand;
     private sealed record TextCommand(string Text) : InspectorCommand;
     private sealed record PostSignalCommand(string Name, JsonElement Args) : InspectorCommand;
+    /// <summary>Synthesize a mouse-wheel scroll at (X, Y). ScrollY &gt; 0 is wheel-up (zoom in in most views).</summary>
+    private sealed record ScrollCommand(float X, float Y, float ScrollY) : InspectorCommand;
+    /// <summary>Synthesize a press-drag-release from (X1,Y1) to (X2,Y2) with <see cref="Steps"/> interpolated
+    /// motion events between, so integrate-per-move pan handlers see a smooth path rather than a teleport.</summary>
+    private sealed record DragCommand(float X1, float Y1, float X2, float Y2, InputModifier Mods, int Steps) : InspectorCommand;
+    /// <summary>Read back the loop's rolling average frame time (the same EWMA that drives the
+    /// [rdiag] frame.slow log), so jank can be measured numerically instead of by eye.</summary>
+    private sealed record FrameStatsCommand : InspectorCommand;
+    /// <summary>Idle for <see cref="Frames"/> rendered frames (e.g. to let async work settle).
+    /// Only meaningful as a step inside a <see cref="BatchCommand"/>.</summary>
+    private sealed record WaitCommand(int Frames) : InspectorCommand;
+    /// <summary>A sequence of commands executed one-per-rendered-frame, so a real frame renders
+    /// between each step (a zoom/pan takes effect before the next step reads state). Returns a
+    /// JSON array of the per-step result fragments.</summary>
+    private sealed record BatchCommand(IReadOnlyList<InspectorCommand> Steps) : InspectorCommand
+    {
+        // ~1 frame per step plus the wait frames; pad generously and cap. This is just the
+        // socket's patience -- the event loop stays responsive throughout regardless.
+        public override TimeSpan Timeout => TimeSpan.FromSeconds(Math.Min(300,
+            15 + Steps.Count + Steps.OfType<WaitCommand>().Sum(w => w.Frames) / 30.0));
+    }
+
+    // In-progress batch, advanced one step per frame by DrainCommands (null when idle).
+    private BatchState? _activeBatch;
+    private sealed class BatchState(IReadOnlyList<InspectorCommand> steps, TaskCompletionSource<string> result)
+    {
+        public readonly IReadOnlyList<InspectorCommand> Steps = steps;
+        public readonly TaskCompletionSource<string> Result = result;
+        public readonly List<string> Results = [];
+        public int Index;
+        public int WaitFrames;
+    }
 
     private readonly DebugInspectorOptions _opts;
     private readonly SdlWindowView _view;
+    private readonly SdlEventLoop _loop; // for frame-timing readback (frameStats)
     private readonly ConcurrentQueue<InspectorCommand> _queue = new();
     private readonly TcpListener _listener;
     private readonly string _startedAtUtc;
@@ -56,10 +95,11 @@ public sealed class DebugInspector : IDisposable
     private Task? _acceptTask;
     private Task? _discoveryTask;
 
-    private DebugInspector(SdlWindowView view, DebugInspectorOptions opts)
+    private DebugInspector(SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts)
     {
         _opts = opts;
         _view = view;
+        _loop = loop;
         _startedAtUtc = DateTimeOffset.UtcNow.ToString("o");
         _listener = new TcpListener(opts.BindAddress, opts.Port);
         _listener.Start();
@@ -74,7 +114,7 @@ public sealed class DebugInspector : IDisposable
     /// </summary>
     public static DebugInspector Attach(SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts)
     {
-        var inspector = new DebugInspector(view, opts);
+        var inspector = new DebugInspector(loop, view, opts);
         inspector.Start();
 
         // Lambda-compose the pump onto OnPostFrame (the framework's own wiring style) so the
@@ -175,7 +215,7 @@ public sealed class DebugInspector : IDisposable
             _queue.Enqueue(cmd);
             _view.RequestRedraw(); // wake the loop so DrainCommands runs (OnPostFrame only fires on a rendered frame)
 
-            var fragment = await cmd.Result.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            var fragment = await cmd.Result.Task.WaitAsync(cmd.Timeout, ct);
             return $"{{\"id\":{id},\"result\":{fragment}}}";
         }
         catch (Exception ex)
@@ -205,11 +245,47 @@ public sealed class DebugInspector : IDisposable
             ResolveInputKey(p.GetProperty("key").GetString() ?? ""),
             ResolveModifier(p.TryGetProperty("mods", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null)),
         "text" => new TextCommand(p.GetProperty("s").GetString() ?? ""),
+        "scroll" => new ScrollCommand(
+            p.GetProperty("x").GetSingle(),
+            p.GetProperty("y").GetSingle(),
+            p.GetProperty("scrollY").GetSingle()),
+        "drag" => new DragCommand(
+            p.GetProperty("x1").GetSingle(),
+            p.GetProperty("y1").GetSingle(),
+            p.GetProperty("x2").GetSingle(),
+            p.GetProperty("y2").GetSingle(),
+            ResolveModifier(p.TryGetProperty("mods", out var dm) && dm.ValueKind == JsonValueKind.String ? dm.GetString() : null),
+            p.TryGetProperty("steps", out var ds) && ds.ValueKind == JsonValueKind.Number ? Math.Clamp(ds.GetInt32(), 1, 64) : 8),
+        "frameStats" => new FrameStatsCommand(),
         "postSignal" => new PostSignalCommand(
             p.GetProperty("name").GetString() ?? "",
             p.TryGetProperty("args", out var a) ? a.Clone() : default),
+        "wait" => new WaitCommand(p.TryGetProperty("frames", out var wf) && wf.ValueKind == JsonValueKind.Number
+            ? Math.Clamp(wf.GetInt32(), 1, 600) : 1),
+        "batch" => BuildBatch(p),
         _ => throw new ArgumentException($"unknown method: {method}")
     };
+
+    // Parses {steps:[{method,params}, ...]} into a BatchCommand. Each step is built through the
+    // same BuildCommand path as a standalone request; nesting a batch inside a batch is rejected
+    // (the one-step-per-frame pump only tracks a single active batch).
+    private static BatchCommand BuildBatch(JsonElement p)
+    {
+        if (!p.TryGetProperty("steps", out var steps) || steps.ValueKind != JsonValueKind.Array)
+            throw new ArgumentException("batch requires a 'steps' array of {method, params}");
+        var list = new List<InspectorCommand>(steps.GetArrayLength());
+        foreach (var step in steps.EnumerateArray())
+        {
+            var m = step.GetProperty("method").GetString() ?? "";
+            if (m == "batch")
+                throw new ArgumentException("nested batch is not supported");
+            step.TryGetProperty("params", out var sp);
+            list.Add(BuildCommand(m, sp));
+        }
+        if (list.Count == 0)
+            throw new ArgumentException("batch 'steps' must be non-empty");
+        return new BatchCommand(list);
+    }
 
     // Resolve a "key" command string to an InputKey.
     //
@@ -346,11 +422,68 @@ public sealed class DebugInspector : IDisposable
     /// </summary>
     private void DrainCommands()
     {
+        // A batch owns its frames: advance one step (or burn one wait-frame) and return, so a
+        // real frame renders before the next step. New single commands queued meanwhile drain
+        // once the batch completes.
+        if (_activeBatch is not null)
+        {
+            AdvanceBatch();
+            return;
+        }
+
         while (_queue.TryDequeue(out var cmd))
         {
+            if (cmd is BatchCommand b)
+            {
+                _activeBatch = new BatchState(b.Steps, b.Result);
+                AdvanceBatch();
+                return;
+            }
             try { cmd.Result.TrySetResult(ExecuteCommand(cmd)); }
             catch (Exception ex) { cmd.Result.TrySetException(ex); }
         }
+    }
+
+    /// <summary>
+    /// Executes the next step of <see cref="_activeBatch"/> (one per call = one per rendered
+    /// frame), or burns a pending wait-frame. Completes the batch's result with a JSON array of
+    /// per-step fragments once all steps are done. A failing step records an error fragment and
+    /// the batch continues -- one bad step doesn't abort the sequence.
+    /// </summary>
+    private void AdvanceBatch()
+    {
+        var b = _activeBatch!;
+        if (b.WaitFrames > 0)
+        {
+            b.WaitFrames--;
+            _view.RequestRedraw();
+            return;
+        }
+
+        if (b.Index < b.Steps.Count)
+        {
+            var step = b.Steps[b.Index++];
+            if (step is WaitCommand w)
+            {
+                b.WaitFrames = Math.Max(0, w.Frames - 1);
+                b.Results.Add("\"waited\"");
+            }
+            else
+            {
+                try { b.Results.Add(ExecuteCommand(step)); }
+                // Encode the error fragment via Utf8JsonWriter (ToJson) like every other result,
+                // not JsonSerializer.Serialize -- the reflection-based serializer trips IL2026/IL3050.
+                catch (Exception ex) { b.Results.Add(ToJson(w => w.WriteStringValue($"error: {ex.Message}"))); }
+            }
+        }
+
+        if (b.Index >= b.Steps.Count && b.WaitFrames == 0)
+        {
+            b.Result.TrySetResult("[" + string.Join(",", b.Results) + "]");
+            _activeBatch = null;
+            return;
+        }
+        _view.RequestRedraw(); // more steps / wait-frames remain -- keep the loop awake
     }
 
     private string ExecuteCommand(InspectorCommand cmd) => cmd switch
@@ -363,7 +496,11 @@ public sealed class DebugInspector : IDisposable
         ClickLabelCommand c => ExecuteClickLabel(c.Label),
         KeyCommand c => ExecuteKey(c.Key, c.Mods),
         TextCommand c => ExecuteText(c.Text),
+        ScrollCommand c => ExecuteScroll(c.X, c.Y, c.ScrollY),
+        DragCommand c => ExecuteDrag(c.X1, c.Y1, c.X2, c.Y2, c.Mods, c.Steps),
+        FrameStatsCommand => ExecuteFrameStats(),
         PostSignalCommand c => ExecutePostSignal(c.Name, c.Args),
+        WaitCommand => "\"waited\"", // only reached if used outside a batch; harmless no-op
         _ => throw new ArgumentException($"unknown command: {cmd.GetType().Name}")
     };
 
@@ -487,6 +624,39 @@ public sealed class DebugInspector : IDisposable
         _view.RequestRedraw();
         return "\"ok\"";
     }
+
+    private string ExecuteScroll(float x, float y, float scrollY)
+    {
+        _view.OnMouseMove?.Invoke(x, y); // position the pointer first -- wheel handlers zoom around it
+        _view.OnMouseWheel?.Invoke(scrollY, x, y);
+        _view.RequestRedraw();
+        return "\"ok\"";
+    }
+
+    private string ExecuteDrag(float x1, float y1, float x2, float y2, InputModifier mods, int steps)
+    {
+        // Same path as a real drag: move-to-start, button-down, interpolated motion, button-up.
+        // Pan handlers that integrate per motion event (e.g. the sky map's unproject-based pan)
+        // need the intermediate steps -- a single jump start->end would under-pan or misbehave.
+        _view.OnMouseMove?.Invoke(x1, y1);
+        _view.OnMouseDown?.Invoke(1, x1, y1, 1, mods);
+        for (var i = 1; i <= steps; i++)
+        {
+            var t = (float)i / steps;
+            _view.OnMouseMove?.Invoke(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        }
+        _view.OnMouseUp?.Invoke(1);
+        _view.RequestRedraw();
+        return "\"ok\"";
+    }
+
+    private string ExecuteFrameStats() => ToJson(w =>
+    {
+        w.WriteStartObject();
+        w.WriteNumber("avgFrameMs", _loop.DebugFrameAvgMs);
+        w.WriteNumber("slowFrameFloorMs", SdlEventLoop.DebugSlowFrameFloorMs);
+        w.WriteEndObject();
+    });
 
     private string ExecutePostSignal(string name, JsonElement args)
     {
