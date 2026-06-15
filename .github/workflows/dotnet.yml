@@ -19,7 +19,8 @@ env:
   # VulkanContext.CreateForSharedDevice builds a swapchain against an existing device. Single-window
   # source-compatible (Create / CreateOffscreen unchanged), but the new app/window/device layering
   # is the intended multi-window entry point.
-  VERSION_PREFIX: 6.2.${{ github.run_number }}
+  # 6.3: OnPinch passes a PinchSource (touchpad vs touchscreen) — needs DIR.Lib >= 4.6.
+  VERSION_PREFIX: 6.3.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
