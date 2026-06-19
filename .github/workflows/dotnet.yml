@@ -20,7 +20,9 @@ env:
   # source-compatible (Create / CreateOffscreen unchanged), but the new app/window/device layering
   # is the intended multi-window entry point.
   # 6.3: OnPinch passes a PinchSource (touchpad vs touchscreen) — needs DIR.Lib >= 4.6.
-  VERSION_PREFIX: 6.3.${{ github.run_number }}
+  # 6.4: DIR.Lib 5.0 (surface-agnostic layout/menu subsystem); VkMenuWidget dropped
+  #      (superseded by DIR.Lib PixelMenuWidget).
+  VERSION_PREFIX: 6.4.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
