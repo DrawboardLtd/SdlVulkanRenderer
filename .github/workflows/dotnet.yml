@@ -22,7 +22,8 @@ env:
   # 6.3: OnPinch passes a PinchSource (touchpad vs touchscreen) — needs DIR.Lib >= 4.6.
   # 6.4: DIR.Lib 5.0 (surface-agnostic layout/menu subsystem); VkMenuWidget dropped
   #      (superseded by DIR.Lib PixelMenuWidget).
-  VERSION_PREFIX: 6.4.${{ github.run_number }}
+  # 6.5: DIR.Lib 5.1 (markdown image nodes) — dependency repin only.
+  VERSION_PREFIX: 6.5.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
