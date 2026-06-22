@@ -28,7 +28,10 @@ public static class SdlInputMapping
             Scancode.Backspace => InputKey.Backspace,
             Scancode.Delete => InputKey.Delete,
             >= Scancode.A and <= Scancode.Z => (InputKey)((int)InputKey.A + (scancode - Scancode.A)),
-            >= Scancode.Alpha1 and <= Scancode.Alpha0 => (InputKey)((int)InputKey.D1 + (scancode - Scancode.Alpha1)),
+            // SDL's number-row scancodes run Alpha1..Alpha9 then Alpha0 LAST, so a single
+            // linear map from Alpha1 would send the '0' key one past D9. Map Alpha0 explicitly.
+            Scancode.Alpha0 => InputKey.D0,
+            >= Scancode.Alpha1 and <= Scancode.Alpha9 => (InputKey)((int)InputKey.D1 + (scancode - Scancode.Alpha1)),
             >= Scancode.F1 and <= Scancode.F12 => (InputKey)((int)InputKey.F1 + (scancode - Scancode.F1)),
             Scancode.Equals => InputKey.Plus,
             Scancode.Minus => InputKey.Minus,
