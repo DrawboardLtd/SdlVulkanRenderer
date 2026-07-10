@@ -6,8 +6,8 @@ using DIR.Lib;
 namespace SdlVulkan.Renderer;
 
 /// <summary>
-/// Disk-persistent cache of rasterized SDF glyph bitmaps. Survives process restarts so
-/// re-opening a document with the same fonts skips the expensive SDF rasterization
+/// Disk-persistent cache of rasterized MTSDF glyph bitmaps. Survives process restarts so
+/// re-opening a document with the same fonts skips the expensive distance-field rasterization
 /// pass (~10 ms per glyph) entirely. Pairs with <see cref="VkSdfFontAtlas"/>: on first
 /// request for a font the atlas pulls every cached glyph in one read and bulk-inserts
 /// them; thereafter, freshly rasterized glyphs are appended to disk for the next session.
@@ -37,14 +37,24 @@ public sealed class SdfGlyphDiskCache : IDisposable
     // so v1 caches hold the garbled glyphs. Bumping the version invalidates every stale
     // .sdfg (header mismatch → truncate + rewrite), forcing a re-rasterize with the fixed
     // glyph mapping. Bump this whenever the charCode→GID mapping logic changes.
-    private const uint FormatVersion = 2;
+    // v3: the atlas moved from single-channel R8 SDF to 4-channel RGBA MTSDF. The per-entry pixel
+    // payload is now width*height*4 (was width*height), so every v2 file is byte-incompatible.
+    // Bumping the version invalidates every stale .sdfg (header mismatch → truncate + rewrite),
+    // forcing a re-rasterize into the new format. Bump this whenever the on-disk pixel layout or the
+    // charCode→GID mapping logic changes.
+    // v4 (A1 — glyph-id keying): entries are now keyed by resolved glyph IDENTITY (glyph id for
+    // OpenType, PostScript glyph name for Type1) rather than (charCode, character, hint). The
+    // per-entry metadata layout changed — gid(4) + a variable-length glyph name replace the old
+    // charCode/character/hint fields — so every v3 file is byte-incompatible; the header mismatch
+    // truncates + rewrites them on next append (glyphs re-rasterize once).
+    private const uint FormatVersion = 4;
     // Header: magic(4) + version(4) + rasterSize(4) + spread(4) + fontHash(8) + reserved(8) = 32 bytes.
     private const int HeaderSize = 32;
-    // Per-entry metadata size *after* the 4-byte length prefix:
-    // charCode(4) + character(4) + hint(1)+reserved(3) + width(4) + height(4)
-    // + advanceX(4) + bearingX(4) + bearingY(4) = 32 bytes.
-    private const int EntryMetaSize = 32;
-    // Defensive upper bound for a single entry's length field; 128x128 SDF is 16 KB so 16 MB is more than ample.
+    // Fixed per-entry metadata size *after* the 4-byte length prefix, i.e. everything before the
+    // (variable-length) glyph name and the pixel payload:
+    // gid(4) + width(4) + height(4) + advanceX(4) + bearingX(4) + bearingY(4) + nameLen(2) = 26 bytes.
+    private const int EntryFixedMetaSize = 26;
+    // Defensive upper bound for a single entry's length field; a 64x64 RGBA MTSDF glyph is 16 KB so 16 MB is ample.
     private const int MaxReasonableEntryLen = 16 * 1024 * 1024;
 
     public float RasterSize { get; }
@@ -143,14 +153,14 @@ public sealed class SdfGlyphDiskCache : IDisposable
     /// Appends a freshly rasterized glyph to the cache file for <paramref name="fontPath"/>.
     /// Whitespace / zero-size bitmaps are skipped — they're derived at runtime in the atlas.
     /// </summary>
-    public void AppendGlyph(string fontPath, int charCode, Rune character, GlyphMapHint hint, in SdfGlyphBitmap bitmap)
+    public void AppendGlyph(string fontPath, uint gid, string? name, in MtsdfGlyphBitmap bitmap)
     {
         if (_disposed || PauseWrites) return;
         if (!IsAppendable(in bitmap)) return;
         // Serialize in-memory on the caller (cheap), hand off to the writer thread. The font-hash
         // resolution + file open happen on the writer thread (OpenStream), keeping the caller's
         // thread free of any disk I/O — including the first-use font-hash file read.
-        Enqueue(fontPath, SerializeEntry(charCode, character, hint, in bitmap));
+        Enqueue(fontPath, SerializeEntry(gid, name, in bitmap));
     }
 
     /// <summary>
@@ -158,7 +168,7 @@ public sealed class SdfGlyphDiskCache : IDisposable
     /// as <see cref="AppendGlyph"/> — small or null bitmaps are silently skipped. The whole
     /// batch is packed into one buffer so the writer thread takes a single hand-off.
     /// </summary>
-    public void AppendGlyphs(string fontPath, IReadOnlyList<(int CharCode, Rune Character, GlyphMapHint Hint, SdfGlyphBitmap Bitmap)> entries)
+    public void AppendGlyphs(string fontPath, IReadOnlyList<(uint Gid, string? Name, MtsdfGlyphBitmap Bitmap)> entries)
     {
         if (_disposed || PauseWrites || entries.Count == 0) return;
 
@@ -166,7 +176,7 @@ public sealed class SdfGlyphDiskCache : IDisposable
         foreach (var e in entries)
         {
             if (!IsAppendable(in e.Bitmap)) continue;
-            var b = SerializeEntry(e.CharCode, e.Character, e.Hint, in e.Bitmap);
+            var b = SerializeEntry(e.Gid, e.Name, in e.Bitmap);
             ms.Write(b, 0, b.Length);
         }
         if (ms.Length > 0) Enqueue(fontPath, ms.ToArray());
@@ -255,11 +265,11 @@ public sealed class SdfGlyphDiskCache : IDisposable
         _writeQueue.Dispose();
     }
 
-    private static bool IsAppendable(in SdfGlyphBitmap bitmap)
+    private static bool IsAppendable(in MtsdfGlyphBitmap bitmap)
     {
         if (bitmap.Width <= 0 || bitmap.Height <= 0) return false;
-        if (bitmap.Alpha is null) return false;
-        return bitmap.Alpha.Length >= bitmap.Width * bitmap.Height;
+        if (bitmap.Rgba is null) return false;
+        return bitmap.Rgba.Length >= bitmap.Width * bitmap.Height * 4;
     }
 
     private FileStream? GetOrOpenAppendStream(string fontPath)
@@ -323,25 +333,32 @@ public sealed class SdfGlyphDiskCache : IDisposable
 
     // Serializes one glyph entry to a self-contained byte buffer (length-prefixed). Runs on the
     // caller's thread (pure in-memory) so the writer thread only does the actual disk write.
-    private static byte[] SerializeEntry(int charCode, Rune character, GlyphMapHint hint, in SdfGlyphBitmap bitmap)
+    // Layout after the length prefix: gid(4) width(4) height(4) advanceX(4) bearingX(4) bearingY(4)
+    // nameLen(2) | name(nameLen, UTF-8) | rgba(width*height*4). nameLen is 0 for OpenType glyphs
+    // (keyed by gid); the name carries the PostScript glyph name for Type1/PFB glyphs.
+    private static byte[] SerializeEntry(uint gid, string? name, in MtsdfGlyphBitmap bitmap)
     {
-        var alphaLen = bitmap.Width * bitmap.Height;
-        // entryLen prefix covers everything after itself: 32-byte metadata block + alpha pixels.
-        var entryLen = EntryMetaSize + alphaLen;
+        var pixelLen = bitmap.Width * bitmap.Height * 4;   // RGBA
+        // Type1 glyph names are short ASCII PostScript names; ushort length is ample. Guard anyway.
+        var nameBytes = string.IsNullOrEmpty(name) ? [] : Encoding.UTF8.GetBytes(name);
+        if (nameBytes.Length > ushort.MaxValue) nameBytes = [];
+        // entryLen prefix covers everything after itself: fixed metadata + name + rgba pixels.
+        var entryLen = EntryFixedMetaSize + nameBytes.Length + pixelLen;
         var buf = new byte[4 + entryLen];
         var sp = buf.AsSpan();
         BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(0, 4), entryLen);
         // Metadata layout — keep aligned with the reader in ReadFile().
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(4, 4), charCode);
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(8, 4), character.Value);
-        sp[12] = (byte)hint;
-        // sp[13..16] reserved (zero)
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(16, 4), bitmap.Width);
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(20, 4), bitmap.Height);
-        BinaryPrimitives.WriteSingleLittleEndian(sp.Slice(24, 4), bitmap.AdvanceX);
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(28, 4), bitmap.BearingX);
-        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(32, 4), bitmap.BearingY);
-        bitmap.Alpha.AsSpan(0, alphaLen).CopyTo(sp.Slice(36, alphaLen));
+        BinaryPrimitives.WriteUInt32LittleEndian(sp.Slice(4, 4), gid);
+        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(8, 4), bitmap.Width);
+        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(12, 4), bitmap.Height);
+        BinaryPrimitives.WriteSingleLittleEndian(sp.Slice(16, 4), bitmap.AdvanceX);
+        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(20, 4), bitmap.BearingX);
+        BinaryPrimitives.WriteInt32LittleEndian(sp.Slice(24, 4), bitmap.BearingY);
+        BinaryPrimitives.WriteUInt16LittleEndian(sp.Slice(28, 2), (ushort)nameBytes.Length);
+        var off = 4 + EntryFixedMetaSize;            // 30 — start of name bytes
+        nameBytes.CopyTo(sp.Slice(off, nameBytes.Length));
+        off += nameBytes.Length;
+        bitmap.Rgba.AsSpan(0, pixelLen).CopyTo(sp.Slice(off, pixelLen));
         return buf;
     }
 
@@ -364,35 +381,43 @@ public sealed class SdfGlyphDiskCache : IDisposable
 
         // Allocate once and reuse — CA2014 (stackalloc in a loop is a stack-overflow risk).
         Span<byte> lenBuf = stackalloc byte[4];
-        Span<byte> meta = stackalloc byte[EntryMetaSize];
+        Span<byte> meta = stackalloc byte[EntryFixedMetaSize];
         while (fs.Position < fs.Length)
         {
             if (!TryReadExactly(fs, lenBuf)) break;
             var entryLen = BinaryPrimitives.ReadInt32LittleEndian(lenBuf);
-            if (entryLen < EntryMetaSize || entryLen > MaxReasonableEntryLen) break;
+            if (entryLen < EntryFixedMetaSize || entryLen > MaxReasonableEntryLen) break;
             if (fs.Position + entryLen > fs.Length) break;
 
             if (!TryReadExactly(fs, meta)) break;
 
-            var charCode = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(0, 4));
-            var characterValue = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(4, 4));
-            var hint = (GlyphMapHint)meta[8];
-            var width = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(12, 4));
-            var height = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(16, 4));
-            var advanceX = BinaryPrimitives.ReadSingleLittleEndian(meta.Slice(20, 4));
-            var bearingX = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(24, 4));
-            var bearingY = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(28, 4));
+            var gid = BinaryPrimitives.ReadUInt32LittleEndian(meta.Slice(0, 4));
+            var width = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(4, 4));
+            var height = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(8, 4));
+            var advanceX = BinaryPrimitives.ReadSingleLittleEndian(meta.Slice(12, 4));
+            var bearingX = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(16, 4));
+            var bearingY = BinaryPrimitives.ReadInt32LittleEndian(meta.Slice(20, 4));
+            var nameLen = BinaryPrimitives.ReadUInt16LittleEndian(meta.Slice(24, 2));
 
-            var alphaLen = entryLen - EntryMetaSize;
-            // Tightly-packed bitmap: alphaLen MUST equal width * height. A mismatch
+            // Variable-length glyph name (Type1 only; nameLen 0 for OpenType). Must fit inside entryLen.
+            if (EntryFixedMetaSize + nameLen > entryLen) break;
+            string? name = null;
+            if (nameLen > 0)
+            {
+                var nameBuf = new byte[nameLen];
+                if (!TryReadExactly(fs, nameBuf)) break;
+                name = Encoding.UTF8.GetString(nameBuf);
+            }
+
+            var pixelLen = entryLen - EntryFixedMetaSize - nameLen;
+            // Tightly-packed RGBA bitmap: pixelLen MUST equal width * height * 4. A mismatch
             // means corruption or a partial write — bail out and skip the rest of the file.
-            if (alphaLen != width * height) break;
-            var alpha = new byte[alphaLen];
-            if (!TryReadExactly(fs, alpha)) break;
+            if (pixelLen != width * height * 4) break;
+            var rgba = new byte[pixelLen];
+            if (!TryReadExactly(fs, rgba)) break;
 
-            if (!Rune.TryCreate(characterValue, out var character)) continue;
-            var bitmap = new SdfGlyphBitmap(alpha, width, height, bearingX, bearingY, advanceX, spread);
-            result.Add(new DiskGlyphEntry(charCode, character, hint, bitmap));
+            var bitmap = new MtsdfGlyphBitmap(rgba, width, height, bearingX, bearingY, advanceX, spread);
+            result.Add(new DiskGlyphEntry(gid, name, bitmap));
         }
         return result;
     }
@@ -482,8 +507,9 @@ public sealed class SdfGlyphDiskCache : IDisposable
 }
 
 /// <summary>
-/// A single SDF glyph record reconstructed from disk. The <see cref="Bitmap"/> can be
-/// fed straight into <c>VkSdfFontAtlas.InsertRasterized</c> the same way a freshly
-/// rasterized bitmap would be.
+/// A single MTSDF glyph record reconstructed from disk, keyed by resolved glyph identity —
+/// <see cref="Gid"/> for OpenType glyphs, <see cref="Name"/> (a PostScript glyph name) for
+/// Type1/PFB glyphs (with <see cref="Gid"/> 0). The <see cref="Bitmap"/> can be fed straight
+/// into <c>VkSdfFontAtlas.InsertRasterized</c> the same way a freshly rasterized bitmap would be.
 /// </summary>
-public readonly record struct DiskGlyphEntry(int CharCode, Rune Character, GlyphMapHint Hint, SdfGlyphBitmap Bitmap);
+public readonly record struct DiskGlyphEntry(uint Gid, string? Name, MtsdfGlyphBitmap Bitmap);
