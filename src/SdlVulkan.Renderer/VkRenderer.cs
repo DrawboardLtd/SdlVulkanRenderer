@@ -36,6 +36,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // are reused across frames (Clear, not realloc). Index = atlas page index.
     private readonly List<List<float>> _sdfPageVertices = new();
 
+    // Reused per-line shaping buffer (cleared + refilled by ITextShaper.Shape each call). DrawText
+    // runs every frame for every UI label, so this stays allocation-free after warmup — a foreach
+    // over List<ShapedGlyph> uses the struct enumerator (no alloc). Not reentrant: DrawText fully
+    // consumes it per line before reshaping, and never calls MeasureText mid-iteration.
+    private readonly List<ShapedGlyph> _shapedLine = new();
+
     // sdfInitialAtlasDim: square size of each SDF atlas PAGE (0 = the atlas default, 2048²). The
     // atlas never reallocates — when a page fills it appends a new page — so this is the page
     // granularity, not a glyph cap. A glyph-heavy consumer can raise it (must be a power of two)
@@ -96,6 +102,24 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _lastBoundPipeline = pipeline;
     }
 
+    // --- Shaped-glyph atlas resolution -------------------------------------------------------
+    // Resolve one shaped slot to its atlas glyph. When the shaper substituted an identity
+    // (sg.Glyph is set — a real ITextShaper ran GSUB/GPOS: ligatures, Arabic joined forms,
+    // contextual alternates) the glyph is fetched GID-direct, because the source codepoint no
+    // longer identifies it. When null (the default AdvanceShaper, one glyph per rune) we fetch by
+    // the source codepoint exactly as the pre-seam loop did, keeping that path byte-identical.
+    // Callers guarantee the relevant atlas is non-null (checked at DrawText/MeasureText entry, and
+    // the bitmap helper is only reached inside an `_fontAtlas is not null` colour-glyph branch).
+    private VkSdfFontAtlas.GlyphInfo ResolveSdfGlyph(in ShapedGlyph sg, string fontFamily, float fontSize, bool skipUnflushed = false)
+        => sg.Glyph is { } id
+            ? _sdfFontAtlas!.GetGlyphByGid(fontFamily, id.Gid, id.Type1Name, skipUnflushed)
+            : _sdfFontAtlas!.GetGlyph(fontFamily, fontSize, sg.Source, skipUnflushed: skipUnflushed);
+
+    private VkFontAtlas.GlyphInfo ResolveBitmapGlyph(in ShapedGlyph sg, string fontFamily, float fontSize, bool skipUnflushed = false)
+        => sg.Glyph is { } id
+            ? _fontAtlas!.GetGlyphByGid(fontFamily, fontSize, id.Gid, id.Type1Name, skipUnflushed)
+            : _fontAtlas!.GetGlyph(fontFamily, fontSize, sg.Source, skipUnflushed: skipUnflushed);
+
     /// <summary>
     /// Measures the size of the given text in pixels at the specified font size.
     /// Returns (width, height) where height is ascent + descent.
@@ -107,11 +131,20 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
         var glyphScale = VkSdfFontAtlas.GetGlyphScale(fontSize);
         var bitmapScale = VkFontAtlas.GetGlyphScale(fontSize);
+
+        // Same shaper as DrawText, so measured width matches drawn advance exactly (incl. any
+        // opt-in kerning). Under AdvanceShaper this is the old per-rune advance sum verbatim —
+        // '\n' is treated as a whitespace rune (its advance derives from the 'n' reference glyph),
+        // matching the pre-seam loop which also never split lines here.
+        TextShaper.Shape(text, fontFamily, fontSize, _sdfFontAtlas.Rasterizer, _shapedLine);
+
         var width = 0f;
         var maxAscent = 0f;
         var maxDescent = 0f;
-        foreach (var ch in text.EnumerateRunes())
+        // ref readonly over the backing array (no List enumerator, no per-glyph struct copy).
+        foreach (ref readonly var sg in CollectionsMarshal.AsSpan(_shapedLine))
         {
+            var ch = sg.Source;
             float advance, bearingY, height;
             var isEmoji = ch.Value >= 0x1F000
                 || (ch.Value >= 0x2600 && ch.Value <= 0x27BF)
@@ -119,19 +152,19 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 || ch.Value == 0x200D;
             if (isEmoji && _fontAtlas is not null)
             {
-                var bg = _fontAtlas.GetGlyph(fontFamily, fontSize, ch);
+                var bg = ResolveBitmapGlyph(sg, fontFamily, fontSize);
                 advance = bg.AdvanceX * bitmapScale;
                 bearingY = bg.BearingY * bitmapScale;
                 height = bg.Height * bitmapScale;
             }
             else
             {
-                var glyph = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, ch);
+                var glyph = ResolveSdfGlyph(sg, fontFamily, fontSize);
                 advance = glyph.AdvanceX * glyphScale;
                 bearingY = glyph.BearingY * glyphScale;
                 height = glyph.Height * glyphScale;
             }
-            width += advance;
+            width += advance + sg.XAdvanceAdjust;
             if (bearingY > maxAscent) maxAscent = bearingY;
             var descent = height - bearingY;
             if (descent > maxDescent) maxDescent = descent;
@@ -1155,6 +1188,22 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     }
 
     /// <summary>
+    /// GID-direct <see cref="PreWarmSdfGlyph"/>: pre-warms a substituted glyph (identified by glyph
+    /// id, or PostScript name for Type1) so it's uploaded in the current frame's flush. A consumer
+    /// driving a real <see cref="ITextShaper"/> shapes a run into <see cref="ShapedGlyph"/>s, then
+    /// pre-warms each <see cref="GlyphIdentity"/> here before drawing — otherwise a freshly
+    /// substituted glyph (ligature, Arabic joined form) is rasterized on the draw thread and skipped
+    /// for one frame; the codepoint-keyed <see cref="PreWarmSdfGlyph"/> would never cover it.
+    /// (fontSize is accepted for symmetry with <see cref="PreWarmSdfGlyph"/>; SDF glyphs rasterize
+    /// at a fixed size and the quad is scaled, so it does not affect the atlas key.)
+    /// </summary>
+    public void PreWarmSdfGlyphByGid(string fontPath, float fontSize, uint gid, string? type1Name = null)
+    {
+        _ = fontSize;
+        _sdfFontAtlas?.GetGlyphByGid(fontPath, gid, type1Name);
+    }
+
+    /// <summary>
     /// Batch SDF prewarm with parallel rasterization. Hand the renderer a list of unique
     /// glyph keys to prime — it dedups against the atlas, rasterizes the missing ones across
     /// the thread pool, then inserts them serially. Use instead of looping
@@ -1442,6 +1491,13 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             if (nl >= 0) remaining = remaining[(nl + 1)..];
             if (line.IsEmpty) continue;
 
+            // Shape the line once; both passes below iterate the shaped run. AdvanceShaper yields
+            // one glyph per rune in input order (byte-identical to the old EnumerateRunes loops),
+            // sourcing base metrics from the atlas as before; a real shaper substitutes/kerns. The
+            // shaper contributes only XAdvanceAdjust (kern/GPOS advance) + X/YOffset, all zero by
+            // default. Color-glyph routing still keys off the source codepoint (sg.Source), not id.
+            TextShaper.Shape(line, fontFamily, fontSize, _sdfFontAtlas.Rasterizer, _shapedLine);
+
             // Compute visual text metrics (scaled from SDF raster size to display size)
             var advanceSum = 0f;
             var firstBearingX = 0f;
@@ -1449,8 +1505,9 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             var maxAscent = 0f;
             var maxDescent = 0f;
             var first = true;
-            foreach (var mc in line.EnumerateRunes())
+            foreach (ref readonly var sg in CollectionsMarshal.AsSpan(_shapedLine))
             {
+                var mc = sg.Source;
                 // Use bitmap atlas metrics for color glyphs (emoji)
                 var isEmoji = mc.Value >= 0x1F000
                     || (mc.Value >= 0x2600 && mc.Value <= 0x27BF)
@@ -1459,7 +1516,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 float scaledBearingX, scaledBearingY, scaledWidth, scaledHeight, scaledAdvance;
                 if (isEmoji && _fontAtlas is not null)
                 {
-                    var bg = _fontAtlas.GetGlyph(fontFamily, fontSize, mc);
+                    var bg = ResolveBitmapGlyph(sg, fontFamily, fontSize);
                     var bScale = VkFontAtlas.GetGlyphScale(fontSize);
                     scaledBearingX = bg.BearingX * bScale;
                     scaledBearingY = bg.BearingY * bScale;
@@ -1469,7 +1526,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 }
                 else
                 {
-                    var g = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, mc);
+                    var g = ResolveSdfGlyph(sg, fontFamily, fontSize);
                     scaledBearingX = g.BearingX * glyphScale;
                     scaledBearingY = g.BearingY * glyphScale;
                     scaledWidth = g.Width * glyphScale;
@@ -1477,11 +1534,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                     scaledAdvance = g.AdvanceX * glyphScale;
                 }
                 if (first && scaledWidth > 0) { firstBearingX = scaledBearingX; first = false; }
-                if (scaledWidth > 0) { lastRightEdge = advanceSum + scaledBearingX + scaledWidth; }
+                if (scaledWidth > 0) { lastRightEdge = advanceSum + sg.XOffset + scaledBearingX + scaledWidth; }
                 if (scaledBearingY > maxAscent) maxAscent = scaledBearingY;
                 var descent = scaledHeight - scaledBearingY;
                 if (descent > maxDescent) maxDescent = descent;
-                advanceSum += scaledAdvance;
+                advanceSum += scaledAdvance + sg.XAdvanceAdjust;
             }
             var visualWidth = first ? advanceSum : lastRightEdge - firstBearingX;
 
@@ -1495,8 +1552,9 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
             var baseline = penY + (lineHeight + maxAscent - maxDescent) / 2f;
 
-            foreach (var ch in line.EnumerateRunes())
+            foreach (ref readonly var sg in CollectionsMarshal.AsSpan(_shapedLine))
             {
+                var ch = sg.Source;
                 // Color glyphs (emoji, symbols) can't render through the single-channel
                 // SDF atlas. Fall back to the RGBA bitmap atlas + TexturedPipeline.
                 var isColorGlyph = ch.Value >= 0x1F000 // Supplementary symbols & emoji
@@ -1513,15 +1571,15 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                         inSdfBatch = false;
                     }
 
-                    var bitmapGlyph = _fontAtlas.GetGlyph(fontFamily, fontSize, ch, skipUnflushed: true);
+                    var bitmapGlyph = ResolveBitmapGlyph(sg, fontFamily, fontSize, skipUnflushed: true);
                     var bScale = VkFontAtlas.GetGlyphScale(fontSize);
                     if (bitmapGlyph.Width > 0)
                     {
-                        var bgx0 = penX + bitmapGlyph.BearingX * bScale;
-                        var bgy0 = baseline - bitmapGlyph.BearingY * bScale;
+                        var bgx0 = penX + bitmapGlyph.BearingX * bScale + sg.XOffset;
+                        var bgy0 = baseline - bitmapGlyph.BearingY * bScale - sg.YOffset;
                         AddBatchedGlyph(in bitmapGlyph, fontSize, bgx0, bgy0);
                     }
-                    penX += bitmapGlyph.AdvanceX * bScale;
+                    penX += bitmapGlyph.AdvanceX * bScale + sg.XAdvanceAdjust;
                     continue;
                 }
 
@@ -1533,18 +1591,18 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                     inSdfBatch = true;
                 }
 
-                var glyph = _sdfFontAtlas.GetGlyph(fontFamily, fontSize, ch, skipUnflushed: true);
+                var glyph = ResolveSdfGlyph(sg, fontFamily, fontSize, skipUnflushed: true);
                 if (glyph.Width > 0)
                 {
                     // gx0/gy0 is the TEXTURE quad top-left (BearingX/Y already include the
                     // SDF spread). AddBatchedSdfGlyph expects INK top-left and internally
                     // shifts by -pad to get texture top-left; adding pad here converts.
                     var pad = glyph.Spread * glyphScale;
-                    var inkX = penX + glyph.BearingX * glyphScale + pad;
-                    var inkY = baseline - glyph.BearingY * glyphScale + pad;
+                    var inkX = penX + glyph.BearingX * glyphScale + pad + sg.XOffset;
+                    var inkY = baseline - glyph.BearingY * glyphScale + pad - sg.YOffset;
                     AddBatchedSdfGlyph(in glyph, inkX, inkY);
                 }
-                penX += glyph.AdvanceX * glyphScale;
+                penX += glyph.AdvanceX * glyphScale + sg.XAdvanceAdjust;
             }
         }
 

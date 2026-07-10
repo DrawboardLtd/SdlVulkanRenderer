@@ -32,7 +32,13 @@ env:
   # 6.9: DIR.Lib 6.0 (DIR.Lib.Layout namespace + Builder DSL + Node.Split) — dependency repin only.
   # 6.10: DIR.Lib 6.1 (embedded Type1 PFB/raw-FontFile glyph rendering) — dependency repin only.
   # 6.11: describe_layout inspector core (GetLayout option + arranged-tree serialization); DIR.Lib 6.2.
-  VERSION_PREFIX: 6.12.${{ github.run_number }}
+  # 6.12: DIR.Lib 6.3 (BackgroundTaskTracker.RunGuarded) — dependency repin only.
+  # 6.13: MTSDF glyph rendering — R8 SDF atlas -> 4-channel MTSDF (median(r,g,b) shader), atlas keyed
+  #       by resolved glyph identity (GID for OpenType, PostScript name for Type1) instead of
+  #       (Rune, charCode); .sdfg disk format -> v4. Public glyph API stays source-compatible (the
+  #       (Rune, charCode, GlyphMapHint) methods resolve to identity internally); by-GID variants
+  #       (GetGlyphByGid / PreWarmSdfGlyphByGid) added. DIR.Lib 6.8.
+  VERSION_PREFIX: 6.13.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release

@@ -13,15 +13,27 @@ namespace SdlVulkan.Renderer;
 /// </summary>
 internal sealed unsafe class VkSdfFontAtlas : IDisposable
 {
-    // CharCode is included in the key for CID subset fonts where the same Unicode
-    // character may need different glyph indices. For non-CID fonts, charCode is -1.
-    private readonly record struct GlyphKey(string Font, float Size, Rune Character, int CharCode);
+    // Glyphs are keyed by resolved identity (A1): the numeric glyph id for OpenType fonts
+    // (Name == null), or the PostScript glyph name for Type1/PFB fonts (Gid == 0, no numeric
+    // ids). Codepoint→identity is resolved once at the GetGlyph boundary via
+    // ManagedFontRasterizer.ResolveGlyphIdentity — so the old (charCode, character) CID
+    // workaround collapses: two codepoints that resolve to the same glyph now share one entry.
+    private readonly record struct GlyphKey(string Font, float Size, uint Gid, string? Name);
+
+    // Sentinel Gid for whitespace, which carries no ink and derives its advance from the 'n'
+    // reference glyph. Kept off gid 0 (the shared notdef/blank entry for genuinely-missing
+    // glyphs) and off any real glyph id (< NumGlyphs) so whitespace never collides with either.
+    private const uint WhitespaceGid = uint.MaxValue;
 
     internal readonly record struct GlyphInfo(float U0, float V0, float U1, float V1,
         int Width, int Height, float AdvanceX, int BearingX, int BearingY, float Spread);
 
     private readonly VulkanContext _ctx;
     private readonly ManagedFontRasterizer _rasterizer;
+
+    /// <summary>The shared rasterizer this atlas resolves/rasterizes through — also what the
+    /// renderer hands an <see cref="ITextShaper"/> so shaping keys off the same font state.</summary>
+    internal ManagedFontRasterizer Rasterizer => _rasterizer;
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
@@ -43,31 +55,38 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     // over a handful of frames. _rasterizeInFlight dedups: the visible-glyph set is re-offered every
     // frame, so a key must be rasterized at most once.
     private readonly ConcurrentDictionary<GlyphKey, byte> _rasterizeInFlight = new();
-    private readonly ConcurrentQueue<(GlyphKey Key, int CharCode, GlyphMapHint Hint, SdfGlyphBitmap Bitmap)> _pendingRasterized = new();
+    // The key already carries the resolved identity, so the finished bitmap needs nothing else
+    // to be inserted and persisted (identity → gid/name lives in Key).
+    private readonly ConcurrentQueue<(GlyphKey Key, MtsdfGlyphBitmap Bitmap)> _pendingRasterized = new();
     // Max glyphs inserted (staging blit + dirty-region upload) per frame from the rasterized queue.
     // Bounds per-frame upload so a 2000-glyph CJK page drains over ~frames (IsDirty keeps the loop
     // awake until empty), never in one stall.
     private const int MaxGlyphInsertsPerFrame = 96;
 
-    // The SDF atlas grows by doubling up to this cap. At 128px raster a 4096² atlas holds only
-    // ~1450 glyphs; a glyph-heavy structural drawing (several embedded fonts + symbols) needs
-    // ~1500+, which thrashed the 4096² cap — constant EvictAll → caption flicker AND repeated
-    // synchronous glyph reloads on the render thread → page-change stalls. 8192² (~5800 glyphs,
-    // ~67 MB R8 when grown) holds the working set with headroom. The effective cap (_maxAtlasSize)
-    // is clamped to the device's maxImageDimension2D so this is safe on every GPU / consumer.
+    // Upper bound for a page dimension, clamped to the device limit in the ctor. Pages don't grow
+    // (a full page is left in place and a new one appended), so this only caps the initial page dim;
+    // the default (DefaultInitialAtlasDim = 1024) sits well under it. Working-set headroom comes from
+    // MaxPages, not page size. Kept generous so an unusually large initialWidth is still device-safe.
     private const int MaxAtlasSize = 8192;
     // MaxAtlasSize clamped to the device limit (set in the ctor). Use this, not the const, for grows.
     private readonly int _maxAtlasSize;
     private const float SdfSpread = 4f;
 
+    // Bytes per atlas texel. The atlas stores MTSDF (RGBA8): RGB = per-channel
+    // pseudo-distance, A = true distance. Every staging/upload byte offset is
+    // scaled by this. (Was 1 when the atlas was single-channel R8.)
+    private const int BytesPerTexel = 4;
+
     /// <summary>
-    /// SDF glyphs are rasterized at this fixed size. The GPU scales the quad
-    /// for any requested display size. Because SDF encodes distance, not pixels,
-    /// a single rasterization looks sharp at all display sizes. Raising this size
-    /// gives more sub-pixel fidelity when glyphs are displayed smaller than the
-    /// raster size, at the cost of atlas memory (quadratic).
+    /// MTSDF glyphs are rasterized at this fixed size. The GPU scales the quad
+    /// for any requested display size. Because a distance field encodes distance,
+    /// not pixels, a single rasterization looks sharp at all display sizes — and
+    /// MTSDF keeps corners sharp too, so a smaller raster costs far less fidelity
+    /// than it would for plain SDF. 64px with 4-channel RGBA is memory-neutral vs
+    /// the old 128px single-channel R8 (¼ the page area × 4 bytes = same bytes per
+    /// glyph, same page size, same page cap).
     /// </summary>
-    private const float SdfRasterSize = 128f;
+    private const float SdfRasterSize = 64f;
 
     /// <summary>
     /// Default page dimension. The atlas is a list of fixed-size square pages of this size;
@@ -76,9 +95,11 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     /// can be recovered exactly from its virtual V coordinate (see <see cref="InsertRasterized"/>
     /// and <see cref="DecodePage"/>).
     /// </summary>
-    private const int DefaultInitialAtlasDim = (int)SdfRasterSize * 16; // 2048
+    private const int DefaultInitialAtlasDim = (int)SdfRasterSize * 16; // 1024 (64px raster × 16)
 
-    // Max resident pages before falling back to evict-all. 16 × 2048² × 1 byte ≈ 64 MB worst case.
+    // Max resident pages before falling back to evict-all. 16 × 1024² × 4 bytes (RGBA) ≈ 64 MB worst
+    // case — identical to the old 16 × 2048² × 1 byte R8 atlas (the 64px raster shrinks pages to 1024²,
+    // the RGBA format restores the 4× per-texel, so per-glyph capacity and the memory cap are unchanged).
     // 8 was tight for glyph-heavy docs (many embedded subset fonts, or CJK with thousands of unique
     // glyphs): the atlas filled every page and then EvictAll thrashed — a vkDeviceWaitIdle drain plus
     // a full glyph re-raster on each scroll (the jank). 16 roughly doubles the working set first.
@@ -93,7 +114,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         public VkDeviceMemory ImageMemory;
         public VkImageView ImageView;
         public VkDescriptorSet DescriptorSet;
-        public byte[] Staging = [];                       // 1 byte per pixel, _pageDim²
+        public byte[] Staging = [];                       // BytesPerTexel per pixel (RGBA), _pageDim²
         public int CursorX, CursorY, RowHeight;
         public int DirtyX0, DirtyY0, DirtyX1, DirtyY1;
         // LRU bookkeeping for per-page eviction. LastUsedFrame is stamped whenever a glyph on this
@@ -180,7 +201,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     {
         var page = new Page
         {
-            Staging = new byte[_pageDim * _pageDim],
+            Staging = new byte[_pageDim * _pageDim * BytesPerTexel],
             DirtyX0 = _pageDim, DirtyY0 = _pageDim, DirtyX1 = 0, DirtyY1 = 0,
         };
         CreateImage(page, _pageDim, _pageDim);
@@ -237,7 +258,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             if (_glyphs.ContainsKey(r.Key)) continue;       // raced with a disk load / duplicate
             var info = InsertRasterized(r.Key, r.Bitmap);
             if (info.Width > 0)
-                _diskCache?.AppendGlyph(r.Key.Font, r.CharCode, r.Key.Character, r.Hint, in r.Bitmap);
+                _diskCache?.AppendGlyph(r.Key.Font, r.Key.Gid, r.Key.Name, in r.Bitmap);
             else if (!_needsEviction)
                 // Genuinely blank glyph (empty SDF — InsertRasterized doesn't record those). Cache a
                 // zero sentinel so the draw path / prewarm don't re-queue it every frame — otherwise
@@ -267,7 +288,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             for (; i < load.Entries.Count && budget > 0; i++)
             {
                 var e = load.Entries[i];
-                var key = new GlyphKey(load.Font, SdfRasterSize, e.Character, e.CharCode);
+                var key = new GlyphKey(load.Font, SdfRasterSize, e.Gid, e.Name);
                 if (_glyphs.ContainsKey(key)) continue;
                 InsertRasterized(key, e.Bitmap);
                 budget--;
@@ -308,8 +329,35 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         // previously-rasterized glyph for it. Idempotent and noop after the first call.
         EnsureFontLoadedFromDisk(fontPath);
 
-        // All SDF glyphs are rasterized at SdfRasterSize; the caller scales the quad
-        var key = new GlyphKey(fontPath, SdfRasterSize, character, charCode);
+        // Resolve (character, charCode, hint) → glyph identity once, here at the draw boundary,
+        // and key by it. All SDF glyphs are rasterized at SdfRasterSize; the caller scales the quad.
+        var key = MakeKey(fontPath, character, charCode, hint);
+        return GetGlyphByKey(key, Rune.IsWhiteSpace(character), skipUnflushed, rasterizeOnMiss);
+    }
+
+    /// <summary>
+    /// GID-direct variant of <see cref="GetGlyph(string, float, Rune, bool, int, GlyphMapHint, bool)"/>:
+    /// fetches by a pre-resolved glyph identity (the glyph id, or the PostScript name for Type1)
+    /// instead of mapping a codepoint through the font cmap. This is the shaped-text entry point —
+    /// once an <c>ITextShaper</c> has run (GSUB ligatures, Arabic joining, contextual forms, …) the
+    /// source codepoint no longer identifies the glyph, only the substituted id does. There is no
+    /// whitespace sentinel here: a shaper emits the real space glyph id, whose empty ink and hmtx
+    /// advance are already correct (only the codepoint path uses WhitespaceGid + the 'n' reference).
+    /// </summary>
+    public GlyphInfo GetGlyphByGid(string fontPath, uint gid, string? type1Name = null,
+        bool skipUnflushed = false, bool rasterizeOnMiss = true)
+    {
+        EnsureFontLoadedFromDisk(fontPath);
+        var key = new GlyphKey(fontPath, SdfRasterSize, gid, type1Name);
+        return GetGlyphByKey(key, isWhitespace: false, skipUnflushed, rasterizeOnMiss);
+    }
+
+    // Shared cache lookup / per-page LRU touch / background-rasterize / skipUnflushed logic behind
+    // both the codepoint path (GetGlyph) and the GID-direct path (GetGlyphByGid). isWhitespace
+    // suppresses background-queuing on a draw-path miss: whitespace carries no ink and is warmed
+    // synchronously by PreRasterizeBatch, so it never needs queuing here.
+    private GlyphInfo GetGlyphByKey(GlyphKey key, bool isWhitespace, bool skipUnflushed, bool rasterizeOnMiss)
+    {
         if (_glyphs.TryGetValue(key, out var existing))
         {
             // Touch the page this glyph lives on so per-page LRU keeps the on-screen working set
@@ -329,41 +377,58 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             // Draw path: NEVER rasterize on the render thread. Queue the glyph for background
             // rasterization (deduped) and skip drawing it this frame — it appears once the
             // background result is inserted (DrainPendingRasterized). Width==0 -> caller skips it.
-            // Whitespace carries no ink and is warmed synchronously by PreRasterizeBatch, so it
-            // never needs queuing here.
-            if (!Rune.IsWhiteSpace(character) && _rasterizeInFlight.TryAdd(key, 0))
-                QueueRasterizeAsync(key, charCode, hint);
+            if (!isWhitespace && _rasterizeInFlight.TryAdd(key, 0))
+                QueueRasterizeAsync(key);
             return default;
         }
-        var result = RasterizeGlyph(key, charCode, hint);
+        var result = RasterizeGlyph(key);
         if (skipUnflushed && result.Width > 0)
             return result with { Width = 0 };
         return result;
     }
 
+    // Resolve a (character, PDF charCode, cmap hint) request to the atlas identity key: the glyph
+    // id for OpenType fonts, the glyph name for Type1/PFB. Whitespace has no ink and shares one
+    // sentinel key (its advance derives from the 'n' reference glyph in RasterizeGlyph).
+    private GlyphKey MakeKey(string fontPath, Rune character, int charCode, GlyphMapHint hint)
+    {
+        if (Rune.IsWhiteSpace(character))
+            return new GlyphKey(fontPath, SdfRasterSize, WhitespaceGid, null);
+        var id = _rasterizer.ResolveGlyphIdentity(fontPath, character, charCode, hint);
+        return new GlyphKey(fontPath, SdfRasterSize, id.Gid, id.Type1Name);
+    }
+
+    // Rasterize a glyph to MTSDF by its resolved identity: Type1 by glyph name, otherwise by GID.
+    // ManagedFontRasterizer is thread-safe, so this runs on both the render thread (RasterizeGlyph)
+    // and background rasterize tasks (QueueRasterizeAsync / PreRasterizeBatch).
+    private MtsdfGlyphBitmap RasterizeByKey(GlyphKey key) =>
+        key.Name is not null
+            ? _rasterizer.RasterizeGlyphMtsdfByType1Name(key.Font, key.Size, key.Name, SdfSpread)
+            : _rasterizer.RasterizeGlyphMtsdfByGid(key.Font, key.Size, key.Gid, SdfSpread);
+
     // Rasterize one glyph on a background thread and enqueue the result for render-thread insertion.
     // Caller must have already claimed the key in _rasterizeInFlight. Used for the rare draw-path miss
     // (a glyph the per-frame prewarm batch didn't cover); the bulk path is PreRasterizeBatch.
-    private void QueueRasterizeAsync(GlyphKey key, int charCode, GlyphMapHint hint)
+    private void QueueRasterizeAsync(GlyphKey key)
     {
         Task.Run(() =>
         {
             try
             {
-                var bitmap = charCode >= 0
-                    ? _rasterizer.RasterizeGlyphSdfWithCharCode(key.Font, key.Size, key.Character, (uint)charCode, hint, SdfSpread)
-                    : _rasterizer.RasterizeGlyphSdf(key.Font, key.Size, key.Character, SdfSpread);
-                _pendingRasterized.Enqueue((key, charCode, hint, bitmap));
+                _pendingRasterized.Enqueue((key, RasterizeByKey(key)));
             }
             catch (Exception ex)
             {
                 // Don't leave the key permanently claimed if rasterization throws — release it so a
                 // later frame can retry; otherwise the glyph would never appear.
                 _rasterizeInFlight.TryRemove(key, out _);
-                Console.Error.WriteLine($"[SdfAtlas] async rasterize failed for '{key.Character}': {ex.Message}");
+                Console.Error.WriteLine($"[SdfAtlas] async rasterize failed for {DescribeKey(key)}: {ex.Message}");
             }
         });
     }
+
+    // Human-readable identity for diagnostics: "gid N" for OpenType, "'name'" for Type1.
+    private static string DescribeKey(GlyphKey key) => key.Name is not null ? $"'{key.Name}'" : $"gid {key.Gid}";
 
     /// <summary>
     /// If a disk cache is configured and we haven't yet imported <paramref name="fontPath"/>'s
@@ -427,20 +492,22 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         var regionW = page.DirtyX1 - page.DirtyX0;
         var regionH = page.DirtyY1 - page.DirtyY0;
         var pixelCount = regionW * regionH;
+        var rowBytes = regionW * BytesPerTexel;
 
-        var bufferSize = (ulong)pixelCount;
+        var bufferSize = (ulong)(pixelCount * BytesPerTexel);
         EnsureUploadBuffer(page, slot, bufferSize);
 
-        // Copy the dirty region (1 byte per pixel) row-by-row straight into the persistently
+        // Copy the dirty region (BytesPerTexel per pixel) row-by-row straight into the persistently
         // mapped upload buffer — no intermediate heap array (large dirty regions would land on
-        // the LOH) and no map/unmap round-trip per flush (memory is HostCoherent).
+        // the LOH) and no map/unmap round-trip per flush (memory is HostCoherent). The upload buffer
+        // is tightly packed (rowBytes stride), so vkCmdCopyBufferToImage uses bufferRowLength = 0.
         var dst = (byte*)page.UploadMapped[slot];
         fixed (byte* pStaging = page.Staging)
         {
             for (var row = 0; row < regionH; row++)
             {
-                var srcOffset = (page.DirtyY0 + row) * _pageDim + page.DirtyX0;
-                Buffer.MemoryCopy(pStaging + srcOffset, dst + row * regionW, regionW, regionW);
+                var srcOffset = ((page.DirtyY0 + row) * _pageDim + page.DirtyX0) * BytesPerTexel;
+                Buffer.MemoryCopy(pStaging + srcOffset, dst + row * rowBytes, rowBytes, rowBytes);
             }
         }
 
@@ -477,9 +544,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         _ctx.DeviceApi.vkDestroySampler(_sampler);
     }
 
-    private GlyphInfo RasterizeGlyph(GlyphKey key, int charCode = -1, GlyphMapHint hint = GlyphMapHint.Auto)
+    private GlyphInfo RasterizeGlyph(GlyphKey key)
     {
-        if (Rune.IsWhiteSpace(key.Character))
+        if (key.Gid == WhitespaceGid)
         {
             var refGlyph = GetGlyph(key.Font, SdfRasterSize, new Rune('n'));
             var info = new GlyphInfo(0, 0, 0, 0, 0, 0, refGlyph.AdvanceX, 0, 0, SdfSpread);
@@ -487,15 +554,11 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             return info;
         }
 
-        // Use WithCharCode variant for CID/embedded-subset fonts whose Unicode cmap
-        // may be absent or unreliable. RasterizeGlyphSdfWithCharCode supports
-        // multiple cmap strategies via GlyphMapHint.
-        var bitmap = charCode >= 0
-            ? _rasterizer.RasterizeGlyphSdfWithCharCode(key.Font, key.Size, key.Character, (uint)charCode, hint, SdfSpread)
-            : _rasterizer.RasterizeGlyphSdf(key.Font, key.Size, key.Character, SdfSpread);
+        // Rasterize by the resolved identity in the key (glyph id, or Type1 glyph name).
+        var bitmap = RasterizeByKey(key);
         var glyphInfo = InsertRasterized(key, bitmap);
         // Persist for the next session. AppendGlyph silently skips invalid/empty bitmaps.
-        _diskCache?.AppendGlyph(key.Font, charCode, key.Character, hint, in bitmap);
+        _diskCache?.AppendGlyph(key.Font, key.Gid, key.Name, in bitmap);
         return glyphInfo;
     }
 
@@ -505,13 +568,13 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
     /// staging, dirty region) + _glyphs/_unflushedGlyphs and may append a new page
     /// — must NOT be called concurrently from multiple threads.
     /// </summary>
-    private GlyphInfo InsertRasterized(GlyphKey key, SdfGlyphBitmap bitmap)
+    private GlyphInfo InsertRasterized(GlyphKey key, MtsdfGlyphBitmap bitmap)
     {
         var glyphWidth = bitmap.Width;
         var glyphHeight = bitmap.Height;
 
         if (glyphWidth == 0 || glyphHeight == 0) return default;
-        // A glyph bigger than a whole page can never be placed (shouldn't happen at 128px raster).
+        // A glyph bigger than a whole page can never be placed (shouldn't happen at 64px raster).
         if (glyphWidth > _pageDim || glyphHeight > _pageDim) return default;
 
         var pageIdx = _activePageIdx;
@@ -553,12 +616,13 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             }
         }
 
-        // Blit single-channel SDF data into this page's staging buffer.
+        // Blit 4-channel MTSDF data into this page's staging buffer (BytesPerTexel per pixel).
+        var rowBytes = glyphWidth * BytesPerTexel;
         for (var row = 0; row < glyphHeight; row++)
         {
-            var srcOffset = row * glyphWidth;
-            var dstOffset = (page.CursorY + row) * _pageDim + page.CursorX;
-            Buffer.BlockCopy(bitmap.Alpha, srcOffset, page.Staging, dstOffset, glyphWidth);
+            var srcOffset = row * rowBytes;
+            var dstOffset = ((page.CursorY + row) * _pageDim + page.CursorX) * BytesPerTexel;
+            Buffer.BlockCopy(bitmap.Rgba, srcOffset, page.Staging, dstOffset, rowBytes);
         }
 
         page.DirtyX0 = Math.Min(page.DirtyX0, page.CursorX);
@@ -662,17 +726,19 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             }
         }
 
-        // Phase 1: claim the keys that need rasterization (not cached, not whitespace, not already
-        // queued/in-flight). TryAdd both dedups within this batch AND stakes the key, so the SAME
-        // visible-glyph set re-offered next frame doesn't re-rasterize what's already pending.
-        var toRasterize = new List<(GlyphKey AtlasKey, int CharCode, GlyphMapHint Hint)>();
+        // Phase 1: resolve each request to its identity key and claim the ones that need
+        // rasterization (not cached, not whitespace, not already queued/in-flight). TryAdd both
+        // dedups within this batch AND stakes the key, so the SAME visible-glyph set re-offered next
+        // frame doesn't re-rasterize what's already pending. Two requests that resolve to the same
+        // glyph now collapse to one key here (the A1 dedup).
+        var toRasterize = new List<GlyphKey>();
         foreach (var (font, ch, charCode, hint) in keys)
         {
             if (Rune.IsWhiteSpace(ch)) continue;            // warmed synchronously in Phase 3
-            var atlasKey = new GlyphKey(font, SdfRasterSize, ch, charCode);
+            var atlasKey = MakeKey(font, ch, charCode, hint);
             if (_glyphs.ContainsKey(atlasKey)) continue;
             if (!_rasterizeInFlight.TryAdd(atlasKey, 0)) continue;
-            toRasterize.Add((atlasKey, charCode, hint));
+            toRasterize.Add(atlasKey);
         }
 
         // Phase 2: rasterize OFF the render thread. SDF distance-field computation is the ~10ms/glyph
@@ -688,19 +754,16 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
             var work = toRasterize;
             Task.Run(() => Parallel.For(0, work.Count, i =>
             {
-                var (atlasKey, charCode, hint) = work[i];
+                var atlasKey = work[i];
                 try
                 {
-                    var bitmap = charCode >= 0
-                        ? _rasterizer.RasterizeGlyphSdfWithCharCode(atlasKey.Font, atlasKey.Size, atlasKey.Character, (uint)charCode, hint, SdfSpread)
-                        : _rasterizer.RasterizeGlyphSdf(atlasKey.Font, atlasKey.Size, atlasKey.Character, SdfSpread);
-                    _pendingRasterized.Enqueue((atlasKey, charCode, hint, bitmap));
+                    _pendingRasterized.Enqueue((atlasKey, RasterizeByKey(atlasKey)));
                 }
                 catch (Exception ex)
                 {
                     // Release the claim so a later frame can retry; otherwise the glyph never appears.
                     _rasterizeInFlight.TryRemove(atlasKey, out _);
-                    Console.Error.WriteLine($"[SdfAtlas] batch rasterize failed for '{atlasKey.Character}': {ex.Message}");
+                    Console.Error.WriteLine($"[SdfAtlas] batch rasterize failed for {DescribeKey(atlasKey)}: {ex.Message}");
                 }
             }));
         }
@@ -762,7 +825,7 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         VkImageCreateInfo imageCI = new()
         {
             imageType = VkImageType.Image2D,
-            format = VkFormat.R8Unorm,
+            format = VkFormat.R8G8B8A8Unorm,
             extent = new VkExtent3D((uint)width, (uint)height, 1),
             mipLevels = 1,
             arrayLayers = 1,
@@ -788,11 +851,12 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable
         // buffer on some drivers (VK_ERROR_INITIALIZATION_FAILED from the next vkQueueSubmit).
         page.NeedsInitialTransition = true;
 
-        // Swizzle R channel into all RGBA channels so the sampler reads the SDF
-        // value consistently regardless of which component the shader samples
+        // Identity swizzle: the shader samples the full RGBA MTSDF (RGB pseudo-distance
+        // for median reconstruction, A true distance). No component broadcast — that was
+        // only needed when the atlas was single-channel R8.
         var viewCI = new VkImageViewCreateInfo(
-            page.Image, VkImageViewType.Image2D, VkFormat.R8Unorm,
-            new VkComponentMapping(VkComponentSwizzle.R, VkComponentSwizzle.R, VkComponentSwizzle.R, VkComponentSwizzle.R),
+            page.Image, VkImageViewType.Image2D, VkFormat.R8G8B8A8Unorm,
+            new VkComponentMapping(VkComponentSwizzle.Identity, VkComponentSwizzle.Identity, VkComponentSwizzle.Identity, VkComponentSwizzle.Identity),
             new VkImageSubresourceRange(VkImageAspectFlags.Color, 0, 1, 0, 1));
         api.vkCreateImageView(&viewCI, null, out page.ImageView).CheckResult();
     }
