@@ -41,7 +41,15 @@ env:
   # 6.14: SdlVulkanWindow.GetNativeWindowHandle (native HWND/NSWindow/wl_surface for hosting
   #       native child surfaces) + the SdlVulkan.Renderer.Inspector project source (MCP bridge;
   #       carried as source only — not in the .sln, consumed via the published dnx tool).
-  VERSION_PREFIX: 6.14.${{ github.run_number }}
+  # 6.15: GPU-wedge resilience. Stuck-fence recovery now runs on a sacrificial background task the
+  #       render thread only polls (on a truly hung GPU the driver can block INSIDE vkFreeMemory /
+  #       teardown — observed on Adreno 2026-07-10: the old synchronous recovery froze the render
+  #       thread permanently); deadline blown or repeated stuck escalations → OnGpuWedged (new host
+  #       callback) + clean loop stop. SDF atlas: per-frame upload BYTE budget alongside the glyph
+  #       count cap (MTSDF quadrupled bytes/glyph vs R8), one-frame quarantine for glyphs on a
+  #       just-appended page (first transition and first sample no longer share a submission), and
+  #       a FrameStats wedge breadcrumb logged at fence-stuck escalation.
+  VERSION_PREFIX: 6.15.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
