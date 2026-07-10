@@ -38,7 +38,10 @@ env:
   #       (Rune, charCode); .sdfg disk format -> v4. Public glyph API stays source-compatible (the
   #       (Rune, charCode, GlyphMapHint) methods resolve to identity internally); by-GID variants
   #       (GetGlyphByGid / PreWarmSdfGlyphByGid) added. DIR.Lib 6.8.
-  VERSION_PREFIX: 6.13.${{ github.run_number }}
+  # 6.14: SdlVulkanWindow.GetNativeWindowHandle (native HWND/NSWindow/wl_surface for hosting
+  #       native child surfaces) + the SdlVulkan.Renderer.Inspector project source (MCP bridge;
+  #       carried as source only — not in the .sln, consumed via the published dnx tool).
+  VERSION_PREFIX: 6.14.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
