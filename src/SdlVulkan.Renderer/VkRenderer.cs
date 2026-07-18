@@ -9,6 +9,13 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     private VkPipelineSet? _pipelines;
     private VkFontAtlas? _fontAtlas;
     private VkSdfFontAtlas? _sdfFontAtlas;
+    // Optional large-text tier: a second SDF atlas at a bigger raster (e.g. 256px). BeginSdfGlyphBatch
+    // routes a batch here once its on-screen fontSize exceeds the small tier's raster, so display-size
+    // glyphs stop magnifying a 64px field. null = single-tier (unchanged behaviour).
+    private VkSdfFontAtlas? _sdfFontAtlasLarge;
+    // The SDF atlas the CURRENT batch draws from (small or large tier); set in BeginSdfGlyphBatch and
+    // used by every batched-glyph op + the flush for that batch.
+    private VkSdfFontAtlas? _activeSdfAtlas;
     private uint _width;
     private uint _height;
     private VkCommandBuffer _currentCmd;
@@ -35,6 +42,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // with its own descriptor set). At EndGlyphBatch each non-empty page is one bind+draw. Lists
     // are reused across frames (Clear, not realloc). Index = atlas page index.
     private readonly List<List<float>> _sdfPageVertices = new();
+    // Companion buckets for the tiered fallback: when a large-tier glyph isn't rasterized yet, its
+    // small-tier (64px) placeholder is accumulated here and flushed in a second pass with the small
+    // atlas's descriptor sets + AA band, so nothing disappears on a zoom-in — it upgrades to the sharp
+    // glyph a frame later. Empty in single-tier batches.
+    private readonly List<List<float>> _sdfFallbackPageVertices = new();
 
     // Reused per-line shaping buffer (cleared + refilled by ITextShaper.Shape each call). DrawText
     // runs every frame for every UI label, so this stays allocation-free after warmup — a foreach
@@ -52,7 +64,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // registrations when the origin window closes. When null, this renderer's atlas creates and owns its
     // own rasterizer (the single-window / standalone case), unchanged.
     public VkRenderer(VulkanContext ctx, uint width, uint height, SdfGlyphDiskCache? sdfDiskCache = null,
-        int sdfInitialAtlasDim = 0, ManagedFontRasterizer? rasterizer = null) : base(ctx)
+        int sdfInitialAtlasDim = 0, ManagedFontRasterizer? rasterizer = null,
+        float sdfLargeTierRasterSize = 0f, SdfGlyphDiskCache? sdfLargeTierDiskCache = null) : base(ctx)
     {
         _width = width;
         _height = height;
@@ -61,6 +74,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _sdfFontAtlas = sdfInitialAtlasDim > 0
             ? new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache, sdfInitialAtlasDim, sdfInitialAtlasDim)
             : new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache);
+        // Optional big-text tier (prototype, gated by the host). Its own disk cache is keyed at the
+        // larger raster; the default 1024² page holds ~16 of the big cells — ample for the handful of
+        // glyphs ever drawn that large. A null disk cache just means re-raster per session.
+        if (sdfLargeTierRasterSize > 0f)
+            _sdfFontAtlasLarge = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfLargeTierDiskCache,
+                rasterSize: sdfLargeTierRasterSize);
         UpdateProjection();
     }
 
@@ -70,7 +89,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     public VkPipelineSet? Pipelines => _pipelines;
     internal VkFontAtlas? FontAtlas => _fontAtlas;
     public ManagedFontRasterizer? GlyphRasterizer => _fontAtlas?.Rasterizer;
-    public bool FontAtlasDirty => _fontAtlas?.IsDirty == true || _sdfFontAtlas?.IsDirty == true;
+    public bool FontAtlasDirty => _fontAtlas?.IsDirty == true || _sdfFontAtlas?.IsDirty == true
+        || _sdfFontAtlasLarge?.IsDirty == true;
 
     public VulkanContext Context => Surface;
 
@@ -129,7 +149,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         if (_sdfFontAtlas is null || text.IsEmpty)
             return (0f, 0f);
 
-        var glyphScale = VkSdfFontAtlas.GetGlyphScale(fontSize);
+        var glyphScale = _sdfFontAtlas!.GetGlyphScale(fontSize);
         var bitmapScale = VkFontAtlas.GetGlyphScale(fontSize);
 
         // Same shaper as DrawText, so measured width matches drawn advance exactly (incl. any
@@ -197,9 +217,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // Handle deferred eviction, then flush font atlas changes before render pass
         _fontAtlas?.BeginFrame();
         _sdfFontAtlas?.BeginFrame();
+        _sdfFontAtlasLarge?.BeginFrame();
         OnPreFlush?.Invoke();
         _fontAtlas?.Flush(_currentCmd);
         _sdfFontAtlas?.Flush(_currentCmd);
+        _sdfFontAtlasLarge?.Flush(_currentCmd);
 
         // Record pending texture uploads before the render pass (transfers can't happen inside)
         OnPreRenderPass?.Invoke(_currentCmd);
@@ -292,9 +314,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
         _fontAtlas?.BeginFrame();
         _sdfFontAtlas?.BeginFrame();
+        _sdfFontAtlasLarge?.BeginFrame();
         OnPreFlush?.Invoke();
         _fontAtlas?.Flush(_currentCmd);
         _sdfFontAtlas?.Flush(_currentCmd);
+        _sdfFontAtlasLarge?.Flush(_currentCmd);
 
         OnPreRenderPass?.Invoke(_currentCmd);
 
@@ -350,6 +374,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// logs it when a fence sticks (the wedge breadcrumb) — a GPU hang leaves no readable GPU
     /// state, so this is the best available record of what the hung submission contained.</summary>
     public string GlyphAtlasBreadcrumb => _sdfFontAtlas is { } a ? $"sdf atlas: {a.FrameStats}" : "sdf atlas: n/a";
+
+    /// <summary>Per-tier SDF atlas residency (pages + glyphs) for the tiered-atlas A/B — the small
+    /// tier, plus the large tier when it's enabled. Cheap; intended for DEBUG/diagnostic reads.</summary>
+    public string SdfAtlasStats => _sdfFontAtlasLarge is { } lg
+        ? $"small[{_sdfFontAtlas?.FrameStats}]  large[{lg.FrameStats}]"
+        : $"single[{_sdfFontAtlas?.FrameStats}]";
 
     public override void FillRectangle(in RectInt rect, DIR.Lib.RGBAColor32 fillColor)
     {
@@ -892,14 +922,23 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// <paramref name="fontSize"/>, which drives the edge-softness push constant — callers must
     /// end the batch and begin a new one when fontSize changes.
     /// </summary>
-    public void BeginSdfGlyphBatch(DIR.Lib.RGBAColor32 color, float fontSize)
+    public void BeginSdfGlyphBatch(DIR.Lib.RGBAColor32 color, float fontSize, bool allowLargeTier = true)
     {
         _glyphBatchActive = true;
         _glyphBatchIsSdf = true;
         _glyphBatchFontSize = fontSize;
+        // Tier-select: route this batch to the large atlas once the on-screen fontSize (already device
+        // px) exceeds the small tier's raster — i.e. whenever we'd otherwise magnify the 64px field.
+        // fontSize is constant per SDF batch (a size change breaks the batch), so tier is per-batch.
+        // allowLargeTier is false for the renderer's own DrawText so UI labels stay single-tier
+        // (DrawText passes pre-resolved small-atlas glyphs, which must not be drawn against large pages).
+        _activeSdfAtlas = (allowLargeTier && _sdfFontAtlasLarge is not null && fontSize > _sdfFontAtlas!.RasterSize)
+            ? _sdfFontAtlasLarge
+            : _sdfFontAtlas;
         _glyphBatchStartOffset = uint.MaxValue;
         _glyphBatchVertexCount = 0;
         foreach (var l in _sdfPageVertices) l.Clear();  // reuse the per-page buffers, don't realloc
+        foreach (var l in _sdfFallbackPageVertices) l.Clear();
         SetColor(color);
     }
 
@@ -1082,7 +1121,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // rasterizeOnMiss: false — the draw path must never rasterize on the render thread. A glyph
         // not yet in the atlas is queued for background rasterization and skipped this frame (Width=0);
         // it appears once DrainPendingRasterized inserts it (a redraw is kept alive via IsDirty).
-        var glyph = _sdfFontAtlas.GetGlyph(fontPath, _glyphBatchFontSize, character,
+        var glyph = _activeSdfAtlas!.GetGlyph(fontPath, _glyphBatchFontSize, character,
             skipUnflushed: true, charCode: charCode, hint: hint, rasterizeOnMiss: false);
         AddBatchedSdfGlyph(glyph, inkX, inkY, rotation, xScale);
     }
@@ -1099,12 +1138,20 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     {
         if (_pipelines is null || _sdfFontAtlas is null || !_glyphBatchActive || !_glyphBatchIsSdf) return;
         if (glyph.Width == 0) return;
+        AddSdfQuad(_activeSdfAtlas!, _sdfPageVertices, in glyph, inkX, inkY, rotation, xScale);
+    }
 
+    // Emits one glyph quad into <paramref name="atlas"/>'s per-page vertex <paramref name="buckets"/>.
+    // Split out so the tiered fallback can route a not-yet-ready large glyph's small-tier placeholder
+    // into a separate bucket set — each is flushed with its own atlas's descriptor sets + AA band.
+    private void AddSdfQuad(VkSdfFontAtlas atlas, List<List<float>> buckets,
+        in SdfFontAtlas.GlyphInfo glyph, float inkX, float inkY, float rotation, float xScale)
+    {
         // The atlas may span several page textures; recover this glyph's page + page-local V
         // (U is already page-local). Each page is drawn separately in EndGlyphBatch.
-        _sdfFontAtlas.DecodePage(glyph, out var page, out var lv0, out var lv1);
+        atlas.DecodePage(glyph, out var page, out var lv0, out var lv1);
 
-        var glyphScale = VkSdfFontAtlas.GetGlyphScale(_glyphBatchFontSize);
+        var glyphScale = atlas.GetGlyphScale(_glyphBatchFontSize);
         // Stretch only the writing direction. SDF spread padding follows xScale on the X-axis
         // too so the ink inside the texture continues to land at (inkX, inkY) after scaling
         // — otherwise compressed text would slip leftward by (1 - xScale) * spread.
@@ -1158,9 +1205,9 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // Accumulate into this glyph's page bucket; EndGlyphBatch writes each page to the vertex
         // ring and issues one bind+draw per page. (No immediate WriteVertices — draws are grouped
         // by page so each binds its own page descriptor set.)
-        while (_sdfPageVertices.Count <= page)
-            _sdfPageVertices.Add(new List<float>(24 * 64));
-        var pageList = _sdfPageVertices[page];
+        while (buckets.Count <= page)
+            buckets.Add(new List<float>(24 * 64));
+        var pageList = buckets[page];
         pageList.AddRange(verts);
         _glyphBatchVertexCount += 6;
     }
@@ -1183,10 +1230,21 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     {
         if (_pipelines is null || _sdfFontAtlas is null || !_glyphBatchActive || !_glyphBatchIsSdf) return;
 
-        // rasterizeOnMiss: false — see AddBatchedSdfGlyph. Not-yet-rasterized glyphs queue + skip.
-        var glyph = _sdfFontAtlas.GetGlyph(fontPath, _glyphBatchFontSize, character,
+        // rasterizeOnMiss: false — a draw-path miss queues a background rasterize + skips this frame.
+        var atlas = _activeSdfAtlas!;
+        var buckets = _sdfPageVertices;
+        var glyph = atlas.GetGlyph(fontPath, _glyphBatchFontSize, character,
             skipUnflushed: true, charCode: charCode, hint: hint, rasterizeOnMiss: false);
-        AddBatchedSdfGlyphAtBaselineCore(in glyph, baselineX, baselineY, rotation, xIsInkLeft, xScale);
+        if (glyph.Width == 0 && !ReferenceEquals(atlas, _sdfFontAtlas))
+        {
+            // Large tier not ready yet (now queued). Draw the small-tier glyph as a placeholder so
+            // nothing vanishes on a zoom-in; it upgrades to the sharp glyph once the large one lands.
+            glyph = _sdfFontAtlas!.GetGlyph(fontPath, _glyphBatchFontSize, character,
+                skipUnflushed: true, charCode: charCode, hint: hint, rasterizeOnMiss: false);
+            atlas = _sdfFontAtlas!;
+            buckets = _sdfFallbackPageVertices;
+        }
+        AddBatchedSdfGlyphAtBaselineCore(atlas, buckets, in glyph, baselineX, baselineY, rotation, xIsInkLeft, xScale);
     }
 
     /// <summary>
@@ -1205,14 +1263,23 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     {
         if (_pipelines is null || _sdfFontAtlas is null || !_glyphBatchActive || !_glyphBatchIsSdf) return;
 
-        var glyph = _sdfFontAtlas.GetGlyphByGid(fontPath, gid, type1Name,
-            skipUnflushed: true, rasterizeOnMiss: false);
-        AddBatchedSdfGlyphAtBaselineCore(in glyph, baselineX, baselineY, rotation, xIsInkLeft, xScale);
+        var atlas = _activeSdfAtlas!;
+        var buckets = _sdfPageVertices;
+        var glyph = atlas.GetGlyphByGid(fontPath, gid, type1Name, skipUnflushed: true, rasterizeOnMiss: false);
+        if (glyph.Width == 0 && !ReferenceEquals(atlas, _sdfFontAtlas))
+        {
+            // Large tier not ready yet (now queued) — small-tier placeholder so nothing vanishes.
+            glyph = _sdfFontAtlas!.GetGlyphByGid(fontPath, gid, type1Name, skipUnflushed: true, rasterizeOnMiss: false);
+            atlas = _sdfFontAtlas!;
+            buckets = _sdfFallbackPageVertices;
+        }
+        AddBatchedSdfGlyphAtBaselineCore(atlas, buckets, in glyph, baselineX, baselineY, rotation, xIsInkLeft, xScale);
     }
 
     // Shared baseline→ink-top transform behind both SDF AtBaseline overloads (rune-resolved and
     // GID-direct) — keeps the two resolve paths in lockstep, mirroring GetGlyphByKey in the atlas.
-    private void AddBatchedSdfGlyphAtBaselineCore(in SdfFontAtlas.GlyphInfo glyph,
+    private void AddBatchedSdfGlyphAtBaselineCore(VkSdfFontAtlas atlas, List<List<float>> buckets,
+        in SdfFontAtlas.GlyphInfo glyph,
         float baselineX, float baselineY, float rotation, bool xIsInkLeft, float xScale)
     {
         if (glyph.Width == 0) return;
@@ -1226,7 +1293,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // positions) drift right by their own LSB, producing visible gaps in the rendered run.
         // The bearing-X lives along the writing direction so it must scale with xScale —
         // otherwise compressed glyphs slip out of their narrow advance slots.
-        var glyphScale = VkSdfFontAtlas.GetGlyphScale(_glyphBatchFontSize);
+        var glyphScale = atlas.GetGlyphScale(_glyphBatchFontSize);
         var bx = xIsInkLeft ? 0f : (glyph.BearingX + glyph.Spread) * glyphScale * xScale;
         var by = (glyph.BearingY - glyph.Spread) * glyphScale;
         float inkX, inkY;
@@ -1245,9 +1312,9 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             inkY = baselineY + bx * sinR - by * cosR;
         }
 
-        // The glyph is already resolved above for its bearings — hand it straight to the
-        // internal overload instead of the fontPath one, which would look it up again.
-        AddBatchedSdfGlyph(in glyph, inkX, inkY, rotation, xScale);
+        // The glyph is already resolved above for its bearings — emit its quad straight into the
+        // chosen atlas's buckets (the active tier, or the small-tier fallback set).
+        AddSdfQuad(atlas, buckets, in glyph, inkX, inkY, rotation, xScale);
     }
 
     /// <summary>
@@ -1300,6 +1367,17 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _sdfFontAtlas?.PreRasterizeBatchByGid(keys);
     }
 
+    /// <summary>Large-tier variants of the SDF batch prewarm: prewarm display-size glyphs (drawn
+    /// larger than the base raster on screen) into the large tier so they're ready before first draw
+    /// — eliminating even first-time pop-in on a fresh page. When the large tier is disabled these
+    /// fall back to the base atlas, since without a tier those glyphs draw from it (so single-tier
+    /// hosts still prewarm every visible glyph exactly as before).</summary>
+    public void PreWarmSdfGlyphBatchLarge(IReadOnlyList<(string Font, System.Text.Rune Character, int CharCode, DIR.Lib.GlyphMapHint Hint)> keys)
+        => (_sdfFontAtlasLarge ?? _sdfFontAtlas)?.PreRasterizeBatch(keys);
+
+    public void PreWarmSdfGlyphBatchByGidLarge(IReadOnlyList<(string Font, uint Gid, string? Type1Name)> keys)
+        => (_sdfFontAtlasLarge ?? _sdfFontAtlas)?.PreRasterizeBatchByGid(keys);
+
     /// <summary>
     /// Ends the current glyph batch and issues a single draw call for all accumulated glyphs.
     /// Dispatches to TexturedPipeline (bitmap atlas) or SdfPipeline (SDF atlas) based on which
@@ -1316,9 +1394,9 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // Slot 20 = sdfEdge: the analytic half-width of the SDF AA band for this batch's fontSize.
         // The shader prefers it over fwidth(dist), whose derivative spikes at median channel-switch
         // seams painted faint gray dashes under round glyphs. Bitmap batches leave it 0 (unused).
-        _pushConstants[20] = isSdf ? VkSdfFontAtlas.ScreenPxHalfBand(_glyphBatchFontSize) : 0f;
+        _pushConstants[20] = isSdf ? _activeSdfAtlas!.ScreenPxHalfBand(_glyphBatchFontSize) : 0f;
 
-        if (isSdf && _sdfFontAtlas is not null)
+        if (isSdf && _activeSdfAtlas is not null)
         {
             if (_glyphBatchVertexCount == 0) return;
             // The atlas spans one or more page textures, each its own descriptor set. Bind the SDF
@@ -1336,7 +1414,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 if (list.Count == 0) continue;
                 var vertOffset = Surface.WriteVertices(CollectionsMarshal.AsSpan(list));
                 if (vertOffset == uint.MaxValue) continue; // ring full this frame; drop the page
-                var descriptorSet = _sdfFontAtlas.GetPageDescriptorSet(p);
+                var descriptorSet = _activeSdfAtlas!.GetPageDescriptorSet(p);
                 api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
                     Surface.PipelineLayout, 0, 1, &descriptorSet, 0, null);
                 var buffer = Surface.VertexBuffer;
@@ -1344,6 +1422,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
                 api.vkCmdDraw(_currentCmd, (uint)(list.Count / 4), 1, 0, 0); // 4 floats (pos.xy+uv.xy)/vertex
             }
+
+            // Second pass: small-tier placeholders for not-yet-ready large-tier glyphs. Same SDF
+            // pipeline, but the small atlas → its own descriptor sets and 64px AA band, so re-push
+            // sdfEdge and bind its pages.
+            FlushSdfFallbackGlyphs();
             return;
         }
 
@@ -1360,6 +1443,39 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var bmpOffset = (ulong)_glyphBatchStartOffset;
         api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &bmpBuffer, &bmpOffset);
         api.vkCmdDraw(_currentCmd, (uint)_glyphBatchVertexCount, 1, 0, 0);
+    }
+
+    // Second flush pass for a tiered SDF batch: draws the small-tier placeholder glyphs accumulated in
+    // _sdfFallbackPageVertices (see AddSdfQuad). Called from EndGlyphBatch with the SdfPipeline already
+    // bound; re-pushes the small atlas's AA band and binds ITS page descriptor sets (a different atlas
+    // than the batch's active large tier). No-op when there are no fallbacks (the common case).
+    private void FlushSdfFallbackGlyphs()
+    {
+        if (_sdfFontAtlas is null) return;
+        var any = false;
+        foreach (var l in _sdfFallbackPageVertices) if (l.Count > 0) { any = true; break; }
+        if (!any) return;
+
+        var api = Surface.DeviceApi;
+        _pushConstants[20] = _sdfFontAtlas.ScreenPxHalfBand(_glyphBatchFontSize);
+        fixed (float* pPC = _pushConstants)
+            api.vkCmdPushConstants(_currentCmd, Surface.PipelineLayout,
+                VkShaderStageFlags.Vertex | VkShaderStageFlags.Fragment, 0, 84, pPC);
+
+        for (var p = 0; p < _sdfFallbackPageVertices.Count; p++)
+        {
+            var list = _sdfFallbackPageVertices[p];
+            if (list.Count == 0) continue;
+            var vertOffset = Surface.WriteVertices(CollectionsMarshal.AsSpan(list));
+            if (vertOffset == uint.MaxValue) continue; // ring full this frame; drop the page
+            var descriptorSet = _sdfFontAtlas.GetPageDescriptorSet(p);
+            api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
+                Surface.PipelineLayout, 0, 1, &descriptorSet, 0, null);
+            var buffer = Surface.VertexBuffer;
+            var vkOffset = (ulong)vertOffset;
+            api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
+            api.vkCmdDraw(_currentCmd, (uint)(list.Count / 4), 1, 0, 0);
+        }
     }
 
     /// <summary>
@@ -1545,7 +1661,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // frame for every UI label, so this path must stay allocation-free.
         var lineCount = text.Count('\n') + 1;
 
-        var glyphScale = VkSdfFontAtlas.GetGlyphScale(fontSize);
+        var glyphScale = _sdfFontAtlas!.GetGlyphScale(fontSize);
         var lineHeight = fontSize * 1.3f;
         var totalHeight = lineCount * lineHeight;
 
@@ -1565,7 +1681,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // descriptor set + push constants + vkCmdDraw -- one set of commands per batch
         // run instead of one per glyph. Emoji (color) glyphs interrupt the SDF run and
         // switch to a bitmap batch; switching back reopens an SDF batch.
-        BeginSdfGlyphBatch(fontColor, fontSize);
+        BeginSdfGlyphBatch(fontColor, fontSize, allowLargeTier: false);
         var inSdfBatch = true;
 
         var remaining = text;
@@ -1672,7 +1788,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 if (!inSdfBatch)
                 {
                     EndGlyphBatch();
-                    BeginSdfGlyphBatch(fontColor, fontSize);
+                    BeginSdfGlyphBatch(fontColor, fontSize, allowLargeTier: false);
                     inSdfBatch = true;
                 }
 
@@ -1699,6 +1815,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     {
         _sdfFontAtlas?.Dispose();
         _sdfFontAtlas = null;
+        _sdfFontAtlasLarge?.Dispose();
+        _sdfFontAtlasLarge = null;
         _fontAtlas?.Dispose();
         _fontAtlas = null;
         _pipelines?.Dispose();
