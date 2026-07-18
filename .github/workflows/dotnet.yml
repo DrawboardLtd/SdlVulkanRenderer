@@ -61,7 +61,12 @@ env:
   #       opt-in SYNCHRONIZATION validation switch (the GPU memory-hazard checker behind the wedge
   #       class) and a validation_report inspector/MCP tool. Gated: DEBUG or SDLVK_VALIDATION=1
   #       (+ SDLVK_SYNC_VALIDATION=1 for sync); zero cost + no layer in a normal Release build.
-  VERSION_PREFIX: 6.22.${{ github.run_number }}
+  # 6.23: VkSdfFontAtlas becomes the thin Vulkan backend of DIR.Lib's SdfFontAtlas — the fused
+  #       atlas shrinks to the GPU half only (per-page images/views/descriptor sets + per-frame
+  #       upload ring + dirty-region Flush). All CPU-side policy (keying, packing, LRU, budgets,
+  #       disk cache, async rasterize) now lives in DIR.Lib.SdfFontAtlas (6.11); page lifecycle
+  #       arrives via ISdfAtlasBackend. SdfGlyphDiskCache moved to DIR.Lib. Public API unchanged.
+  VERSION_PREFIX: 6.23.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
