@@ -9,7 +9,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     private VkPipelineSet? _pipelines;
     private VkFontAtlas? _fontAtlas;
     private VkSdfFontAtlas? _sdfFontAtlas;
-    // Optional large-text tier: a second SDF atlas at a bigger raster (e.g. 256px). BeginSdfGlyphBatch
+    // Optional large-text tier: a second SDF atlas at a bigger raster (e.g. 128px). BeginSdfGlyphBatch
     // routes a batch here once its on-screen fontSize exceeds the small tier's raster, so display-size
     // glyphs stop magnifying a 64px field. null = single-tier (unchanged behaviour).
     private VkSdfFontAtlas? _sdfFontAtlasLarge;
@@ -74,9 +74,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _sdfFontAtlas = sdfInitialAtlasDim > 0
             ? new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache, sdfInitialAtlasDim, sdfInitialAtlasDim)
             : new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache);
-        // Optional big-text tier (prototype, gated by the host). Its own disk cache is keyed at the
-        // larger raster; the default 1024² page holds ~16 of the big cells — ample for the handful of
-        // glyphs ever drawn that large. A null disk cache just means re-raster per session.
+        // Optional big-text tier (gated by the host). Its own disk cache is keyed at the larger
+        // raster. Every glyph drawn above the base raster on screen routes here — headings, zoomed-in
+        // body text — so pages do fill under real zoom: at 128px a 1024² page holds ~60 cells
+        // (ink-tight bitmaps, so it varies), and the atlas appends pages / evicts as usual.
+        // A null disk cache just means re-raster per session.
         if (sdfLargeTierRasterSize > 0f)
             _sdfFontAtlasLarge = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfLargeTierDiskCache,
                 rasterSize: sdfLargeTierRasterSize);
@@ -380,6 +382,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     public string SdfAtlasStats => _sdfFontAtlasLarge is { } lg
         ? $"small[{_sdfFontAtlas?.FrameStats}]  large[{lg.FrameStats}]"
         : $"single[{_sdfFontAtlas?.FrameStats}]";
+
+    /// <summary>The base SDF tier's raster size (px) — the tier-select threshold: an SDF batch whose
+    /// on-screen fontSize exceeds this routes to the large tier (see BeginSdfGlyphBatch). Hosts that
+    /// split prewarm by tier must compare against THIS, not the SdfFontAtlas.SdfRasterSize const, so
+    /// their split stays in lockstep with the tier-select if the base raster ever changes.</summary>
+    public float SdfBaseRasterSize => _sdfFontAtlas?.RasterSize ?? SdfFontAtlas.SdfRasterSize;
 
     public override void FillRectangle(in RectInt rect, DIR.Lib.RGBAColor32 fillColor)
     {
