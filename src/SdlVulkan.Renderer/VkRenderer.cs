@@ -16,6 +16,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // The SDF atlas the CURRENT batch draws from (small or large tier); set in BeginSdfGlyphBatch and
     // used by every batched-glyph op + the flush for that batch.
     private VkSdfFontAtlas? _activeSdfAtlas;
+    // Tier-select threshold in device px (see ctor). Meaningful only when _sdfFontAtlasLarge exists.
+    private readonly float _sdfLargeTierMinPx;
     private uint _width;
     private uint _height;
     private VkCommandBuffer _currentCmd;
@@ -65,7 +67,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // own rasterizer (the single-window / standalone case), unchanged.
     public VkRenderer(VulkanContext ctx, uint width, uint height, SdfGlyphDiskCache? sdfDiskCache = null,
         int sdfInitialAtlasDim = 0, ManagedFontRasterizer? rasterizer = null,
-        float sdfLargeTierRasterSize = 0f, SdfGlyphDiskCache? sdfLargeTierDiskCache = null) : base(ctx)
+        SdfLargeTierOptions? sdfLargeTier = null) : base(ctx)
     {
         _width = width;
         _height = height;
@@ -74,14 +76,25 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _sdfFontAtlas = sdfInitialAtlasDim > 0
             ? new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache, sdfInitialAtlasDim, sdfInitialAtlasDim)
             : new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfDiskCache);
-        // Optional big-text tier (gated by the host). Its own disk cache is keyed at the larger
-        // raster. Every glyph drawn above the base raster on screen routes here — headings, zoomed-in
-        // body text — so pages do fill under real zoom: at 128px a 1024² page holds ~60 cells
-        // (ink-tight bitmaps, so it varies), and the atlas appends pages / evicts as usual.
-        // A null disk cache just means re-raster per session.
-        if (sdfLargeTierRasterSize > 0f)
-            _sdfFontAtlasLarge = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, sdfLargeTierDiskCache,
-                rasterSize: sdfLargeTierRasterSize);
+        // Optional big-text tier (host passes SdfLargeTierOptions). Hard-capped + saturation-
+        // refusing: a dense-CJK doc's glyph vocabulary at 128px can exceed ANY cap several-fold
+        // (measured: 2,285 identities ≈ 47 pages vs 16), so past the cap the tier refuses inserts
+        // and those glyphs draw from the base atlas via the fallback pass — bounded GPU cost, and
+        // never the evict-all wipe+refill thrash that hammers the driver's allocation path.
+        if (sdfLargeTier is { RasterSize: > 0f } lt)
+        {
+            _sdfFontAtlasLarge = new VkSdfFontAtlas(ctx, _fontAtlas.Rasterizer, lt.DiskCache,
+                rasterSize: lt.RasterSize,
+                maxPages: lt.MaxPages,
+                refuseWhenSaturated: true);
+            // Tier-select threshold (device px). 0 → the base raster (anything that would magnify
+            // the base field); hosts pass a higher value to keep body-text-at-zoom out of the tier.
+            _sdfLargeTierMinPx = lt.MinOnScreenPx > 0f ? lt.MinOnScreenPx : _sdfFontAtlas!.RasterSize;
+        }
+        else
+        {
+            _sdfLargeTierMinPx = _sdfFontAtlas!.RasterSize;
+        }
         UpdateProjection();
     }
 
@@ -383,11 +396,14 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         ? $"small[{_sdfFontAtlas?.FrameStats}]  large[{lg.FrameStats}]"
         : $"single[{_sdfFontAtlas?.FrameStats}]";
 
-    /// <summary>The base SDF tier's raster size (px) — the tier-select threshold: an SDF batch whose
-    /// on-screen fontSize exceeds this routes to the large tier (see BeginSdfGlyphBatch). Hosts that
-    /// split prewarm by tier must compare against THIS, not the SdfFontAtlas.SdfRasterSize const, so
-    /// their split stays in lockstep with the tier-select if the base raster ever changes.</summary>
+    /// <summary>The base SDF tier's raster size (px). See <see cref="SdfLargeTierMinPx"/> for the
+    /// tier-select threshold — the two coincide only when the host didn't raise the threshold.</summary>
     public float SdfBaseRasterSize => _sdfFontAtlas?.RasterSize ?? SdfFontAtlas.SdfRasterSize;
+
+    /// <summary>The tier-select threshold (device px): an SDF batch whose on-screen fontSize exceeds
+    /// this routes to the large tier (see BeginSdfGlyphBatch). Hosts that split prewarm by tier must
+    /// compare against THIS so their split stays in lockstep with the tier-select.</summary>
+    public float SdfLargeTierMinPx => _sdfLargeTierMinPx > 0f ? _sdfLargeTierMinPx : SdfBaseRasterSize;
 
     public override void FillRectangle(in RectInt rect, DIR.Lib.RGBAColor32 fillColor)
     {
@@ -936,11 +952,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _glyphBatchIsSdf = true;
         _glyphBatchFontSize = fontSize;
         // Tier-select: route this batch to the large atlas once the on-screen fontSize (already device
-        // px) exceeds the small tier's raster — i.e. whenever we'd otherwise magnify the 64px field.
-        // fontSize is constant per SDF batch (a size change breaks the batch), so tier is per-batch.
-        // allowLargeTier is false for the renderer's own DrawText so UI labels stay single-tier
-        // (DrawText passes pre-resolved small-atlas glyphs, which must not be drawn against large pages).
-        _activeSdfAtlas = (allowLargeTier && _sdfFontAtlasLarge is not null && fontSize > _sdfFontAtlas!.RasterSize)
+        // px) exceeds the host's threshold (default: the small tier's raster — anything that would
+        // magnify the base field). fontSize is constant per SDF batch (a size change breaks the
+        // batch), so tier is per-batch. allowLargeTier is false for the renderer's own DrawText so UI
+        // labels stay single-tier (DrawText passes pre-resolved small-atlas glyphs, which must not be
+        // drawn against large pages).
+        _activeSdfAtlas = (allowLargeTier && _sdfFontAtlasLarge is not null && fontSize > _sdfLargeTierMinPx)
             ? _sdfFontAtlasLarge
             : _sdfFontAtlas;
         _glyphBatchStartOffset = uint.MaxValue;

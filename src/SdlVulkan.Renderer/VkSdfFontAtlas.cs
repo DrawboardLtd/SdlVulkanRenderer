@@ -45,7 +45,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable, ISdfAtlasBackend
         SdfGlyphDiskCache? diskCache = null,
         int initialWidth = SdfFontAtlas.DefaultInitialAtlasDim,
         int initialHeight = SdfFontAtlas.DefaultInitialAtlasDim,
-        float rasterSize = SdfFontAtlas.SdfRasterSize)
+        float rasterSize = SdfFontAtlas.SdfRasterSize,
+        int maxPages = SdfFontAtlas.MaxPages,
+        bool refuseWhenSaturated = false)
     {
         _ctx = ctx;
         // MUST run before constructing the core: its ctor synchronously allocates page 0, which
@@ -57,7 +59,9 @@ internal sealed unsafe class VkSdfFontAtlas : IDisposable, ISdfAtlasBackend
             backend: this,
             initialPageDim: initialWidth,
             diskCache: diskCache,
-            rasterSize: rasterSize);
+            rasterSize: rasterSize,
+            maxPages: maxPages,
+            refuseWhenSaturated: refuseWhenSaturated);
         // initialHeight intentionally unused — pages are square, exactly as before the split.
         _ = initialHeight;
     }
