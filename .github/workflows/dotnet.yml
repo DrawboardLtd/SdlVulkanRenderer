@@ -66,7 +66,13 @@ env:
   #       upload ring + dirty-region Flush). All CPU-side policy (keying, packing, LRU, budgets,
   #       disk cache, async rasterize) now lives in DIR.Lib.SdfFontAtlas (6.11); page lifecycle
   #       arrives via ISdfAtlasBackend. SdfGlyphDiskCache moved to DIR.Lib. Public API unchanged.
-  VERSION_PREFIX: 6.24.${{ github.run_number }}
+  # 6.24: pre-bake shaders to SPIR-V at build (tools/BakeShaders, source-only); VkPipelineSet loads
+  #       embedded .spv instead of compiling GLSL at runtime — no runtime shaderc, no first-render
+  #       compile stall. Plus the large-text SDF atlas tier (SdfLargeTierOptions: second atlas at a
+  #       larger raster, tier-select + fallback pass). DIR.Lib 6.13.
+  # 6.25: DIR.Lib 6.14 (responsive layout primitives: clamped Star, collapse-below-minimum, Wrap) —
+  #       dependency repin only.
+  VERSION_PREFIX: 6.25.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
