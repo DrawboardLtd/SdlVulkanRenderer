@@ -66,7 +66,7 @@ env:
   #       upload ring + dirty-region Flush). All CPU-side policy (keying, packing, LRU, budgets,
   #       disk cache, async rasterize) now lives in DIR.Lib.SdfFontAtlas (6.11); page lifecycle
   #       arrives via ISdfAtlasBackend. SdfGlyphDiskCache moved to DIR.Lib. Public API unchanged.
-  VERSION_PREFIX: 6.23.${{ github.run_number }}
+  VERSION_PREFIX: 6.24.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
