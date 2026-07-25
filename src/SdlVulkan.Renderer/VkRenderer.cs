@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.InteropServices;
 using DIR.Lib;
 using Vortice.Vulkan;
@@ -29,6 +30,10 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
     // Push constant data: mat4 (16 floats) + vec4 color (4 floats) + float innerRadius (1 float) = 84 bytes
     private readonly float[] _pushConstants = new float[21];
+
+    // Content→device transform folded into the projection (see UpdateProjection). Identity by default,
+    // so the projection is byte-identical to the plain screen-space ortho until a consumer sets it.
+    private DeviceTransform _deviceTransform = DeviceTransform.Identity;
 
     // Glyph batching state — accumulates contiguous glyph quads for a single draw call.
     // A batch is either bitmap (TexturedPipeline + RGBA atlas) or SDF (SdfPipeline +
@@ -358,6 +363,23 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     }
 
     /// <summary>
+    /// Rebuild the swapchain against a NEW presentation surface. Android destroys the native surface
+    /// when the app is backgrounded and hands back a fresh one on foreground, so the old swapchain and
+    /// surface are dead on return. <paramref name="recreateSurface"/> must create the replacement (the
+    /// window destroys the old handle and returns the new one); it runs AFTER the old swapchain is torn
+    /// down and BEFORE the new one binds. Bounded-drain, no vkDeviceWaitIdle (see
+    /// <see cref="VulkanContext.PrepareForSurfaceLoss"/>).
+    /// </summary>
+    public void RecreateForNewSurface(Func<VkSurfaceKHR> recreateSurface, uint width, uint height)
+    {
+        _width = width;
+        _height = height;
+        Surface.PrepareForSurfaceLoss();
+        Surface.AdoptSurface(recreateSurface(), width, height);
+        UpdateProjection();
+    }
+
+    /// <summary>
     /// Resize the offscreen render target (offscreen contexts only) and update the projection to
     /// match. Unlike <see cref="Resize"/> this rebuilds the single VkImage target, not a swapchain,
     /// and leaves the glyph atlases intact — for multi-page offscreen raster/export where pages
@@ -440,6 +462,10 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     // allocation. Render-thread only, like all draw APIs.
     private readonly List<float> _rectScratch = new();
 
+    // Scratch vertex accumulator for batched polylines (DrawPolyline / DrawPolylineDashed) — reused,
+    // render-thread only, like _rectScratch.
+    private readonly List<float> _polyScratch = new();
+
     public override void FillRectangles(ReadOnlySpan<(RectInt Rect, DIR.Lib.RGBAColor32 Color)> rectangles)
     {
         if (_pipelines is null || rectangles.IsEmpty) return;
@@ -517,6 +543,8 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// <summary>
     /// Draws triangles with a custom origin and scale (e.g. for tiled/paged rendering).
     /// Builds a combined projection so vertices stay in their original coordinate space.
+    /// NOTE: this builds its own screen-space projection inline and does NOT honour
+    /// <see cref="DeviceTransform"/> (tiled/paged capture runs at the surface's native orientation).
     /// </summary>
     public void DrawTrianglesTransformed(ReadOnlySpan<float> vertices, DIR.Lib.RGBAColor32 color,
         float originX, float originY, float scale)
@@ -1132,7 +1160,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// <summary>
     /// Adds an SDF glyph to the current batch at the exact ink top-left position (no draw call
     /// issued). All glyphs in the batch share the fontSize passed to <see cref="BeginSdfGlyphBatch"/>.
-    /// <para>Semantics match <see cref="AddBatchedGlyph"/>: <paramref name="inkX"/>/<paramref name="inkY"/>
+    /// <para>Semantics match <see cref="AddBatchedGlyph(string, float, System.Text.Rune, int, float, float, float, GlyphMapHint, float)"/>: <paramref name="inkX"/>/<paramref name="inkY"/>
     /// is where the top-left of the glyph's *ink* bounding box should land. The SDF texture itself
     /// extends <c>spread*scale</c> pixels beyond the ink on every side; this function offsets the
     /// quad so the ink inside lines up with the caller's coordinates.</para>
@@ -1240,7 +1268,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// <summary>
     /// Adds an SDF glyph to the current batch at the text baseline position (no draw call issued).
     /// Computes ink-top from baseline using the glyph's bearing, then delegates to
-    /// <see cref="AddBatchedSdfGlyph"/>.
+    /// <see cref="AddBatchedSdfGlyph(string, System.Text.Rune, int, float, float, float, GlyphMapHint, float)"/>.
     /// <para>
     /// <paramref name="xIsInkLeft"/>: when false (default), <paramref name="baselineX"/> is
     /// treated as glyph origin (pen position) and the glyph's LSB is added to reach ink-left.
@@ -1546,6 +1574,78 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         DrawTriangles(vertices, color);
     }
 
+    /// <summary>
+    /// Batched polyline: expands every segment to a rotated quad and records the whole run as ONE
+    /// FlatPipeline draw (single WriteVertices + bind + push + draw), instead of the base class's
+    /// one-<see cref="DrawLine"/>-per-segment loop (N draws). Geometry is identical to calling
+    /// <see cref="DrawLine"/> per consecutive pair; no join handling (matches the base contract).
+    /// </summary>
+    public override void DrawPolyline(ReadOnlySpan<(float X, float Y)> points, DIR.Lib.RGBAColor32 color, int thickness = 1)
+    {
+        if (_pipelines is null || points.Length < 2) return;
+
+        var hw = Math.Max(thickness, 1) * 0.5f;
+        _polyScratch.Clear();
+        for (var i = 1; i < points.Length; i++)
+            AppendSegmentQuad(_polyScratch, points[i - 1].X, points[i - 1].Y, points[i].X, points[i].Y, hw);
+
+        if (_polyScratch.Count >= 6)
+            DrawTriangles(CollectionsMarshal.AsSpan(_polyScratch), color);
+    }
+
+    /// <summary>
+    /// Batched dashed polyline: every visible dash across every segment becomes one rotated quad, and
+    /// the whole run records as ONE FlatPipeline draw. Dash pattern resets at each vertex (no phase
+    /// continuity), matching the base <c>DrawLineDashed</c> semantics. Degrades to
+    /// <see cref="DrawPolyline"/> when either length is non-positive.
+    /// </summary>
+    public override void DrawPolylineDashed(ReadOnlySpan<(float X, float Y)> points, DIR.Lib.RGBAColor32 color,
+        float dashLength, float gapLength, int thickness = 1)
+    {
+        if (_pipelines is null || points.Length < 2) return;
+        if (dashLength <= 0f || gapLength <= 0f) { DrawPolyline(points, color, thickness); return; }
+
+        var hw = Math.Max(thickness, 1) * 0.5f;
+        var period = dashLength + gapLength;
+        _polyScratch.Clear();
+        for (var i = 1; i < points.Length; i++)
+        {
+            float x0 = points[i - 1].X, y0 = points[i - 1].Y;
+            var dx = points[i].X - x0;
+            var dy = points[i].Y - y0;
+            var len = MathF.Sqrt(dx * dx + dy * dy);
+            if (len <= 0f) continue;
+            var ux = dx / len;
+            var uy = dy / len;
+            for (var t = 0f; t < len; t += period)
+            {
+                var dashEnd = MathF.Min(t + dashLength, len);
+                AppendSegmentQuad(_polyScratch, x0 + ux * t, y0 + uy * t, x0 + ux * dashEnd, y0 + uy * dashEnd, hw);
+            }
+        }
+
+        if (_polyScratch.Count >= 6)
+            DrawTriangles(CollectionsMarshal.AsSpan(_polyScratch), color);
+    }
+
+    // Appends one segment's rotated quad (2 triangles, 6 position-only vertices) to the accumulator.
+    // Same perpendicular-normal quad math as DrawLine; degenerate (zero-length) segments are skipped.
+    private static void AppendSegmentQuad(List<float> dst, float x0, float y0, float x1, float y1, float hw)
+    {
+        var dx = x1 - x0;
+        var dy = y1 - y0;
+        var len = MathF.Sqrt(dx * dx + dy * dy);
+        if (len < 0.001f) return;
+
+        var nx = -dy / len * hw;
+        var ny = dx / len * hw;
+        var ax = x0 + nx; var ay = y0 + ny;
+        var bx = x0 - nx; var by = y0 - ny;
+        var cx = x1 - nx; var cy = y1 - ny;
+        var ex = x1 + nx; var ey = y1 + ny;
+        dst.AddRange([ax, ay, bx, by, cx, cy, ax, ay, cx, cy, ex, ey]);
+    }
+
     public override void DrawRectangle(in RectInt rect, DIR.Lib.RGBAColor32 strokeColor, int strokeWidth)
     {
         if (_pipelines is null) return;
@@ -1848,18 +1948,49 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         _pipelines = null;
     }
 
+    /// <inheritdoc/>
+    public override DeviceTransform DeviceTransform
+    {
+        get => _deviceTransform;
+        set
+        {
+            _deviceTransform = value;
+            UpdateProjection(); // refold into the cached push-constant matrix
+        }
+    }
+
     private void UpdateProjection()
     {
         var w = (float)_width;
         var h = (float)_height;
 
+        // Device→NDC orthographic as a 2D affine (Vulkan Y already points down, so no Y-flip here):
+        //   (x, y) → (2x/w − 1, 2y/h − 1).
+        var proj = new Matrix3x2(
+            2f / w, 0f,
+            0f, 2f / h,
+            -1f, -1f);
+
+        // Fold the content→device transform in front of it: content → device → NDC. This is the only
+        // matrix MULTIPLY, and it stays 2×3 — the transform is a pure affine (no perspective, no z), so a
+        // 4×4 multiply would waste half its lanes. System.Numerics keeps it to the six real coefficients.
+        // Identity _deviceTransform leaves `mvp` == `proj`, so the upload below is byte-identical to the
+        // plain screen-space projection this method used to write.
+        var mvp = _deviceTransform.ToMatrix3x2() * proj;
+
+        // Widen the composed affine into the mat4 the vertex shaders multiply (gl_Position = proj *
+        // vec4(pos, 0, 1)). The push-constant block is a column-major GLSL mat4: the linear part lands in
+        // slots 0/1/4/5, the translation in the last column (12/13), and the z/w rows are constants (all
+        // geometry is z = 0, so m22 = −1 leaves clip.z = 0 exactly as before).
         Array.Clear(_pushConstants, 0, 16);
-        _pushConstants[0] = 2f / w;      // m00
-        _pushConstants[5] = 2f / h;      // m11 (Vulkan Y already points down)
-        _pushConstants[10] = -1f;        // m22
-        _pushConstants[12] = -1f;        // m30
-        _pushConstants[13] = -1f;        // m31
-        _pushConstants[15] = 1f;         // m33
+        _pushConstants[0] = mvp.M11;
+        _pushConstants[1] = mvp.M12;
+        _pushConstants[4] = mvp.M21;
+        _pushConstants[5] = mvp.M22;
+        _pushConstants[10] = -1f;         // z passthrough (clip.z = 0 for z = 0 geometry)
+        _pushConstants[12] = mvp.M31;     // translation x
+        _pushConstants[13] = mvp.M32;     // translation y
+        _pushConstants[15] = 1f;
     }
 
     private void SetColor(DIR.Lib.RGBAColor32 color)

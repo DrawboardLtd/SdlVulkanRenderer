@@ -146,6 +146,8 @@ public sealed class SdlEventLoop
     public Func<float, float, bool>? OnMouseMove { get => Primary.OnMouseMove; set => Primary.OnMouseMove = value; }
     public Action<byte>? OnMouseUp { get => Primary.OnMouseUp; set => Primary.OnMouseUp = value; }
     public Func<float, float, float, bool>? OnMouseWheel { get => Primary.OnMouseWheel; set => Primary.OnMouseWheel = value; }
+    /// <summary>Primary window's unified pointer callback. See <see cref="SdlWindowView.OnPointerInput"/>.</summary>
+    public Func<InputEvent, bool>? OnPointerInput { get => Primary.OnPointerInput; set => Primary.OnPointerInput = value; }
     public Action<float, float, float, PinchSource>? OnPinch { get => Primary.OnPinch; set => Primary.OnPinch = value; }
     public Action? OnPinchEnd { get => Primary.OnPinchEnd; set => Primary.OnPinchEnd = value; }
     public Action<string>? OnTextInput { get => Primary.OnTextInput; set => Primary.OnTextInput = value; }
@@ -166,6 +168,21 @@ public sealed class SdlEventLoop
 
     /// <summary>Stops the event loop. Safe to call from any callback.</summary>
     public void Stop() => _running = false;
+
+    /// <summary>
+    /// Optional diagnostic sink. Android apps have no console (Console.Error is not routed to logcat),
+    /// so the host can point this at <c>Android.Util.Log</c> to see loop-internal lifecycle traces
+    /// (surface loss / rebuild). Null (default) = no diagnostics, so it costs nothing when unset.
+    /// Static so it can be set before any loop exists.
+    /// </summary>
+    public static Action<string>? DiagnosticLog;
+
+    // DebugLog calls are kept when DEBUG OR ANDROID is defined (multiple [Conditional] attributes are
+    // OR-ed). ANDROID is defined for the net10.0-android TFM, so the traces survive the Release device
+    // build — where they're actually needed — yet compile out of desktop Release entirely (the whole
+    // call, args included). Routed through DiagnosticLog so there's still no cost when no sink is set.
+    [Conditional("DEBUG"), Conditional("ANDROID")]
+    private static void DebugLog(string message) => DiagnosticLog?.Invoke(message);
 
     /// <summary>
     /// Runs the event loop until <see cref="Stop"/> is called or the cancellation token is triggered.
@@ -246,6 +263,48 @@ public sealed class SdlEventLoop
     {
         var renderer = v.Renderer;
 
+        // Android app lifecycle: on the first frame after returning to the foreground, rebuild the
+        // swapchain against a fresh surface (the native surface was destroyed while backgrounded).
+        // Never while a sacrificial recovery task exists — its thread may still be mutating this
+        // renderer's Vulkan state, and the poll block below owns that path (including the wedge
+        // deadline, which must stay live while the rebuild waits its turn).
+        if (v.NeedsSurfaceRebuild && v.GpuRecoveryTask is null)
+        {
+            v.Window.GetSizeInPixels(out var fw, out var fh);
+            if (fw <= 0 || fh <= 0)
+            {
+                // Android delivers the new surface a beat after the foreground event — settle and retry.
+                DebugLog($"[resume] surface not sized yet ({fw}x{fh}); retry");
+                v.NeedsRedraw = true;
+                v.NextRenderAttemptTick = Environment.TickCount64 + FenceRetryBackoffMs;
+                return false;
+            }
+            try
+            {
+                renderer.RecreateForNewSurface(
+                    () => { v.Window.RecreateSurface(); return v.Window.Surface; }, (uint)fw, (uint)fh);
+                DebugLog($"[resume] swapchain rebuilt at {fw}x{fh}");
+                v.OnResize?.Invoke((uint)fw, (uint)fh);
+                v.NeedsSurfaceRebuild = false;
+                v.Paused = false;
+                v.NeedsRedraw = true; // paint the restored frame now that the swapchain is live
+            }
+            catch (VkException ex)
+            {
+                // Surface not ready to build a swapchain yet (still settling) — retry next tick.
+                DebugLog($"[resume] rebuild threw ({ex.Message}); retry");
+                v.NeedsRedraw = true;
+                v.NextRenderAttemptTick = Environment.TickCount64 + FenceRetryBackoffMs;
+            }
+            return false;
+        }
+
+        // Backgrounded: the native surface is gone. Skip all rendering until DidEnterForeground —
+        // except polling a pending recovery task: its fault/deadline handling must not stall just
+        // because the app was backgrounded (or is awaiting a rebuild) mid-recovery.
+        if (v.Paused && v.GpuRecoveryTask is null)
+            return false;
+
         // A sacrificial recovery task owns this window's renderer while in flight (see the
         // stuck-fence escalation in the catch below). Poll it here — the render thread itself never
         // enters the possibly-blocking teardown: success resumes rendering, failure or a blown
@@ -256,6 +315,14 @@ public sealed class SdlEventLoop
             {
                 v.GpuRecoveryTask = null;
                 Console.Error.WriteLine($"[SdlEventLoop] GPU recovery completed (window {v.Window.WindowId}); resuming.");
+                // A surface rebuild queued up while recovery ran (Android backgrounded mid-recovery):
+                // recovery rebuilt against the OLD surface, which is dead — don't present to it. Hand
+                // control back to the rebuild branch next frame, now that the task is cleared.
+                if (v.NeedsSurfaceRebuild || v.Paused)
+                {
+                    v.NeedsRedraw = true;
+                    return false;
+                }
                 // Recovery rebuilt the swapchain at the pre-recovery size; re-run layout only if the
                 // window was resized while recovery was in flight (mirrors the synchronous path).
                 v.Window.GetSizeInPixels(out var rw, out var rh);
@@ -497,6 +564,18 @@ public sealed class SdlEventLoop
             case EventType.WindowPixelSizeChanged:
                 if (TryView(evt.Window.WindowID, out var vr))
                 {
+                    // Backgrounded or awaiting a surface rebuild (Android): the current surface is
+                    // dead, so resizing the swapchain against it would throw SURFACE_LOST — and
+                    // Dispatch runs uncaught. SDL can deliver Restored + Resized in one poll batch
+                    // (rotation does), both ahead of RenderView's rebuild. Fold the resize into the
+                    // rebuild instead: it re-reads the pixel size when it runs. Never true on desktop.
+                    if (vr.Paused || vr.NeedsSurfaceRebuild)
+                    {
+                        DebugLog($"[resume] resize while surface dead -> folded into rebuild");
+                        vr.NeedsSurfaceRebuild = true;
+                        vr.NeedsRedraw = true;
+                        break;
+                    }
                     vr.Window.GetSizeInPixels(out var rw, out var rh);
                     if (rw > 0 && rh > 0)
                     {
@@ -509,12 +588,53 @@ public sealed class SdlEventLoop
 
             case EventType.WindowRestored:
             case EventType.WindowExposed:
-                // Un-minimize / re-expose: re-arm a repaint. Covers the case where the window was
-                // idle (NeedsRedraw already false) when it got minimized, so the render pass's
-                // "keep NeedsRedraw armed" has nothing to resume from.
+                // Un-minimize / re-expose: re-arm a repaint. Covers the case where the window was idle
+                // (NeedsRedraw already false) when it got minimized, so the render pass's "keep
+                // NeedsRedraw armed" has nothing to resume from.
                 if (TryView(evt.Window.WindowID, out var ve))
+                {
+                    // On Android this is the return-to-foreground signal (SDL delivers Minimized/Restored
+                    // window events, not the app-lifecycle ones): the native surface was destroyed while
+                    // backgrounded, so rebuild the swapchain against a fresh one before the next frame.
+                    // Desktop restore doesn't lose the surface, so it just re-arms a repaint (no churn).
+#if ANDROID
+                    DebugLog($"[resume] window event ({(EventType)evt.Type}) -> rebuild flagged");
+                    ve.NeedsSurfaceRebuild = true;
+#endif
                     ve.NeedsRedraw = true;
+                }
                 break;
+
+#if ANDROID
+            case EventType.WindowHidden:
+            case EventType.WindowMinimized:
+                // Android background: the native surface is torn down. Stop presenting to it (a present
+                // on the dead surface fails with "No such device") until we're restored and have rebuilt.
+                DebugLog($"[resume] window event ({(EventType)evt.Type}) -> paused");
+                if (TryView(evt.Window.WindowID, out var vh))
+                    vh.Paused = true;
+                break;
+
+            // App-lifecycle events (app-level, not per-window): belt-and-suspenders alongside the
+            // window Minimized/Restored events above — SDL delivers window events on the tested device,
+            // but other devices/SDL versions may deliver these instead.
+            case EventType.WillEnterBackground:
+            case EventType.DidEnterBackground:
+                DebugLog($"[resume] background ({(EventType)evt.Type})");
+                foreach (var bg in _viewList)
+                    bg.Paused = true;
+                break;
+
+            case EventType.WillEnterForeground:
+            case EventType.DidEnterForeground:
+                DebugLog($"[resume] foreground ({(EventType)evt.Type}) -> rebuild flagged");
+                foreach (var fg in _viewList)
+                {
+                    fg.NeedsSurfaceRebuild = true;
+                    fg.NeedsRedraw = true;
+                }
+                break;
+#endif
 
             case EventType.KeyDown:
                 if (TryView(evt.Key.WindowID, out var vk))
@@ -527,14 +647,22 @@ public sealed class SdlEventLoop
             case EventType.MouseButtonDown:
                 if (TryView(evt.Button.WindowID, out var vmd))
                 {
-                    vmd.OnMouseDown?.Invoke(evt.Button.Button, evt.Button.X, evt.Button.Y, evt.Button.Clicks, GetModState().ToInputModifier);
+                    vmd.DispatchPointerDown(evt.Button.Button, evt.Button.X, evt.Button.Y, evt.Button.Clicks, GetModState().ToInputModifier);
                     vmd.NeedsRedraw = true;
                 }
                 break;
 
             case EventType.MouseButtonUp:
                 if (TryView(evt.Button.WindowID, out var vmu))
-                    vmu.OnMouseUp?.Invoke(evt.Button.Button);
+                {
+                    // SDL's button-up event DOES carry the release coordinates — only the legacy
+                    // Action<byte> signature drops them. The synthesized event keeps them, so
+                    // position-dependent release logic (tap-vs-drag slop, tap-to-select) just works.
+                    if (vmu.DispatchPointerUp(evt.Button.Button, evt.Button.X, evt.Button.Y))
+                    {
+                        vmu.NeedsRedraw = true;
+                    }
+                }
                 break;
 
             case EventType.MouseMotion:
@@ -546,7 +674,7 @@ public sealed class SdlEventLoop
                     {
                         vmm.MouseX = newMx;
                         vmm.MouseY = newMy;
-                        if (vmm.OnMouseMove?.Invoke(vmm.MouseX, vmm.MouseY) == true)
+                        if (vmm.DispatchPointerMove(vmm.MouseX, vmm.MouseY))
                         {
                             // Throttle mouse-driven redraws to ~30fps (per window).
                             var now = GetPerformanceCounter();
@@ -563,7 +691,7 @@ public sealed class SdlEventLoop
             case EventType.MouseWheel:
                 if (TryView(evt.Wheel.WindowID, out var vw))
                 {
-                    vw.OnMouseWheel?.Invoke(evt.Wheel.Y, vw.MouseX, vw.MouseY);
+                    vw.DispatchPointerWheel(evt.Wheel.Y, vw.MouseX, vw.MouseY, GetModState().ToInputModifier);
                     vw.NeedsRedraw = true;
                 }
                 break;

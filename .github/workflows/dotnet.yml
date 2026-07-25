@@ -13,66 +13,58 @@ env:
   # frame stall). Internal change to VkSdfFontAtlas + the SDF draw path; the public VkRenderer API
   # is source-compatible (the optional sdfInitialAtlasDim param now sizes a page).
   # 5.1: VkRenderer overrides DIR.Lib's PushClip/PopClip → Vulkan scissor (needs DIR.Lib >= 4.4).
-  # Major bump 5.1 -> 6.0: multi-window foundation. Device-level Vulkan state split out of
-  # VulkanContext into a shareable VulkanDevice; new SdlVulkanApp owns SDL + one VkInstance + one
-  # shared device across windows; SdlVulkanWindow gains an app-path factory + WindowId;
-  # VulkanContext.CreateForSharedDevice builds a swapchain against an existing device. Single-window
-  # source-compatible (Create / CreateOffscreen unchanged), but the new app/window/device layering
-  # is the intended multi-window entry point.
-  # 6.3: OnPinch passes a PinchSource (touchpad vs touchscreen) — needs DIR.Lib >= 4.6.
-  # 6.4: DIR.Lib 5.0 (surface-agnostic layout/menu subsystem); VkMenuWidget dropped
-  #      (superseded by DIR.Lib PixelMenuWidget).
-  # 6.5: DIR.Lib 5.1 (markdown image nodes) — dependency repin only.
-  # 6.6: live-device thumbnail capture (VulkanContext.ThumbnailCapture + VkRenderer
+  # 6.0: multi-window — one VulkanDevice shared across windows (SdlVulkanApp); VulkanContext split into
+  #      device-level (VulkanDevice) + per-window state; multi-window SdlEventLoop. Breaking: standalone
+  #      consumers move to SdlVulkanApp. Adds opt-in SDF glyph disk cache + window placement/morph API.
+  # 6.4: rebuilt against DIR.Lib 5.0 (layout engine + PixelMenuWidget); removes VkMenuWidget
+  #      (superseded by DIR.Lib's surface-agnostic PixelMenuWidget).
+  # 6.5: live-device thumbnail capture (VulkanContext.ThumbnailCapture + VkRenderer
   #      BeginThumbnailCapture/EndThumbnailCapture/TryGetThumbnailCapture) — re-issues already-
   #      tessellated geometry into an offscreen target at thumbnail scale, non-blocking readback.
   #      Plus SDF atlas per-page LRU eviction (replaces EvictAll thrash) + bounded disk-load drain.
-  # 6.7: DIR.Lib 5.2 (font family+style by-name resolution) — dependency repin only.
-  # 6.8: map SDL Alpha0 ('0' key) to InputKey.D0 (was landing one past D9).
-  # 6.9: DIR.Lib 6.0 (DIR.Lib.Layout namespace + Builder DSL + Node.Split) — dependency repin only.
-  # 6.10: DIR.Lib 6.1 (embedded Type1 PFB/raw-FontFile glyph rendering) — dependency repin only.
-  # 6.11: describe_layout inspector core (GetLayout option + arranged-tree serialization); DIR.Lib 6.2.
-  # 6.12: DIR.Lib 6.3 (BackgroundTaskTracker.RunGuarded) — dependency repin only.
-  # 6.13: MTSDF glyph rendering — R8 SDF atlas -> 4-channel MTSDF (median(r,g,b) shader), atlas keyed
-  #       by resolved glyph identity (GID for OpenType, PostScript name for Type1) instead of
-  #       (Rune, charCode); .sdfg disk format -> v4. Public glyph API stays source-compatible (the
-  #       (Rune, charCode, GlyphMapHint) methods resolve to identity internally); by-GID variants
-  #       (GetGlyphByGid / PreWarmSdfGlyphByGid) added. DIR.Lib 6.8.
-  # 6.14: SdlVulkanWindow.GetNativeWindowHandle (native HWND/NSWindow/wl_surface for hosting
-  #       native child surfaces) + the SdlVulkan.Renderer.Inspector project source (MCP bridge;
-  #       carried as source only — not in the .sln, consumed via the published dnx tool).
-  # 6.15: GPU-wedge resilience. Stuck-fence recovery now runs on a sacrificial background task the
+  # 6.7: lockstep rebuild against DIR.Lib 6.0 (layout namespace + Layout.Builder DSL).
+  # 6.8: inspector render-thread watchdog -- render_liveness MCP tool + ProbeRenderAsync (ALIVE/BLOCKED/DEAD
+  #      via a short-budget ping that round-trips ON the render thread; detects a wedged render loop).
+  # 6.9: inspector describe_layout MCP tool -- serializes the FULL arranged DIR.Lib.Layout tree (depth +
+  #      kind + rect + content/bg/hit chrome), not just the clickable subset describe_ui shows. Needs
+  #      DIR.Lib's ArrangedNode.Depth + PixelWidgetBase.GetCapturedLayout + LayoutInspection (DIR.Lib 6.0.x).
+  # 6.15: shaped-text GID-direct atlas fetch. DrawText/MeasureText now honor ShapedGlyph.Glyph (the
+  #       substituted glyph id from an ITextShaper -- GSUB ligatures, Arabic joined forms, ...),
+  #       fetching the SDF/bitmap atlas by glyph id instead of the source codepoint. Adds
+  #       VkFontAtlas/VkSdfFontAtlas.GetGlyphByGid + VkRenderer.PreWarmSdfGlyphByGid. Opt-in via
+  #       renderer.TextShaper (e.g. DIR.Lib.Shaping's ShapingTextShaper); the default AdvanceShaper
+  #       per-rune path is byte-identical to before. Bumps DIR.Lib pin 6.5 -> 6.6.
+  # 6.16: re-pin DIR.Lib 6.6 -> 6.8. DIR.Lib 6.8's DIR.Lib.Shaping satellite is rebuilt against
+  #       SharpAstro.Fonts.Shaping 1.5.551 (Fonts.Lib F6 zero-alloc bidi + F7 HarfBuzz-style
+  #       coverage-digest lookup skipping, ~3-4x faster shaping). Renderer core is unchanged; apps
+  #       that plug DIR.Lib.Shaping's ShapingTextShaper into renderer.TextShaper get the speedup.
+  # 6.17: GPU-wedge resilience. Stuck-fence recovery now runs on a sacrificial background task the
   #       render thread only polls (on a truly hung GPU the driver can block INSIDE vkFreeMemory /
-  #       teardown — observed on Adreno 2026-07-10: the old synchronous recovery froze the render
-  #       thread permanently); deadline blown or repeated stuck escalations → OnGpuWedged (new host
+  #       teardown — observed on Adreno: the old synchronous recovery froze the render thread
+  #       permanently); deadline blown or repeated stuck escalations → OnGpuWedged (new host
   #       callback) + clean loop stop. SDF atlas: per-frame upload BYTE budget alongside the glyph
   #       count cap (MTSDF quadrupled bytes/glyph vs R8), one-frame quarantine for glyphs on a
   #       just-appended page (first transition and first sample no longer share a submission), and
   #       a FrameStats wedge breadcrumb logged at fence-stuck escalation.
-  # 6.16: idle the render loop while a window is minimized. A minimized window reports a non-zero
+  # 6.18: idle the render loop while a window is minimized. A minimized window reports a non-zero
   #       pixel size on Windows, so the old size guard never caught it and the loop busy-spun through
   #       swapchain recreation (~270ms/frame) for invisible frames. Gate redraw on the SDL minimized
   #       flag (SdlVulkanWindow.IsMinimized): ~0% CPU while minimized, instant repaint on restore.
   #       DEBUG-only: inspector minimize/maximize/restore commands + a per-iteration command pump
   #       (SdlEventLoop.OnLoopIteration) so commands drain on a minimized window.
-  # 6.17: opt-in Vulkan validation diagnostics (VulkanValidation). The Khronos validation layer's
+  # 6.19: opt-in Vulkan validation diagnostics (VulkanValidation). The Khronos validation layer's
   #       output was previously enabled in DEBUG but dropped to the loader's default sink; now a
   #       debug-utils messenger routes it to a prefixed stderr line + a bounded ring buffer. Adds an
   #       opt-in SYNCHRONIZATION validation switch (the GPU memory-hazard checker behind the wedge
   #       class) and a validation_report inspector/MCP tool. Gated: DEBUG or SDLVK_VALIDATION=1
   #       (+ SDLVK_SYNC_VALIDATION=1 for sync); zero cost + no layer in a normal Release build.
-  # 6.23: VkSdfFontAtlas becomes the thin Vulkan backend of DIR.Lib's SdfFontAtlas — the fused
-  #       atlas shrinks to the GPU half only (per-page images/views/descriptor sets + per-frame
-  #       upload ring + dirty-region Flush). All CPU-side policy (keying, packing, LRU, budgets,
-  #       disk cache, async rasterize) now lives in DIR.Lib.SdfFontAtlas (6.11); page lifecycle
-  #       arrives via ISdfAtlasBackend. SdfGlyphDiskCache moved to DIR.Lib. Public API unchanged.
-  # 6.24: pre-bake shaders to SPIR-V at build (tools/BakeShaders, source-only); VkPipelineSet loads
-  #       embedded .spv instead of compiling GLSL at runtime — no runtime shaderc, no first-render
-  #       compile stall. Plus the large-text SDF atlas tier (SdfLargeTierOptions: second atlas at a
-  #       larger raster, tier-select + fallback pass). DIR.Lib 6.13.
-  # 6.25: DIR.Lib 6.14 (responsive layout primitives: clamped Star, collapse-below-minimum, Wrap) —
-  #       dependency repin only.
-  VERSION_PREFIX: 6.25.${{ github.run_number }}
+  # 6.30: DeviceTransform GPU compose (needs DIR.Lib 6.17). VkRenderer.DeviceTransform folds the
+  #       content->device affine into the projection in UpdateProjection — the compose stays a
+  #       Matrix3x2 (2D affine, no wasted lanes) and only widens to the mat4 push-constant at upload,
+  #       so the whole frame (text included) rotates/scales as one. Identity transform is byte-
+  #       identical to the previous screen-space projection. Verified via offscreen render + readback
+  #       (180° flip moves a top-left fill to the bottom-right).
+  VERSION_PREFIX: 6.32.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
@@ -87,6 +79,10 @@ jobs:
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x
+    - name: Install Android workload
+      # The package multi-targets net10.0-android (SdlVulkanActivity host); restore resolves all TFMs,
+      # so it needs the android workload. ubuntu runners already ship the Android SDK + JDK.
+      run: dotnet workload install android
     - name: Restore dependencies
       run: dotnet restore
     - name: Build
@@ -97,3 +93,103 @@ jobs:
         name: nuget-packages
         path: '**/*.nupkg'
         retention-days: 5
+
+  # BlendOpRegressionTests catch the dangling-pAttachments bug fixed in 3.4.471 by
+  # round-tripping VkBlendOp.Min / Max through actual draw calls. Need a Vulkan ICD on the
+  # runner; Mesa lavapipe (software) is the standard headless choice. fail-fast: false so a
+  # regression on one architecture doesn't mask the other.
+  #
+  # vulkan-validationlayers is installed too so SyncValidationGlyphFloodTests runs (not skips):
+  # it renders an SDF glyph flood offscreen under VK_LAYER_KHRONOS_validation with SYNCHRONIZATION
+  # validation on and asserts no read-after-write hazard. Sync validation flags the atlas
+  # upload/sample hazard STATICALLY, so lavapipe reproduces it deterministically where the vendor
+  # hang (Adreno) never would. timeout-minutes bounds a genuine wedge (the test has its own
+  # 60s in-process deadman on top).
+  test:
+    needs: build
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: SharpAstro/cache-apt-pkgs-action@v1
+      with:
+        packages: mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
+        version: 1.1
+    # If the loader can't enumerate at least one ICD, the tests will Assert.Skip via
+    # TryCreateOffscreenContext rather than fail. This diagnostic surfaces that situation
+    # (and whether the validation layer is present, for the sync-validation test) in the build
+    # log without a re-run.
+    - name: Vulkan ICD + layer summary
+      run: |
+        vulkaninfo --summary || true
+        echo "--- instance layers ---"
+        vulkaninfo 2>/dev/null | grep -iA1 "VK_LAYER_KHRONOS_validation" || echo "validation layer NOT visible to loader"
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+    - name: Install Android workload
+      # The package multi-targets net10.0-android (SdlVulkanActivity host); restore resolves all TFMs,
+      # so it needs the android workload. ubuntu runners already ship the Android SDK + JDK.
+      run: dotnet workload install android
+    - name: Restore dependencies
+      run: dotnet restore
+    - name: Build test project
+      # Only the test project (net10.0) — NOT the whole solution: building the net10.0-android TFM needs
+      # the Android SDK, which the ubuntu-24.04-arm runner doesn't ship (ubuntu-latest x64 does). The
+      # tests are net10.0 offscreen Vulkan, so the android TFM is irrelevant here (the build job packs it).
+      run: dotnet build src/SdlVulkan.Renderer.Tests -c $BUILD_CONF --no-restore -p:Version=${VERSION_PREFIX}${VERSION_REV}${VERSION_HASH} -p:FileVersion=${VERSION_PREFIX}.${VERSION_REV} -p:ContinuousIntegrationBuild=true
+    - name: Test
+      run: dotnet test src/SdlVulkan.Renderer.Tests -c $BUILD_CONF --no-build --logger "console;verbosity=detailed"
+
+  # Headless functional smoke for the Linux WebView backend (GtkWebView / WebKitGTK). Runs two
+  # network-free self-tests (tools/WebViewSmoke) inside a real SDL X11 window under Xvfb: `assert`
+  # (two-way messaging: page->host + host->page + navigation + JS execution) and `assert-autosize`
+  # (the WebViewContentSizer content->host channel). Each exits 0/1 deterministically (it _exit()s
+  # past WebKitGTK's atexit teardown, which otherwise aborts with 134). The harness SKIPs (exit 0)
+  # when the display / WebKitGTK / Vulkan stack is
+  # unavailable, mirroring BlendOpRegressionTests' Assert.Skip-on-no-ICD. Non-gating for now (not
+  # in publish-nuget's needs) until proven stable across runners. If a runner's Mesa does not
+  # auto-fall-back to software, add LIBGL_ALWAYS_SOFTWARE=1 + WEBKIT_DISABLE_DMABUF_RENDERER=1 below.
+  webview-smoke-linux:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    # Plain apt-get (not cache-apt-pkgs-action): the cache action installs only the named packages
+    # without their dependencies, so mesa-vulkan-drivers landed without the driver libs its ICD needs
+    # -> "vkCreateInstance: Found no drivers" (-9). apt-get resolves dependencies and installs the ICD.
+    - name: Install WebKitGTK + software Vulkan + Xvfb
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers libvulkan1 libgtk-3-0 libwebkit2gtk-4.1-0 xvfb
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+    - name: Install Android workload
+      # WebViewSmoke references the renderer, whose restore resolves the net10.0-android TFM.
+      run: dotnet workload install android
+    - name: WebView messaging self-test (headless via Xvfb)
+      run: >-
+        xvfb-run -a -s "-screen 0 1280x800x24"
+        env SDL_VIDEODRIVER=x11
+        dotnet run --project tools/WebViewSmoke/WebViewSmoke.csproj -f net10.0 -c $BUILD_CONF assert
+    - name: WebView content-sizer self-test (headless via Xvfb)
+      # Exercises WebViewContentSizer: the page reports its content height (content->host), and the
+      # assert proves the height shrinks below the initial once the box is shrunk — i.e. shrink-to-fit
+      # below the webview viewport works. Same skip-on-no-GUI / deterministic-exit semantics as above.
+      run: >-
+        xvfb-run -a -s "-screen 0 1280x800x24"
+        env SDL_VIDEODRIVER=x11
+        dotnet run --project tools/WebViewSmoke/WebViewSmoke.csproj -f net10.0 -c $BUILD_CONF assert-autosize
