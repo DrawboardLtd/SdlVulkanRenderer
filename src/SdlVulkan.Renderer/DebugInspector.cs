@@ -66,6 +66,15 @@ public sealed class DebugInspector : IDisposable
     /// <summary>Synthesize a press-drag-release from (X1,Y1) to (X2,Y2) with <see cref="Steps"/> interpolated
     /// motion events between, so integrate-per-move pan handlers see a smooth path rather than a teleport.</summary>
     private sealed record DragCommand(float X1, float Y1, float X2, float Y2, InputModifier Mods, int Steps) : InspectorCommand;
+    /// <summary>Synthesize a left-button PRESS-AND-HOLD at (X,Y): button down, held for <see cref="DurationMs"/>
+    /// ms while the loop keeps pumping (so a long-press / hold-to-repeat / charge-up timer ticks THROUGH the
+    /// hold), then button up. Advanced by DrainCommands one non-blocking step per loop iteration, like a batch --
+    /// it never sleeps the render thread.</summary>
+    private sealed record HoldCommand(float X, float Y, InputModifier Mods, int DurationMs) : InspectorCommand
+    {
+        // The socket waits out the hold plus slack; the render loop stays responsive throughout.
+        public override TimeSpan Timeout => TimeSpan.FromSeconds(Math.Min(300, DurationMs / 1000.0 + 15));
+    }
     /// <summary>Read back the loop's rolling average frame time (the same EWMA that drives the
     /// [rdiag] frame.slow log), so jank can be measured numerically instead of by eye.</summary>
     private sealed record FrameStatsCommand : InspectorCommand;
@@ -96,6 +105,21 @@ public sealed class DebugInspector : IDisposable
         public readonly List<string> Results = [];
         public int Index;
         public int WaitFrames;
+    }
+
+    // In-progress press-and-hold, advanced one non-blocking step per loop iteration by DrainCommands
+    // (null when idle). Mirrors _activeBatch: the button stays held across frames so the app ticks THROUGH
+    // the hold (a long-press timer advances) instead of the render thread blocking for the duration.
+    private HoldState? _activeHold;
+    private sealed class HoldState(TaskCompletionSource<string> result, long startTick, long durationMs, float x, float y)
+    {
+        public readonly TaskCompletionSource<string> Result = result;
+        public readonly long StartTick = startTick;
+        public readonly long DurationMs = durationMs;
+        // Press position, so the deferred release can carry real coordinates (position-dependent
+        // release logic -- tap-vs-drag slop, tap-to-select -- reads them off the MouseUp event).
+        public readonly float X = x;
+        public readonly float Y = y;
     }
 
     private readonly DebugInspectorOptions _opts;
@@ -287,6 +311,11 @@ public sealed class DebugInspector : IDisposable
             p.GetProperty("y2").GetSingle(),
             ResolveModifier(p.TryGetProperty("mods", out var dm) && dm.ValueKind == JsonValueKind.String ? dm.GetString() : null),
             p.TryGetProperty("steps", out var ds) && ds.ValueKind == JsonValueKind.Number ? Math.Clamp(ds.GetInt32(), 1, 64) : 8),
+        "pressHold" => new HoldCommand(
+            p.GetProperty("x").GetSingle(),
+            p.GetProperty("y").GetSingle(),
+            ResolveModifier(p.TryGetProperty("mods", out var hm) && hm.ValueKind == JsonValueKind.String ? hm.GetString() : null),
+            (int)Math.Clamp((p.TryGetProperty("seconds", out var hs) && hs.ValueKind == JsonValueKind.Number ? hs.GetDouble() : 1.0) * 1000.0, 50, 300000)),
         "frameStats" => new FrameStatsCommand(),
         "postSignal" => new PostSignalCommand(
             p.GetProperty("name").GetString() ?? "",
@@ -461,18 +490,73 @@ public sealed class DebugInspector : IDisposable
             AdvanceBatch();
             return;
         }
+        // A press-and-hold advances every iteration but, UNLIKE a batch, does not own the queue: it
+        // releases the button once its duration elapses, then we fall through to drain other commands
+        // below. So observe commands (ping/describe/screenshot) sent mid-hold are serviced WHILE the
+        // button stays held -- the point of a hold test is to inspect the hold-triggered UI in progress.
+        if (_activeHold is not null)
+        {
+            AdvanceHold();
+        }
 
         while (_queue.TryDequeue(out var cmd))
         {
             if (cmd is BatchCommand b)
             {
+                if (_activeHold is not null)
+                {
+                    cmd.Result.TrySetException(new InvalidOperationException("cannot start a batch while a press-and-hold is in progress"));
+                    continue;
+                }
                 _activeBatch = new BatchState(b.Steps, b.Result);
                 AdvanceBatch();
                 return;
             }
+            if (cmd is HoldCommand h)
+            {
+                if (_activeHold is not null)
+                {
+                    cmd.Result.TrySetException(new InvalidOperationException("a press-and-hold is already in progress"));
+                    continue;
+                }
+                StartHold(h); // hold now active; keep draining simple commands queued behind it this iteration
+                continue;
+            }
             try { cmd.Result.TrySetResult(ExecuteCommand(cmd)); }
             catch (Exception ex) { cmd.Result.TrySetException(ex); }
         }
+    }
+
+    /// <summary>
+    /// Begins a press-and-hold: press the button now and arm <see cref="_activeHold"/>, which
+    /// <see cref="AdvanceHold"/> releases once the duration elapses. Non-blocking -- the loop keeps
+    /// rendering during the hold.
+    /// </summary>
+    private void StartHold(HoldCommand h)
+    {
+        _view.DispatchPointerMove(h.X, h.Y); // update cached pointer position (consumers may read it on MouseUp)
+        _view.DispatchPointerDown(1, h.X, h.Y, 1, h.Mods);
+        _activeHold = new HoldState(h.Result, Environment.TickCount64, h.DurationMs, h.X, h.Y);
+        _view.RequestRedraw();
+    }
+
+    /// <summary>
+    /// Releases the active press-and-hold once its duration has elapsed (monotonic
+    /// <see cref="Environment.TickCount64"/>); until then it just keeps the loop awake so the app renders
+    /// frames while the button is held. One non-blocking step per call, like <see cref="AdvanceBatch"/>.
+    /// </summary>
+    private void AdvanceHold()
+    {
+        var h = _activeHold!;
+        if (Environment.TickCount64 - h.StartTick < h.DurationMs)
+        {
+            _view.RequestRedraw(); // still holding -- keep the loop pumping so the app ticks through the hold
+            return;
+        }
+        _view.DispatchPointerUp(1, h.X, h.Y);
+        _view.RequestRedraw();
+        h.Result.TrySetResult(ToJson(w => w.WriteStringValue($"held {h.DurationMs}ms")));
+        _activeHold = null;
     }
 
     /// <summary>
@@ -711,9 +795,9 @@ public sealed class DebugInspector : IDisposable
 
     private string ExecuteClickAt(float x, float y, InputModifier mods = InputModifier.None)
     {
-        _view.OnMouseMove?.Invoke(x, y); // update cached pointer position (some consumers read it on MouseUp)
-        _view.OnMouseDown?.Invoke(1, x, y, 1, mods);
-        _view.OnMouseUp?.Invoke(1);
+        _view.DispatchPointerMove(x, y); // update cached pointer position (some consumers read it on MouseUp)
+        _view.DispatchPointerDown(1, x, y, 1, mods);
+        _view.DispatchPointerUp(1, x, y);
         _view.RequestRedraw();
         return "\"ok\"";
     }
@@ -747,8 +831,8 @@ public sealed class DebugInspector : IDisposable
 
     private string ExecuteScroll(float x, float y, float scrollY)
     {
-        _view.OnMouseMove?.Invoke(x, y); // position the pointer first -- wheel handlers zoom around it
-        _view.OnMouseWheel?.Invoke(scrollY, x, y);
+        _view.DispatchPointerMove(x, y); // position the pointer first -- wheel handlers zoom around it
+        _view.DispatchPointerWheel(scrollY, x, y, InputModifier.None);
         _view.RequestRedraw();
         return "\"ok\"";
     }
@@ -758,14 +842,14 @@ public sealed class DebugInspector : IDisposable
         // Same path as a real drag: move-to-start, button-down, interpolated motion, button-up.
         // Pan handlers that integrate per motion event (e.g. the sky map's unproject-based pan)
         // need the intermediate steps -- a single jump start->end would under-pan or misbehave.
-        _view.OnMouseMove?.Invoke(x1, y1);
-        _view.OnMouseDown?.Invoke(1, x1, y1, 1, mods);
+        _view.DispatchPointerMove(x1, y1);
+        _view.DispatchPointerDown(1, x1, y1, 1, mods);
         for (var i = 1; i <= steps; i++)
         {
             var t = (float)i / steps;
-            _view.OnMouseMove?.Invoke(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+            _view.DispatchPointerMove(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
         }
-        _view.OnMouseUp?.Invoke(1);
+        _view.DispatchPointerUp(1, x2, y2);
         _view.RequestRedraw();
         return "\"ok\"";
     }
@@ -795,8 +879,11 @@ public sealed class DebugInspector : IDisposable
 
     private string ExecutePostSignal(string name, JsonElement args)
     {
-        if (_opts.SignalFactories is null || !_opts.SignalFactories.TryGetValue(name, out var post))
-            throw new ArgumentException($"unknown signal: {name}");
+        if (_opts.SignalFactories is null)
+            throw new ArgumentException("this instance exposes no signals (SignalFactories is null)");
+        if (!_opts.SignalFactories.TryGetValue(name, out var post))
+            // List the valid names so a misspelled/unknown signal is self-correcting instead of a dead end.
+            throw new ArgumentException($"unknown signal: '{name}'. Known signals: {string.Join(", ", _opts.SignalFactories.Keys)}");
         post(args);
         _view.RequestRedraw();
         return "\"queued\"";

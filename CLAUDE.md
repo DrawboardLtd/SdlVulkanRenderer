@@ -6,7 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repo is a **private fork** of an upstream repo of the same name (`SdlVulkan.Renderer`). It is for internal drawboard use and must **not** publish to nuget.org — only the upstream repo does.
 
-When syncing from upstream: copy code changes but skip nuget publish CI jobs, and do not overwrite LICENSE or `RepositoryUrl` in `SdlVulkan.Renderer.csproj`. Keep this fork's submodule-based DIR.Lib reference (see below) rather than upstream's `UseLocalDirLib` conditional.
+The fork now mirrors upstream's **full source** — the Android host (`Android/`, the `net10.0-android` TFM), the native WebView subsystem (`SdlVulkan.Renderer.WebView` / `.WebView.Native` / `tools/WebViewSmoke`), and the test project — so a sync is a wholesale `git checkout upstream/main -- .` plus re-applying these fork-only divergences, which must be preserved each round:
+- **skip the nuget-publish CI job** — only the upstream repo publishes to nuget.org;
+- don't overwrite `LICENSE`, `README.md`, `CLAUDE.md`, or `RepositoryUrl` in `SdlVulkan.Renderer.csproj`;
+- keep the submodule-based DIR.Lib `ProjectReference` (see below) rather than upstream's `UseLocalDirLib` sibling/nuget conditional;
+- keep `submodules: recursive` on every CI checkout — the submodule DIR.Lib `ProjectReference` needs the nested checkout to exist;
+- then bump the submodule pin + `VersionPrefix` / `VERSION_PREFIX`.
 
 ## Build commands
 
@@ -16,7 +21,7 @@ dotnet build -c Release                 # Release build
 dotnet pack -c Release                  # Build + produce .nupkg
 ```
 
-No test project exists. No linter is configured.
+A test project (`src/SdlVulkan.Renderer.Tests`, offscreen-Vulkan render regressions) is mirrored from upstream and runs in CI on Mesa lavapipe. No linter is configured.
 
 ## Versioning
 

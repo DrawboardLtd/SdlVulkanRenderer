@@ -2,14 +2,17 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0;net10.0-android</TargetFrameworks>
+    <!-- Android host (SdlVulkanActivity) needs SDL3-CS.Android's Java bridge, which only exists on
+         the android TFM. Desktop keeps the SDL3-CS.Native path via consuming apps. -->
+    <SupportedOSPlatformVersion Condition="'$(TargetFramework)' == 'net10.0-android'">24.0</SupportedOSPlatformVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <VersionPrefix>6.25.0</VersionPrefix>
-    <AssemblyVersion>6.20.0.0</AssemblyVersion>
+    <VersionPrefix>6.32.0</VersionPrefix>
+    <AssemblyVersion>6.11.0.0</AssemblyVersion>
     <PackageID>SdlVulkan.Renderer</PackageID>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -24,18 +27,29 @@
     <None Include="../../README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 
+  <!--
+    DIR.Lib lives as a git submodule at ./DeviceIndependentRenderingLibrary (the drawboard DIR.Lib
+    fork) and is referenced by ProjectReference. This fork does NOT use upstream's UseLocalDirLib
+    sibling/nuget fallback: the drawboard DIR.Lib fork is not published to nuget.org, so CI checks
+    out the submodule (submodules: recursive) and builds it in-tree. See CLAUDE.md.
+  -->
   <ItemGroup>
     <ProjectReference Include="../../DeviceIndependentRenderingLibrary/src/DIR.Lib/DIR.Lib.csproj" />
-    <PackageReference Include="SDL3-CS" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SDL3-CS publishes preview versions only, so NuGet's stable-package-with-prerelease-dependency
+         warning (NU5104) fires on every pack; suppressed for this reference alone. -->
+    <PackageReference Include="SDL3-CS" NoWarn="NU5104" />
     <PackageReference Include="Vortice.Vulkan" />
   </ItemGroup>
 
   <!--
     Shaders are authored as GLSL 450 in Shaders/*.vert|*.frag and pre-baked to SPIR-V under
     Shaders/spirv/*.spv by the tools/BakeShaders tool (committed). The renderer embeds the .spv and
-    loads it at runtime, so the shipped package carries NO shaderc dependency and does NO runtime
-    GLSL to SPIR-V compilation (which cost hundreds of ms building the first renderer). Re-bake and
-    commit the .spv when a shader changes (see the SVR0001 build warning below for the command).
+    loads it at runtime, so the shipped package carries NO shaderc dependency (it has no Android RID)
+    and does NO runtime GLSL to SPIR-V compilation. Re-bake and commit the .spv when a shader
+    changes (see the SVR0001 build warning below for the exact command; also tools/BakeShaders).
     (.vert/.frag are already visible in the IDE via the SDK's default None glob.)
   -->
   <ItemGroup>
@@ -55,6 +69,16 @@
     <Warning Code="SVR0001"
              Text="Shader source(s) newer than baked SPIR-V; re-run 'dotnet run --project tools/BakeShaders -c Release -- src/SdlVulkan.Renderer/Shaders' and commit Shaders/spirv/*.spv. Stale: @(ShaderSource)" />
   </Target>
+
+  <!-- Android-only: SDL Java bridge (Org.Libsdl.App.SDLActivity) + per-ABI libSDL3.so natives. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-android'">
+    <PackageReference Include="SDL3-CS.Android" />
+  </ItemGroup>
+
+  <!-- The Android host (Android/*.cs) uses Org.Libsdl.App and compiles only for the android TFM. -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net10.0-android'">
+    <Compile Remove="Android/**/*.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.SourceLink.GitHub">

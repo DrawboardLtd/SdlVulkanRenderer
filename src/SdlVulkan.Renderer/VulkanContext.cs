@@ -136,7 +136,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
     private readonly float*[] _vertexMapped = new float*[MaxFramesInFlight];
     private int _vertexOffset; // in floats
 
-    private readonly VkSurfaceKHR _surface;
+    // Not readonly: Android destroys the native surface on background and hands back a fresh one on
+    // foreground, so the swapchain is rebuilt against a new surface via AdoptSurface.
+    private VkSurfaceKHR _surface;
     private bool _disposed;
 
     private VulkanContext(VulkanDevice device, VkSurfaceKHR surface, uint vertexBufferSize, bool ownsDevice)
@@ -213,6 +215,31 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // UI thread on an unbounded vkDeviceWaitIdle.
         TryDrainDevice(DrainTimeoutNs, "swapchain recreate");
         CleanupSwapchain();
+        CreateSwapchain(width, height);
+    }
+
+    /// <summary>
+    /// Android surface loss (app backgrounded): drain in-flight frames (bounded, like
+    /// <see cref="RecreateSwapchain"/> — never an unbounded vkDeviceWaitIdle on the UI thread) and
+    /// destroy the swapchain so the old surface is no longer referenced by it. Pair with
+    /// <see cref="AdoptSurface"/> once the window has created a fresh surface. Split from AdoptSurface
+    /// so the caller can recreate the window's surface in between: the old surface must outlive its
+    /// swapchain (destroyed here) yet be gone before the new swapchain binds.
+    /// </summary>
+    public void PrepareForSurfaceLoss()
+    {
+        TryDrainDevice(DrainTimeoutNs, "surface loss");
+        CleanupSwapchain();
+    }
+
+    /// <summary>
+    /// Adopt a freshly-created presentation surface (created and owned by the window) and rebuild the
+    /// swapchain against it. The previous surface was destroyed by the window, not here — so this does
+    /// not touch the old handle.
+    /// </summary>
+    public void AdoptSurface(VkSurfaceKHR newSurface, uint width, uint height)
+    {
+        _surface = newSurface;
         CreateSwapchain(width, height);
     }
 
@@ -556,7 +583,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
         if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount)
             imageCount = caps.maxImageCount;
 
-        var format = VkFormat.B8G8R8A8Unorm;
+        // Chosen once against the surface in VulkanDevice.Create; the render pass baked in the same
+        // format, so the swapchain images must match it (BGRA on desktop, RGBA on Android/Mali).
+        var format = _dev.ColorFormat;
         SwapchainFormat = format;
         SwapchainWidth = extent.width;
         SwapchainHeight = extent.height;
@@ -585,6 +614,31 @@ public sealed unsafe partial class VulkanContext : IDisposable
             }
         }
 
+        var imageUsage = VkImageUsageFlags.ColorAttachment;
+#if DEBUG
+        // TransferSrc lets the DEBUG-only inspector copy the presented frame out for screenshots
+        // (see VulkanContext.SwapchainReadback.cs). Desktop drivers always support it as a swapchain
+        // usage, but Android/Mali swapchains often expose ColorAttachment ONLY — and requesting an
+        // unsupported usage fails vkCreateSwapchainKHR (reported as VK_ERROR_SURFACE_LOST_KHR on
+        // Android). Only add it when the surface actually advertises it.
+        if ((caps.supportedUsageFlags & VkImageUsageFlags.TransferSrc) != 0)
+            imageUsage |= VkImageUsageFlags.TransferSrc;
+#endif
+
+        // Pick a supported composite-alpha mode. Desktop supports Opaque; Android surfaces commonly
+        // support Inherit ONLY, and requesting an unsupported mode fails swapchain creation (reported
+        // as VK_ERROR_SURFACE_LOST_KHR on Mali).
+        var compositeAlpha = VkCompositeAlphaFlagsKHR.Opaque;
+        if ((caps.supportedCompositeAlpha & VkCompositeAlphaFlagsKHR.Opaque) == 0)
+        {
+            if ((caps.supportedCompositeAlpha & VkCompositeAlphaFlagsKHR.Inherit) != 0)
+                compositeAlpha = VkCompositeAlphaFlagsKHR.Inherit;
+            else if ((caps.supportedCompositeAlpha & VkCompositeAlphaFlagsKHR.PreMultiplied) != 0)
+                compositeAlpha = VkCompositeAlphaFlagsKHR.PreMultiplied;
+            else if ((caps.supportedCompositeAlpha & VkCompositeAlphaFlagsKHR.PostMultiplied) != 0)
+                compositeAlpha = VkCompositeAlphaFlagsKHR.PostMultiplied;
+        }
+
         VkSwapchainCreateInfoKHR swapCI = new()
         {
             surface = _surface,
@@ -593,17 +647,17 @@ public sealed unsafe partial class VulkanContext : IDisposable
             imageColorSpace = VkColorSpaceKHR.SrgbNonLinear,
             imageExtent = extent,
             imageArrayLayers = 1,
-#if DEBUG
-            // TransferSrc lets the DEBUG-only inspector copy the presented frame out for screenshots
-            // (see VulkanContext.SwapchainReadback.cs). B8G8R8A8Unorm is guaranteed to support
-            // TransferSrc on all conformant desktop drivers, so no format fallback is needed.
-            imageUsage = VkImageUsageFlags.ColorAttachment | VkImageUsageFlags.TransferSrc,
-#else
-            imageUsage = VkImageUsageFlags.ColorAttachment,
-#endif
+            imageUsage = imageUsage,
             imageSharingMode = VkSharingMode.Exclusive,
-            preTransform = caps.currentTransform,
-            compositeAlpha = VkCompositeAlphaFlagsKHR.Opaque,
+            // After a device rotation, currentTransform becomes Rotate90/270 — an app that adopts it
+            // as preTransform must render pre-rotated (rotate its projection), which VkRenderer does
+            // not. Prefer Identity when supported: the presentation engine applies the rotation
+            // itself (small compositor cost on mobile, correct visuals). Desktop surfaces report
+            // Identity as current anyway, so this is Android-rotation-only in practice.
+            preTransform = (caps.supportedTransforms & VkSurfaceTransformFlagsKHR.Identity) != 0
+                ? VkSurfaceTransformFlagsKHR.Identity
+                : caps.currentTransform,
+            compositeAlpha = compositeAlpha,
             presentMode = presentMode,
             clipped = true,
             oldSwapchain = VkSwapchainKHR.Null
