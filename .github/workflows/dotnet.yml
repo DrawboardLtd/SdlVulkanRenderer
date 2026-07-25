@@ -80,13 +80,13 @@ jobs:
       with:
         dotnet-version: 10.0.x
     - name: Install Android workload
-      # The package multi-targets net10.0-android (SdlVulkanActivity host); restore resolves all TFMs,
+      # This job opts into the android host TFM (BuildAndroidHost=true below) to compile + pack it,
       # so it needs the android workload. ubuntu runners already ship the Android SDK + JDK.
       run: dotnet workload install android
     - name: Restore dependencies
-      run: dotnet restore
+      run: dotnet restore -p:BuildAndroidHost=true
     - name: Build
-      run: dotnet build -c $BUILD_CONF --no-restore -p:Version=${VERSION_PREFIX}${VERSION_REV}${VERSION_HASH} -p:FileVersion=${VERSION_PREFIX}.${VERSION_REV} -p:ContinuousIntegrationBuild=true
+      run: dotnet build -c $BUILD_CONF --no-restore -p:BuildAndroidHost=true -p:Version=${VERSION_PREFIX}${VERSION_REV}${VERSION_HASH} -p:FileVersion=${VERSION_PREFIX}.${VERSION_REV} -p:ContinuousIntegrationBuild=true
     - name: Upload NuGet package
       uses: actions/upload-artifact@v4
       with:
@@ -133,11 +133,8 @@ jobs:
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x
-    - name: Install Android workload
-      # The package multi-targets net10.0-android (SdlVulkanActivity host); restore resolves all TFMs,
-      # so it needs the android workload. ubuntu runners already ship the Android SDK + JDK.
-      run: dotnet workload install android
     - name: Restore dependencies
+      # net10.0 only (BuildAndroidHost unset → renderer is net10.0), so no android workload needed here.
       run: dotnet restore
     - name: Build test project
       # Only the test project (net10.0) — NOT the whole solution: building the net10.0-android TFM needs
@@ -177,9 +174,6 @@ jobs:
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x
-    - name: Install Android workload
-      # WebViewSmoke references the renderer, whose restore resolves the net10.0-android TFM.
-      run: dotnet workload install android
     - name: WebView messaging self-test (headless via Xvfb)
       run: >-
         xvfb-run -a -s "-screen 0 1280x800x24"

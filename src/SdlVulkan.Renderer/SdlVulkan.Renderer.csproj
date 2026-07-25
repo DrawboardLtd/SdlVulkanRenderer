@@ -2,7 +2,13 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>net10.0;net10.0-android</TargetFrameworks>
+    <!-- Desktop consumers build net10.0 only and must NOT need the android workload: the viewer
+         references this project by source (submodule ProjectReference) and `dotnet restore` evaluates
+         every TFM of a referenced project. The android host TFM is therefore opt-in — the fork CI sets
+         BuildAndroidHost=true (where the workload is installed) to compile + pack the android host; a
+         plain build and every source consumer stay net10.0. -->
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="'$(BuildAndroidHost)' == 'true'">net10.0;net10.0-android</TargetFrameworks>
     <!-- Android host (SdlVulkanActivity) needs SDL3-CS.Android's Java bridge, which only exists on
          the android TFM. Desktop keeps the SDL3-CS.Native path via consuming apps. -->
     <SupportedOSPlatformVersion Condition="'$(TargetFramework)' == 'net10.0-android'">24.0</SupportedOSPlatformVersion>
