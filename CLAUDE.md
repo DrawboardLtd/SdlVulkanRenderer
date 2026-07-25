@@ -11,6 +11,7 @@ The fork now mirrors upstream's **full source** — the Android host (`Android/`
 - don't overwrite `LICENSE`, `README.md`, `CLAUDE.md`, or `RepositoryUrl` in `SdlVulkan.Renderer.csproj`;
 - keep the submodule-based DIR.Lib `ProjectReference` (see below) rather than upstream's `UseLocalDirLib` sibling/nuget conditional;
 - keep `submodules: recursive` on every CI checkout — the submodule DIR.Lib `ProjectReference` needs the nested checkout to exist;
+- keep the **android host TFM opt-in** — upstream targets `net10.0;net10.0-android` unconditionally, but desktop consumers reference this project by source (the viewer's submodule `ProjectReference`) and `dotnet restore` evaluates every TFM, so an unconditional android TFM would force the android workload on every consumer/CI. The csproj defaults to `net10.0` and adds the android TFM only when `BuildAndroidHost=true`, which the fork CI's build job sets (it installs the workload); the test/webview jobs stay `net10.0`;
 - then bump the submodule pin + `VersionPrefix` / `VERSION_PREFIX`.
 
 ## Build commands
