@@ -64,7 +64,40 @@ env:
   #       so the whole frame (text included) rotates/scales as one. Identity transform is byte-
   #       identical to the previous screen-space projection. Verified via offscreen render + readback
   #       (180° flip moves a top-left fill to the bottom-right).
-  VERSION_PREFIX: 6.32.${{ github.run_number }}
+  # 6.33: VkRenderer.FillRoundedRectangle — a real GPU override of DIR.Lib 6.20's scanline fallback:
+  #       one rounded-box SDF quad per rect with antialiased corners, single-coverage so a translucent
+  #       fill blends exactly once. New roundrect.vert/.frag + RoundRectPipeline. The box parameters
+  #       (half extents, radius) ride on VERTEX ATTRIBUTES, not push constants, so the shared 84-byte
+  #       push block stays byte-identical across every pipeline — growing it for one pipeline is the
+  #       per-stage mismatch ellipse.vert documents as an llvmpipe shader-compiler SEGV. A zero radius
+  #       delegates to FillRectangle, so the square path is untouched.
+  # 7.0: DeviceTransform is a ContentTransform (needs DIR.Lib 7.0) — both the type and the VkRenderer
+  #      property are renamed, so a consumer that sets it must rename too.
+  # 7.1: no reflective JSON in the MCP sidecar either — source-generated binding, AOT-clean.
+  # 7.2: the inspector REFUSES an unrecognised `mods` string instead of resolving it to None. Resolving
+  #      the unknown to None delivered a BARE key, and a bare key is frequently a different valid
+  #      binding rather than a no-op, so a typo surfaced as the app IGNORING a correct chord rather than
+  #      as a bad request. A partial match still resolves, so a chord that CAN be delivered is never
+  #      blocked. ResolveModifier / ResolveInputKey are internal with InternalsVisibleTo the tests.
+  # 7.3: DebugInspector folds onto DIR.Lib's DebugInspectorCore (needs DIR.Lib 7.3), 940 -> ~600 lines.
+  #      Gone are the private TCP accept loop, the newline framing, the discovery responder, the command
+  #      queue, the InspectorCommand hierarchy with its parser, and the batch/wait state machine — all
+  #      duplicated what the core does. What stays is what is actually SDL: the verbs,
+  #      ResolveInputKey/ResolveModifier, and pressHold as a background operation (pressed in Begin,
+  #      released in Advance, deliberately NOT exclusive so a screenshot can be taken mid-hold).
+  #      SECURITY: BindAddress defaulted to IPAddress.Any, so a command server that injects input,
+  #      captures the framebuffer and reads app state accepted connections from the whole LAN. The core
+  #      binds LOOPBACK with no opt-out.
+  #      ONE discovery protocol: `dir-inspect` on 239.255.77.91:47892, was `sdlvk-inspect` on
+  #      239.255.77.90:47891. A sidecar tells surfaces apart by the `kind` field ("sdl") rather than by
+  #      which port answered, and moves in lockstep — an OLDER sidecar will not find the app.
+  #      BREAKING, in DEBUG builds only: DebugInspectorOptions loses BindAddress, Port, DiscoveryGroup
+  #      and DiscoveryPort. The core owns addressing, so they could only be accepted-and-ignored, and a
+  #      `Port = 5000` that silently does nothing is worse than one that fails to compile. The whole
+  #      type is #if DEBUG, so it is ABSENT from the published Release package — only a local Debug
+  #      build against the sibling can hit this. EnableDiscovery survives.
+  #      ping answers the core's {"ok":true,"protocol":N,"app":"..."} rather than the bare "pong".
+  VERSION_PREFIX: 7.3.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
