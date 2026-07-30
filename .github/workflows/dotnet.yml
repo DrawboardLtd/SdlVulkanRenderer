@@ -97,7 +97,13 @@ env:
   #      type is #if DEBUG, so it is ABSENT from the published Release package — only a local Debug
   #      build against the sibling can hit this. EnableDiscovery survives.
   #      ping answers the core's {"ok":true,"protocol":N,"app":"..."} rather than the bare "pong".
-  VERSION_PREFIX: 7.3.${{ github.run_number }}
+  # 7.4 - lockstep rebuild against DIR.Lib 7.4. No renderer code change. DIR.Lib gains per-axis
+  #      PixelMeasureContext scales plus a CellAuthored factory, so a cell-authored tree arranges on a
+  #      pixel surface, and PixelWidgetBase Arrange/Paint/RenderLayout gain overloads taking the measure
+  #      context itself — the painter reads FontPath/FontScale/radius from the same object the measure
+  #      pass used, rather than a dpiScale threaded into both by hand. Additive: the scalar overloads
+  #      delegate with an isotropic context, so this renderer paints byte-identically.
+  VERSION_PREFIX: 7.4.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
