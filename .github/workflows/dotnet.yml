@@ -103,7 +103,15 @@ env:
   #      context itself — the painter reads FontPath/FontScale/radius from the same object the measure
   #      pass used, rather than a dpiScale threaded into both by hand. Additive: the scalar overloads
   #      delegate with an isotropic context, so this renderer paints byte-identically.
-  VERSION_PREFIX: 7.4.${{ github.run_number }}
+  # 7.5 - lockstep rebuild against DIR.Lib 7.5. No renderer code change. DIR.Lib now resolves installed
+  #      fonts by the family each face DECLARES rather than by a guessed file name, so a face whose file
+  #      isn't named after it resolves (Segoe UI Symbol lives in seguisym.ttf) and so does every face of
+  #      a .ttc past the first — both previously unreachable. Those are named by FontFaceId
+  #      (path, or path#index for a collection), which ManagedFontRasterizer honours; since the id is
+  #      already every glyph/atlas/shaper cache key, faces separate without further plumbing.
+  #      FontFallbackResolver gains TryResolveFont/CanRender and role-based construction, and
+  #      PixelWidgetBase.FontFallback carries per-run fallback into the declarative painter. Additive.
+  VERSION_PREFIX: 7.5.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
