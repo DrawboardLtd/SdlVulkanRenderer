@@ -7,6 +7,11 @@ on:
     branches: [ main ]
 
 env:
+  # Release notes for the chain, one entry per Major.Minor. The version NUMBER is deliberately not
+  # here any more — it lives in src/Directory.Build.props (VersionMajorMinor) and the build job reads
+  # it back, so it cannot drift from what the packages declare. Add the entry here when you bump it
+  # there. (The entries stay in the yml rather than moving next to the number because several contain
+  # `--`, which is illegal inside an XML comment.)
   # Major bump 4.1 -> 5.0: multi-page SDF glyph atlas. The atlas is now a list of fixed-size
   # page textures (default 2048²); a full page appends a new page instead of reallocating, so
   # glyph-atlas growth no longer does a vkDeviceWaitIdle + image realloc + re-upload (the visible
@@ -111,14 +116,34 @@ env:
   #      already every glyph/atlas/shaper cache key, faces separate without further plumbing.
   #      FontFallbackResolver gains TryResolveFont/CanRender and role-based construction, and
   #      PixelWidgetBase.FontFallback carries per-run fallback into the declarative painter. Additive.
-  VERSION_PREFIX: 7.5.${{ github.run_number }}
+  # 7.6 - descriptor sets and samplers stop being a fixed budget. The descriptor pool was created once with
+  #      maxSets 512 and treated as a hard ceiling, so a page carrying a few thousand small images ran the
+  #      device out — and since the glyph atlas draws from the same pool, the allocation refused could be
+  #      TEXT as easily as an image. Pools cannot be resized, so growth is by chaining: VulkanDevice adds a
+  #      pool when the current one is spent. Freed sets are recycled rather than returned to the driver
+  #      (every set shares one combined-image-sampler layout, so a returned set is re-pointed at another
+  #      image), which also keeps handles valid instead of invalidating one an in-flight command buffer may
+  #      still name, and keeps the pool count tracking PEAK live sets rather than growing with churn.
+  #      VkTexture no longer creates a sampler each — identical settings every time, no per-image state, and
+  #      thousands of them walked into maxSamplerAllocationCount as a second ceiling behind the first; one
+  #      shared VulkanDevice.LinearClampSampler replaces them. NEW: DrawTexturedQuadRegion draws an
+  #      arbitrary quad from a UV sub-rect, so many small images can share one atlas texture. FIX: a failed
+  #      page allocation in the SDF backend left its image and memory behind. Lockstep with DIR.Lib 7.6.
+  #      ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
+  # The build job CAPTURES a dotnet invocation's stdout to resolve the version, so the SDK's
+  # first-run banner must not be able to land in it.
+  DOTNET_NOLOGO: 1
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Published for the test job, so the version is resolved ONCE per run rather than each job
+    # re-deriving it.
+    outputs:
+      version-prefix: ${{ steps.version.outputs.prefix }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -126,6 +151,24 @@ jobs:
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x
+    - name: Resolve version prefix
+      id: version
+      # Read the version back from the one place it is written (src/Directory.Build.props) instead of
+      # restating it here — CI stamps -p:Version across every package, so a hard-coded copy here could
+      # ship packages whose version disagrees with the one they declare. -getProperty only EVALUATES
+      # the file: nothing is built and no restore is needed, so this can run before restore.
+      # The value is CAPTURED, so nothing else may print to stdout: DOTNET_NOLOGO (workflow env) keeps
+      # the SDK first-run banner out — this is the job's first dotnet call — and the shape check makes
+      # anything else unexpected, or a renamed property, fail the run rather than quietly stamping
+      # every package ".<run>".
+      run: |
+        MM="$(dotnet msbuild src/Directory.Build.props -getProperty:VersionMajorMinor -nologo)"
+        case "$MM" in
+          [0-9]*.[0-9]*) ;;
+          *) echo "::error::VersionMajorMinor did not resolve from src/Directory.Build.props (got '$MM')"; exit 1 ;;
+        esac
+        echo "VERSION_PREFIX=${MM}.${{ github.run_number }}" >> "$GITHUB_ENV"
+        echo "prefix=${MM}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
     - name: Install Android workload
       # This job opts into the android host TFM (BuildAndroidHost=true below) to compile + pack it,
       # so it needs the android workload. ubuntu runners already ship the Android SDK + JDK.
@@ -155,6 +198,9 @@ jobs:
   test:
     needs: build
     timeout-minutes: 15
+    # Inherited from the build job rather than resolved again — same run, same version.
+    env:
+      VERSION_PREFIX: ${{ needs.build.outputs.version-prefix }}
     strategy:
       fail-fast: false
       matrix:

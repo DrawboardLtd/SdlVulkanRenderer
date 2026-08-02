@@ -12,7 +12,8 @@ The fork now mirrors upstream's **full source** — the Android host (`Android/`
 - keep the submodule-based DIR.Lib `ProjectReference` (see below) rather than upstream's `UseLocalDirLib` sibling/nuget conditional;
 - keep `submodules: recursive` on every CI checkout — the submodule DIR.Lib `ProjectReference` needs the nested checkout to exist;
 - keep the **android host TFM opt-in** — upstream targets `net10.0;net10.0-android` unconditionally, but desktop consumers reference this project by source (the viewer's submodule `ProjectReference`) and `dotnet restore` evaluates every TFM, so an unconditional android TFM would force the android workload on every consumer/CI. The csproj defaults to `net10.0` and adds the android TFM only when `BuildAndroidHost=true`, which the fork CI's build job sets (it installs the workload); the test/webview jobs stay `net10.0`;
-- then bump the submodule pin + `VersionPrefix` / `VERSION_PREFIX`.
+- keep `src/Directory.Build.props`, and keep every csproj FREE of `VersionPrefix` — upstream versions per-csproj, and a csproj `VersionPrefix` overrides the props file, so a sync round silently restores the drift it exists to prevent (see Versioning);
+- then bump the submodule pin + `VersionMajorMinor` in `src/Directory.Build.props`.
 
 ## Build commands
 
@@ -26,9 +27,11 @@ A test project (`src/SdlVulkan.Renderer.Tests`, offscreen-Vulkan render regressi
 
 ## Versioning
 
-Package version is `Major.Minor.RunNumber` where `RunNumber` is the CI build number. Two places must stay in sync when bumping:
-- `VersionPrefix` in `src/SdlVulkan.Renderer/SdlVulkan.Renderer.csproj` — used for local builds (`Major.Minor.0`)
-- `VERSION_PREFIX` in `.github/workflows/dotnet.yml` — used for CI builds (`Major.Minor.${{ github.run_number }}`)
+Package version is `Major.Minor.RunNumber` where `RunNumber` is the CI build number. **One place to bump:** `VersionMajorMinor` in `src/Directory.Build.props`. Local builds get `Major.Minor.0`; the workflow reads that same property back (`dotnet msbuild src/Directory.Build.props -getProperty:VersionMajorMinor`) rather than restating the number, so CI cannot stamp a version the packages disagree with.
+
+It covers **every** package here — renderer, Inspector, WebView, WebView.Native — because CI stamps a single `-p:Version` across all of them. No csproj declares its own `VersionPrefix`: a per-project one silently overrides the props file, which is how Inspector/WebView/WebView.Native sat at 6.0.0 while the renderer shipped 7.5.0.
+
+Add the matching entry to the changelog comment block in `.github/workflows/dotnet.yml` — that block is the chain's de-facto release notes.
 
 Central package versioning via `src/SdlVulkan.Renderer/Directory.Packages.props` — update there, not in `.csproj`.
 
