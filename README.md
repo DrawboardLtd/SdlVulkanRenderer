@@ -9,9 +9,9 @@ SDL3 + Vortice.Vulkan rendering library built on [DIR.Lib](https://github.com/Dr
   - `VulkanContext.Create(instance, surface, w, h, ...)` — on-screen path with a swapchain tied to an `SdlVulkanWindow`.
   - `VulkanContext.CreateOffscreen(instance, w, h, ...)` — headless path rendering to a standalone `VkImage`; no surface, no swapchain, no SDL window. See **Headless / offscreen rendering** below.
 - **`VkRenderer`** — `Renderer<VulkanContext>` implementation with FillRectangle, DrawRectangle, FillEllipse, DrawText, plus batched glyph and persistent-vertex-buffer draw APIs. Exposes `FontAtlasDirty` so callers can trigger redraws after glyph rasterization. Has `BeginFrame` / `BeginOffscreenFrame` variants that match the two `VulkanContext` modes.
-- **`VkPipelineSet`** — GLSL 450 shader compilation and Vulkan pipeline creation (flat, textured, ellipse, stroke, SDF, blend variants).
+- **`VkPipelineSet`** — Vulkan pipeline creation from pre-baked SPIR-V (flat, textured, ellipse, page, stroke, SDF, round-rect, blend variants). Shaders are authored as GLSL 450 and baked by `tools/BakeShaders` at build time — see **Dependencies** below.
 - **`VkFontAtlas`** — Dynamic bitmap glyph atlas with ManagedFontRasterizer (from DIR.Lib) rasterization and Vulkan texture upload. Supports grow (512→4096), deferred eviction, and `skipUnflushed` to prevent sampling stale GPU texture data.
-- **`VkSdfFontAtlas`** — Signed-distance-field glyph atlas side-car for resolution-independent text. `SdfRasterSize = 128`, `fwidth`-driven AA in the fragment shader auto-tunes to ±0.5 screen pixels at any zoom. Single-channel R8_Unorm texture, keyed on `(font, size, character, charCode)` so CID subset fonts don't collide.
+- **`VkSdfFontAtlas`** — Signed-distance-field glyph atlas side-car for resolution-independent text. `SdfRasterSize = 64` (overridable per atlas), `fwidth`-driven AA in the fragment shader auto-tunes to ±0.5 screen pixels at any zoom. Four-channel R8G8B8A8Unorm MTSDF texture — RGB carry pseudo-distance, which the shader medians to keep corners sharp, and A the true distance. Keyed on `(font, size, gid, glyph name)`: glyph identity rather than code point, so subset fonts that reuse code points don't collide.
 
 ## Font Atlas Lifecycle
 
@@ -19,7 +19,7 @@ Per frame:
 1. `BeginFrame()` / `BeginOffscreenFrame()` — handles deferred eviction, runs `OnPreFlush` (pre-warm callback), calls `Flush(cmd)` on both atlases, runs `OnPreRenderPass` (texture uploads), then `BeginRenderPass`.
 2. `Flush(cmd)` — uploads dirty staging region to GPU via `vkCmdCopyBufferToImage`.
 3. `DrawText(...)` → `GetGlyph(...)` — cache hit returns UV coords; miss rasterizes into staging.
-4. `GetGlyph(..., skipUnflushed: true)` — in draw loops, returns zero-width for glyphs not yet uploaded. Pair with `PreWarmGlyph` in `OnPreFlush` if drawing a glyph that wasn't shown last frame (first-frame glyph flicker).
+4. `GetGlyph(..., skipUnflushed: true)` — in draw loops, returns zero-width for glyphs not yet uploaded. Pair with `PreWarmGlyph` in `OnPreFlush` if drawing a glyph that wasn't shown last frame (first-frame glyph flicker). For SDF text, `PreWarmSdfGlyph` is the equivalent; `PreWarmSdfGlyphBatch` warms many glyphs in one call with parallel rasterization — preferred when a page introduces tens-to-hundreds of unique glyphs.
 
 **Thread safety**: `vkDeviceWaitIdle()` before reusing the shared upload buffer (prevents race with `MaxFramesInFlight = 2`).
 
