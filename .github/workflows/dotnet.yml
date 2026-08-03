@@ -130,6 +130,11 @@ env:
   #      arbitrary quad from a UV sub-rect, so many small images can share one atlas texture. FIX: a failed
   #      page allocation in the SDF backend left its image and memory behind. Lockstep with DIR.Lib 7.6.
   #      ADDITIVE.
+  # 7.7 - lockstep rebuild against DIR.Lib 7.7. No renderer code change. A layout tree can now state a
+  #      hyperlink, and a text run which end it trims (new DIR.Lib TextTrim); ten dangling <see cref>
+  #      targets in DIR.Lib's own docs now resolve. DIR.Lib's SharpAstro.LALR.CC pin also moves 3.1.* ->
+  #      4.7.*, which only ever bound CI — a local build swaps it for the sibling ProjectReference, which
+  #      is how it sat a major behind unnoticed. ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
