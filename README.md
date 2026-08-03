@@ -131,9 +131,107 @@ On a fresh Ubuntu runner (GitHub Actions `ubuntu-latest`, Azure Pipelines, GitLa
 
 Containers: add the same two packages to your image. The offscreen path doesn't require a `tty`, display variable, or privileged mode.
 
+## Native WebView (optional)
+
+Host a native browser view *inside* an `SdlVulkanWindow`. The window system composites it over the
+Vulkan swapchain as a child surface — it does **not** go through the Vulkan render pass. It lives in
+its own projects so a consumer that wants no browser pulls none of it:
+
+| Project | Purpose |
+| --- | --- |
+| `src/SdlVulkan.Renderer.WebView` | The `INativeWebView` abstraction + platform backends. Multi-targets `net10.0` (interface, factory and the Linux/WebKitGTK backend) and `net10.0-windows` (adds the Windows/WebView2 backend). |
+| `src/SdlVulkan.Renderer.WebView.Native` | `WebView2Loader.dll` per Windows RID (x64 / arm64 / x86). The Windows TFM of the project above references it — never reference it yourself. |
+
+**Consume it by source, not from NuGet.** This repo publishes nothing to nuget.org, so reference the
+project the same way you reference the core renderer — through the submodule checkout, with the path
+relative to your own `.csproj`:
+
+```xml
+<ProjectReference Include="..\..\lib\SdlVulkanRenderer\src\SdlVulkan.Renderer.WebView\SdlVulkan.Renderer.WebView.csproj" />
+```
+
+`dotnet add package SdlVulkan.Renderer.WebView` resolves the **upstream** package, which is a
+different codebase from this one — don't. The loader DLL needs no separate reference: `.Native` is an
+in-tree `ProjectReference`, so it flows in with the Windows TFM. The only thing still coming from
+nuget.org is the third-party [WebView2Aot](https://www.nuget.org/packages/WebView2Aot) binding, which
+that TFM pins itself (the project opts out of central package management to do so).
+
+Backends:
+- **Windows** — `Win32WebView`, WebView2 (Edge/Chromium) via the [WebView2Aot](https://www.nuget.org/packages/WebView2Aot) Native-AOT bindings. Needs the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) installed: that runtime is a system component and is **not** redistributed here; only the loader DLL ships (in the `.Native` project).
+- **Linux** — `GtkWebView`, WebKitGTK 4.1 embedded via X11 (`XReparentWindow` into SDL's window; GTK runs its own loop on a dedicated thread). Requires the SDL window on the X11 driver — run with `SDL_VIDEODRIVER=x11` (works under Wayland sessions via XWayland) — and the WebKitGTK 4.1 + GTK3 runtime (`apt install libwebkit2gtk-4.1-0` on Debian/Ubuntu; present on most desktops).
+- **macOS** — `CocoaWebView` (`WKWebView`); present but not yet implemented.
+
+```csharp
+using SdlVulkan.Renderer;
+using SdlVulkan.Renderer.WebView;
+using DIR.Lib;
+
+using var window = SdlVulkanWindow.Create("App", 1280, 800);
+using var web = NativeWebView.Create();            // platform backend via the factory
+
+web.NavigationCompleted += url => Console.WriteLine($"loaded {url}");
+web.ConsoleMessage += (level, text) => Console.WriteLine($"[{level}] {text}");
+web.PageError += err => Console.WriteLine($"JS error: {err}");
+
+web.AttachToWindow(window);                         // parents the webview into the window's HWND
+web.Navigate("https://example.com");
+window.GetSizeInPixels(out var w, out var h);
+web.SetBounds(new RectInt(new PointInt(w, h), new PointInt(0, 0)));   // window pixel coords
+
+string href = await web.ExecuteScriptAsync("location.href");   // JSON-encoded result
+```
+
+For two-way native↔web interaction, `MessageReceived` surfaces the page's
+`window.chrome.webview.postMessage(...)` calls (as raw JSON) and `PostMessage(json)` sends the
+other way (the page receives it on `chrome.webview`'s `message` event) — build whatever
+request/response protocol you want on top. The Linux backend injects a small `window.chrome.webview`
+shim at document-start (mapping to WebKit's `messageHandlers`), so the **same page JS API works on
+both backends**.
+
+### Fit-to-content sizing
+
+`SetBounds` is host→browser (you position the webview). For the reverse direction — letting the
+page's content drive the webview's size — wrap it in a `WebViewContentSizer`. It injects a small
+`ResizeObserver` reporter after each navigation, surfaces the page's content size (in **device
+pixels**, ready for `SetBounds`) as `ContentSizeChanged`, and can drive the bounds for you:
+
+```csharp
+using var web = NativeWebView.Create();
+using var sizer = new WebViewContentSizer(web);     // construct before navigating
+
+// Grow/shrink the webview's height to fit the page; width stays fixed at `w`, top-left at (0,0).
+sizer.EnableAutoSize(origin: new PointInt(0, 0), fixedExtent: new PointInt(w, 0), axis: AutoSizeAxis.Height);
+sizer.ContentSizeChanged += size => Console.WriteLine($"content is {size.X}x{size.Y} device px");
+
+web.AttachToWindow(window);
+web.NavigateToString("<h1>I size myself</h1>");
+```
+
+`AutoSizeAxis.Height` is the default and the safe choice: a fixed width never reflows the page, so it
+can't oscillate. `Width`/`Both` track the other axis but are prone to reflow feedback. The `__sdlLayout`
+message key is **reserved** for this protocol — layout envelopes are consumed by the sizer and never
+reach *its* `MessageReceived`, so subscribe to `sizer.MessageReceived` to get only your app's messages.
+No `INativeWebView` change is involved; the sizer is built entirely on the existing message bridge.
+
+Beyond navigation, both backends surface diagnostics: `Trace` (redirect/load chain), `ConsoleMessage`
+(`console.*`), and `PageError` (uncaught JS exceptions, with stack). On Windows these come from the
+WebView2 DevTools Protocol; on Linux from in-page hooks forwarded over dedicated script-message
+channels.
+
+Backend notes:
+- **Windows** — WebView2's async creation completes on the Win32 message pump, which SDL's event
+  loop drives, so it composes with the standard render/event loop. Requires an STA thread. Events
+  are raised on the UI thread.
+- **Linux** — GTK runs its own main loop on a dedicated thread; public methods are safe to call from
+  the SDL event-loop thread (they marshal across via `g_idle_add`). Events (`MessageReceived`,
+  `TitleChanged`, …) are raised on the **GTK thread**, so handlers must be thread-safe or marshal back
+  themselves.
+
+`tools/WebViewSmoke` is a headless self-test of this subsystem, exercised by CI on Linux under Xvfb.
+
 ## Dependencies
 
-- [DIR.Lib](https://github.com/DrawboardLtd/DeviceIndependentRenderingLibrary) — Rendering primitives + FreeType glyph rasterization (git submodule, not NuGet)
+- [DIR.Lib](https://github.com/DrawboardLtd/DeviceIndependentRenderingLibrary) — Rendering primitives + pure-managed glyph rasterization (git submodule, not NuGet)
 - [SDL3-CS](https://www.nuget.org/packages/SDL3-CS) — SDL3 bindings
 - [SDL3-CS.Android](https://www.nuget.org/packages/SDL3-CS.Android) — android TFM only: SDL Java bridge + per-ABI `libSDL3.so` (see [Android](#android) for the version pin)
 - [Vortice.Vulkan](https://www.nuget.org/packages/Vortice.Vulkan) — Vulkan bindings
