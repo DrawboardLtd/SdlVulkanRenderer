@@ -183,6 +183,16 @@ env:
   #      three are now 7.9.0.0. Deliberately not a minor bump: the value only moves UP, and the runtime
   #      rejects a loaded assembly LOWER than the compiled reference, never higher, so anything already
   #      built against 6.11.0.0 or 6.0.0.0 keeps loading.
+  # 7.10 - lockstep rebuild against DIR.Lib 7.8 (submodule 7.7 -> 7.8). No renderer code change; the
+  #       CPM pin already tracked 7.8.*, so CI was restoring 7.8 while a local build used the 7.7
+  #       submodule — this closes that split. BEHAVIOUR CHANGE flowing through from DIR.Lib, not
+  #       additive: the PIXEL painter now fits every text run to the rect the layout engine arranged for
+  #       it, so a run left on the default TextTrim.End ellipsizes where it used to start at the rect
+  #       edge and overhang its neighbour. TextTrim.Shrink (scale down, keep every character) and
+  #       TextTrim.None (the previous overhang) are available for callers that want the old shape.
+  #       DIR.Lib 7.8 also derives AssemblyVersion from its version property, fixing the same
+  #       ships-the-wrong-identity bug this repo had: DIR.Lib and DIR.Lib.Shaping had published 6.4.0.0
+  #       since 6.5.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
