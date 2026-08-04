@@ -92,6 +92,10 @@ public sealed unsafe partial class VulkanContext
         // degraded state where a one-off leak is far cheaper than a freeze.
         VkSubmitInfo si = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
         DeviceApi.vkCreateFence(VkFenceCreateFlags.None, out var readbackFence).CheckResult();
+        // DEBUG-only, and on a window's device — so it must run on the render thread like every other
+        // submit to it. The assertion catches an inspector/MCP thread calling in, which would be
+        // concurrent queue access (see VulkanDevice.AssertQueueThread).
+        _dev.AssertQueueThread("swapchain readback");
         DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &si, readbackFence).CheckResult();
         if (DeviceApi.vkWaitForFences(1, &readbackFence, true, DrainTimeoutNs) == VkResult.Timeout)
         {

@@ -141,6 +141,19 @@ env:
   #      atlas half of the breadcrumb reading all zeros and the actual churn had to be dug out of host
   #      logs. The "fence late" line carries the gap too, so recovered episodes are data points as
   #      well. NEW: VulkanDevice.ChurnCounters/DeviceChurn, VkRenderer.DeviceChurnBreadcrumb. ADDITIVE.
+  # 7.9 - a frame's fence is now reset immediately before the submit that signals it, instead of in
+  #      BeginFrame. Everything in between — atlas flush/grow, texture uploads, the consumer's whole
+  #      render callback — used to run with a fence only EndFrame could signal, so any exit that
+  #      skipped EndFrame orphaned it permanently and the next BeginFrame waited on a fence nothing
+  #      would ever signal: indistinguishable from a hung GPU, but with the GPU idle. Same fix on the
+  #      offscreen path, where the wait is unbounded and the hang therefore permanent. Added
+  #      VulkanContext.AbortFrame (resolve a frame abandoned mid-way, so its acquire semaphore and
+  #      image do not leak into the next), VK_ERROR_DEVICE_LOST now reported distinctly instead of as
+  #      a generic VkException, and a submission ledger on the wedge breadcrumb that states whether
+  #      the fence being waited on ever had work submitted under it. Queue/command-pool external
+  #      synchronization is asserted (single-owner submission) rather than locked. NEW:
+  #      VulkanContext.AbortFrame/SubmissionLedger/DeviceLost, VkRenderer.AbortFrame/SubmissionLedger.
+  #      ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release

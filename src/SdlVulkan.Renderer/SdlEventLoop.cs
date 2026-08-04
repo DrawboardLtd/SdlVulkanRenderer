@@ -447,7 +447,7 @@ public sealed class SdlEventLoop
                 {
                     v.FenceStuckSinceTick = now;
                     var idle = v.LastCleanFrameTick > 0 ? $"{now - v.LastCleanFrameTick}ms since last clean frame" : "no clean frame yet";
-                    Console.Error.WriteLine($"[SdlEventLoop] GPU fence late (window {v.Window.WindowId}); retrying without teardown ({idle}).");
+                    Console.Error.WriteLine($"[SdlEventLoop] GPU fence late (window {v.Window.WindowId}); retrying without teardown ({idle}); {renderer.SubmissionLedger}.");
                 }
                 if (now - v.FenceStuckSinceTick < FenceEscalateMs)
                 {
@@ -461,7 +461,7 @@ public sealed class SdlEventLoop
                 // Breadcrumb: what the frames leading into the hang were doing. A field wedge report
                 // with this line attached tells us whether a glyph-upload storm / page append was in
                 // flight without needing a repro (the hang itself lives GPU-side and leaves no dump).
-                Console.Error.WriteLine($"[SdlEventLoop] wedge breadcrumb (window {v.Window.WindowId}): {renderer.GlyphAtlasBreadcrumb}; {renderer.DeviceChurnBreadcrumb}; " +
+                Console.Error.WriteLine($"[SdlEventLoop] wedge breadcrumb (window {v.Window.WindowId}): {renderer.GlyphAtlasBreadcrumb}; {renderer.DeviceChurnBreadcrumb}; {renderer.SubmissionLedger}; " +
                     (v.LastCleanFrameTick > 0 ? $"last clean frame {now - v.LastCleanFrameTick}ms ago" : "no clean frame yet"));
 
                 // A stuck fence means the GPU may be truly hung — and on a hung device the driver can
@@ -540,6 +540,26 @@ public sealed class SdlEventLoop
                 _running = false;
             }
             return false;
+        }
+        catch (Exception)
+        {
+            // A NON-Vulkan exception escaped OnRender (or an atlas flush) with a frame already begun:
+            // an app-side bug, not a GPU fault. Resolve the frame before letting it propagate. An
+            // abandoned frame keeps its acquired image and leaves its acquire semaphore signaled with
+            // no waiter, and the next acquire on that index would then signal an already-signaled
+            // binary semaphore — illegal, and a plausible route to a submit that waits forever. The
+            // fence itself is safe (it is only reset at submit time), so this is about the semaphore
+            // and the image.
+            //
+            // Rethrown deliberately: an app bug must still surface as that bug. This only ensures it
+            // does not ALSO leave the device in a state that looks like a driver wedge.
+            try { renderer.AbortFrame(); }
+            catch (Exception abort)
+            {
+                Console.Error.WriteLine(
+                    $"[SdlEventLoop] AbortFrame after a mid-frame exception threw: {abort.GetType().Name}: {abort.Message}");
+            }
+            throw;
         }
     }
 

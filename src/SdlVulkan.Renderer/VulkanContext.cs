@@ -117,6 +117,97 @@ public sealed unsafe partial class VulkanContext : IDisposable
     private int _currentFrame;
     private uint _currentImageIndex;
 
+    // Frame state machine. Render thread ONLY (BeginFrame / BeginRenderPass / SubmitFrame /
+    // AbortFrame all run on the event-loop thread), so these are deliberately plain fields —
+    // volatile would imply a sharing that does not exist.
+    private bool _frameBegun;       // BeginFrame acquired an image; a submit must resolve the frame
+    private bool _renderPassBegun;  // vkCmdBeginRenderPass has been recorded into this frame
+
+    // ---- Submission ledger (wedge forensics) ----------------------------------------------------
+    // A wedge presents as a fence that never signals, and until now the log could not distinguish
+    // the two causes: the GPU is genuinely slow/hung under work we submitted, versus nothing was
+    // ever submitted under that fence (the orphan case — see the note in BeginFrame). Recording the
+    // frame ordinal of each index's last submit answers it in one line, with no repro needed.
+    //
+    // Written on the render thread; read from breadcrumbs and (in DEBUG) the inspector's MCP thread,
+    // hence Volatile/Interlocked — matching VulkanDevice's churn counters. Single writer, so no CAS.
+    private long _frameOrdinal;                                            // ++ per frame that clears its fence wait
+    private readonly long[] _submitOrdinal = new long[MaxFramesInFlight];   // 0 = never submitted under this index
+    private long _submitsTotal;
+    private volatile bool _deviceLost;
+
+    /// <summary>True once any queue/fence/present call has reported VK_ERROR_DEVICE_LOST.</summary>
+    public bool DeviceLost => _deviceLost;
+
+    // Frame-state ownership, enforced rather than merely documented. The frame state machine is
+    // single-threaded, and the ONLY legal transfer of this context to another thread is the sacrificial
+    // recovery task (SdlEventLoop hands the renderer over while the render thread polls
+    // GpuRecoveryTask.IsCompletedSuccessfully, whose completion is the publish barrier — that is why
+    // none of this state needs volatile). If a future change ever calls a frame method from a second
+    // thread, that reasoning silently breaks and the symptom would be another unexplained wedge; this
+    // turns it into an immediate, named failure in DEBUG at zero release cost.
+    private int _frameThreadId;
+
+    [Conditional("DEBUG")]
+    private void AssertFrameThread(string method)
+    {
+        var id = Environment.CurrentManagedThreadId;
+        if (_frameThreadId == 0)
+        {
+            _frameThreadId = id;
+            return;
+        }
+        if (_frameThreadId != id)
+        {
+            throw new InvalidOperationException(
+                $"{method} called from thread {id}, but this context's frame state machine is owned by " +
+                $"thread {_frameThreadId}. Frame methods are single-threaded; only the sacrificial " +
+                "recovery task may touch this context, and only while the render thread polls it.");
+        }
+    }
+
+    /// <summary>
+    /// Re-seat frame-state ownership after the sacrificial recovery task legitimately ran frame-adjacent
+    /// teardown on its own thread. Called by <see cref="RecoverFromGpuError"/> so the assertion tracks the
+    /// handoff instead of tripping on it.
+    /// </summary>
+    [Conditional("DEBUG")]
+    private void ReseatFrameThread() => _frameThreadId = 0;
+
+    /// <summary>
+    /// One-line submission ledger for the wedge breadcrumb. A gap larger than
+    /// <see cref="MaxFramesInFlight"/> — or "NEVER" — means the fence being waited on has no
+    /// submission behind it, so the GPU is idle and the stall is ours, not the driver's.
+    /// </summary>
+    public string SubmissionLedger
+    {
+        get
+        {
+            var idx = _currentFrame;
+            var ord = Volatile.Read(ref _submitOrdinal[idx]);
+            var now = Volatile.Read(ref _frameOrdinal);
+            var last = ord == 0 ? "NEVER" : $"frame {ord} ({now - ord} frame(s) ago)";
+            return $"ledger: waiting fence[{idx}], last submit under it {last}; " +
+                   $"frames {now}, submits {Interlocked.Read(ref _submitsTotal)}" +
+                   (_deviceLost ? "; DEVICE_LOST seen" : "");
+        }
+    }
+
+    /// <summary>
+    /// Log a real device loss distinctly, once. Nothing in the renderer used to single DEVICE_LOST out
+    /// — every non-success came back as a generic VkException — so no field log could tell a GPU reset
+    /// (TDR) apart from a fence that simply never got a submission. That distinction is the first thing
+    /// a wedge report needs.
+    /// </summary>
+    private void NoteDeviceLost(VkResult result, string where)
+    {
+        if (result != VkResult.ErrorDeviceLost || _deviceLost) return;
+        _deviceLost = true;
+        Console.Error.WriteLine(
+            $"[VulkanContext] VK_ERROR_DEVICE_LOST from {where} — the device is gone (GPU reset / TDR). " +
+            "This is a real device loss, not a late fence.");
+    }
+
     /// <summary>
     /// Index of the current frame-in-flight (0 or 1 for double-buffered).
     /// Consumers that need per-frame GPU resources (UBO copies, staging buffers)
@@ -280,6 +371,16 @@ public sealed unsafe partial class VulkanContext : IDisposable
         _currentFrame = 0;
         _fenceWaitStuck = false; // fresh fences start signaled — leave stuck-mode polling
 
+        // The in-flight frame (if any) died with its semaphores and command buffer: it can never be
+        // submitted now, and the fences it would have signaled no longer exist. Clear the frame state
+        // so AbortFrame cannot try to resolve a frame against replaced sync objects, and clear the
+        // ledger so it reports against the new fences rather than the destroyed ones.
+        _frameBegun = false;
+        _renderPassBegun = false;
+        Array.Clear(_submitOrdinal);
+        // This ran on the sacrificial task's thread; let the render thread re-seat ownership.
+        ReseatFrameThread();
+
         CleanupSwapchain();
         CreateSwapchain(width, height);
     }
@@ -364,6 +465,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
 
     public VkCommandBuffer BeginFrame(out bool resized)
     {
+        AssertFrameThread(nameof(BeginFrame));
         resized = false;
         var fence = _inFlightFences[_currentFrame];
         // Bounded wait. We rely on the submit signaling this fence — including on drivers (Adreno
@@ -382,8 +484,10 @@ public sealed unsafe partial class VulkanContext : IDisposable
             _fenceWaitStuck = true;
             throw new VkException(waitResult, "in-flight fence wait timed out — GPU late or stuck");
         }
+        NoteDeviceLost(waitResult, "vkWaitForFences");
         waitResult.CheckResult();
         _fenceWaitStuck = false;
+        _frameOrdinal++;
 
         // The fence for _currentFrame is now signaled (just waited, not yet reset). If a thumbnail
         // capture's copy rode this fence index, its GPU work is complete — snapshot it now without
@@ -393,14 +497,28 @@ public sealed unsafe partial class VulkanContext : IDisposable
         var result = DeviceApi.vkAcquireNextImageKHR(Swapchain, ulong.MaxValue,
             _imageAvailableSemaphores[_currentFrame], VkFence.Null, out _currentImageIndex);
 
+        NoteDeviceLost(result, "vkAcquireNextImageKHR");
+
         if (result == VkResult.ErrorOutOfDateKHR)
         {
             resized = true;
             return VkCommandBuffer.Null;
         }
 
-        DeviceApi.vkResetFences(1, &fence);
-
+        // NOTE: the fence is deliberately NOT reset here — see EndFrame, which resets it immediately
+        // before the submit that signals it.
+        //
+        // It used to be reset at this point, which opened a window in which the frame's fence was
+        // unsignaled and NOTHING but EndFrame's vkQueueSubmit could ever signal it again. Everything
+        // between here and that submit runs inside that window: the three atlas Flushes (including a
+        // page Grow), OnPreFlush, OnPreRenderPass texture uploads, BeginRenderPass, and the whole of
+        // the consumer's OnRender. Any exit on that stretch that skipped EndFrame — a throw, or a
+        // Timeout raised mid-frame rather than by the wait above — orphaned the fence permanently:
+        // _currentFrame was never advanced either, so the NEXT BeginFrame waited on a fence no
+        // submission would ever signal. That presents exactly like a hung GPU (fence never signals)
+        // while the GPU is in fact idle, and it defeats the event loop's non-destructive retry, whose
+        // whole premise is that a Timeout leaves no mutated frame state. Resetting at submit time
+        // instead means an abandoned frame leaves the fence SIGNALED and the next frame proceeds.
         var cmd = _commandBuffers[_currentFrame];
         DeviceApi.vkResetCommandBuffer(cmd, 0);
 
@@ -409,6 +527,10 @@ public sealed unsafe partial class VulkanContext : IDisposable
             flags = VkCommandBufferUsageFlags.OneTimeSubmit
         };
         DeviceApi.vkBeginCommandBuffer(cmd, &beginInfo);
+        // From here until EndFrame there is an acquired swapchain image and a recording command
+        // buffer that must be resolved by a submit. AbortFrame does that when the frame is abandoned.
+        _frameBegun = true;
+        _renderPassBegun = false;
 
         // Reset vertex offset for this frame
         _vertexOffset = 0;
@@ -431,6 +553,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         };
 
         DeviceApi.vkCmdBeginRenderPass(cmd, &rpBI, VkSubpassContents.Inline);
+        _renderPassBegun = true;
 
         // Set dynamic viewport and scissor
         VkViewport viewport = new(0, 0, SwapchainWidth, SwapchainHeight, 0, 1);
@@ -439,9 +562,16 @@ public sealed unsafe partial class VulkanContext : IDisposable
         DeviceApi.vkCmdSetScissor(cmd, 0, scissor);
     }
 
-    public void EndFrame(VkCommandBuffer cmd)
+    public void EndFrame(VkCommandBuffer cmd) => SubmitFrame(cmd, endRenderPass: true);
+
+    private void SubmitFrame(VkCommandBuffer cmd, bool endRenderPass)
     {
-        DeviceApi.vkCmdEndRenderPass(cmd);
+        AssertFrameThread(nameof(SubmitFrame));
+        if (endRenderPass)
+        {
+            DeviceApi.vkCmdEndRenderPass(cmd);
+            _renderPassBegun = false;
+        }
         DeviceApi.vkEndCommandBuffer(cmd);
 
         var waitSemaphore = _imageAvailableSemaphores[_currentFrame];
@@ -459,22 +589,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
             pSignalSemaphores = &signalSemaphore
         };
 
-        var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, _inFlightFences[_currentFrame]);
-        RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
-        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) can return VK_ERROR_INITIALIZATION_FAILED from
-        // vkQueueSubmit even though the work executes and the fence + semaphore signal normally. That is not
-        // a spec-legal return for vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST
-        // are), so it can NEVER denote a real failure here — a genuine failure arrives as one of those and
-        // still throws via CheckResult below.
-        //
-        // The ROOT CAUSE of the per-frame storm was an unsynchronized atlas image swap in
-        // VkSdfFontAtlas.Grow / VkFontAtlas.Grow (fixed there with a vkDeviceWaitIdle before the swap). This
-        // tolerance is KEPT DELIBERATELY as defense-in-depth: it's free, it cannot mask a real error, and it
-        // breaks the throw -> rebuild-swapchain-every-frame feedback loop for ANY other latent trigger (that
-        // recovery churn was itself what sustained the storm). The RenderDiag.Vk call above still logs every
-        // occurrence in DEBUG, so a new trigger stays visible without freezing the app.
-        if (submitResult != VkResult.ErrorInitializationFailed)
-            submitResult.CheckResult();
+        // Reset the fence HERE, not in BeginFrame — the whole point is that only the few statements
+        // between this reset and the submit below can leave it unsignaled (see the note in BeginFrame).
+        // Legal: BeginFrame waited this fence to the signaled state and nothing has been submitted
+        // under it since, so it is not in use by any pending submission.
+        var frameFence = _inFlightFences[_currentFrame];
+        DeviceApi.vkResetFences(1, &frameFence);
 
         var swapchain = Swapchain;
         var imageIndex = _currentImageIndex;
@@ -487,12 +607,74 @@ public sealed unsafe partial class VulkanContext : IDisposable
             pImageIndices = &imageIndex
         };
 
+        // Submit then present, both on this device's owning thread — the device relies on single-owner
+        // submission rather than a lock (see VulkanDevice.AssertQueueThread), so nothing can interleave
+        // between the two halves of this frame's queue work.
+        VkResult presentResult;
+        _dev.AssertQueueThread(nameof(SubmitFrame));
+        var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, frameFence);
+        RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
+        if (submitResult is VkResult.Success or VkResult.ErrorInitializationFailed)
+        {
+            // Ledger: this frame index now has work in flight that will signal its fence. On a
+            // stuck fence the breadcrumb compares this against the index being waited on, which is
+            // what tells "the GPU is slow" apart from "nothing was ever submitted under it".
+            Volatile.Write(ref _submitOrdinal[_currentFrame], _frameOrdinal);
+            Interlocked.Increment(ref _submitsTotal);
+        }
+        NoteDeviceLost(submitResult, "vkQueueSubmit");
+
+        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) can return VK_ERROR_INITIALIZATION_FAILED from
+        // vkQueueSubmit even though the work executes and the fence + semaphore signal normally. That is not
+        // a spec-legal return for vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST
+        // are), so it can NEVER denote a real failure here — a genuine failure arrives as one of those and
+        // still throws via CheckResult below.
+        //
+        // The ROOT CAUSE of the per-frame storm was an unsynchronized atlas image swap in
+        // VkSdfFontAtlas.Grow / VkFontAtlas.Grow (fixed there with a vkDeviceWaitIdle before the swap). This
+        // tolerance is KEPT DELIBERATELY as defense-in-depth: it's free, it cannot mask a real error, and it
+        // breaks the throw -> rebuild-swapchain-every-frame feedback loop for ANY other latent trigger (that
+        // recovery churn was itself what sustained the storm). The RenderDiag.Vk call above still logs every
+        // occurrence in DEBUG, so a new trigger stays visible without freezing the app.
+        //
+        // Throwing here leaves the fence reset-but-unsignaled, which is the one orphan case this method
+        // cannot avoid — but a genuine submit failure is exactly what the event loop's mid-frame VkException
+        // handler recovers from, and RecoverFromGpuError recreates the fences (fresh fences start signaled).
+        if (submitResult != VkResult.ErrorInitializationFailed)
+            submitResult.CheckResult();
+
         // Present is intentionally not CheckResult'd — ErrorOutOfDateKHR/SuboptimalKHR on resize are
         // handled by the next BeginFrame's acquire. Log it (DEBUG only) so we can confirm present is
         // actually succeeding now that submit no longer throws on the benign Adreno quirk above.
-        var presentResult = DeviceApi.vkQueuePresentKHR(GraphicsQueue, &presentInfo);
+        presentResult = DeviceApi.vkQueuePresentKHR(GraphicsQueue, &presentInfo);
         RenderDiag.Vk("present", presentResult, $"frame={_currentFrame} img={_currentImageIndex}");
+        NoteDeviceLost(presentResult, "vkQueuePresentKHR");
+
+        _frameBegun = false;
         _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
+    }
+
+    /// <summary>
+    /// Resolve a frame that was begun but will not be presented normally, so its fence and its acquired
+    /// swapchain image do not leak into the next frame. Safe to call when no frame is in flight (no-op).
+    /// <para>
+    /// A frame between BeginFrame and EndFrame owns an acquired image, a pending acquire-semaphore signal
+    /// and a recording command buffer. Simply walking away from it leaves the semaphore signaled with no
+    /// waiter — and the next acquire on the same index would then signal an already-signaled binary
+    /// semaphore, which is illegal and is a plausible route to a submit that waits forever. The cheapest
+    /// legal resolution is to finish the frame anyway: close the render pass, submit (which consumes the
+    /// acquire signal and signals the fence) and present whatever was recorded. A partially-drawn frame
+    /// flashes; a wedged device does not come back.
+    /// </para>
+    /// Render thread only, like the rest of the frame state machine.
+    /// </summary>
+    public void AbortFrame()
+    {
+        if (!_frameBegun) return;
+        // endRenderPass tracks reality: a frame that died before BeginRenderPass must not have
+        // vkCmdEndRenderPass recorded into it (illegal), but still needs the submit to retire its
+        // semaphore and fence.
+        SubmitFrame(_commandBuffers[_currentFrame], endRenderPass: _renderPassBegun);
     }
 
     [Conditional("DEBUG")]
