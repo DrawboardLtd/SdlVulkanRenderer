@@ -193,6 +193,11 @@ env:
   #       DIR.Lib 7.8 also derives AssemblyVersion from its version property, fixing the same
   #       ships-the-wrong-identity bug this repo had: DIR.Lib and DIR.Lib.Shaping had published 6.4.0.0
   #       since 6.5.
+  # 7.11 - rebuild against DIR.Lib 7.9: a PDF font's own /Encoding now decides which glyph a char
+  #        code selects, so embedded name-keyed CFF subsets stop drawing unrelated glyphs. Carries
+  #        SharpAstro.Fonts 1.8, which loads PDF subset fonts whose cmap a subsetter malformed
+  #        (previously the whole font was rejected and every glyph fell back to a system face).
+  #        No renderer API change.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
