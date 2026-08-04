@@ -173,6 +173,16 @@ env:
   #      text, so log-grepping tooling is unaffected. RenderDiag stays [Conditional("DEBUG")] raw
   #      stderr. NEW dependency: Microsoft.Extensions.Logging.Abstractions (interface-only). NEW:
   #      SdlVulkanLog. ADDITIVE.
+  #      Later in 7.9, no X.Y bump: AssemblyVersion is now DERIVED from VersionMajorMinor for every
+  #      project instead of being restated as a literal per csproj, and the DIR.Lib pin moves 7.5.* ->
+  #      7.8.* to match upstream. Both come down from upstream, which had already corrected them. The
+  #      AssemblyVersion half matters most: CI stamps -p:Version and -p:FileVersion but NOT
+  #      -p:AssemblyVersion, so where a stale VersionPrefix only spoiled a local pack, a stale
+  #      AssemblyVersion SHIPPED — SdlVulkan.Renderer published 6.11.0.0 and both WebView packages
+  #      6.0.0.0 right through 7.9, each against an informational version a major or more ahead. All
+  #      three are now 7.9.0.0. Deliberately not a minor bump: the value only moves UP, and the runtime
+  #      rejects a loaded assembly LOWER than the compiled reference, never higher, so anything already
+  #      built against 6.11.0.0 or 6.0.0.0 keeps loading.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
