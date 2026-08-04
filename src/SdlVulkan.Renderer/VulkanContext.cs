@@ -133,7 +133,10 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // hence Volatile/Interlocked — matching VulkanDevice's churn counters. Single writer, so no CAS.
     private long _frameOrdinal;                                            // ++ per frame that clears its fence wait
     private readonly long[] _submitOrdinal = new long[MaxFramesInFlight];   // 0 = never submitted under this index
-    private long _submitsTotal;
+    // 1 = a submit succeeded under this index and its fence will signal. 0 = nothing in flight, so the
+    // fence CANNOT signal and BeginFrame must not wait on it. int rather than bool for Volatile access.
+    private readonly int[] _submitPending = new int[MaxFramesInFlight];
+    private long _submitsTotal, _submitsRejected;
     private volatile bool _deviceLost;
 
     /// <summary>True once any queue/fence/present call has reported VK_ERROR_DEVICE_LOST.</summary>
@@ -187,10 +190,30 @@ public sealed unsafe partial class VulkanContext : IDisposable
             var ord = Volatile.Read(ref _submitOrdinal[idx]);
             var now = Volatile.Read(ref _frameOrdinal);
             var last = ord == 0 ? "NEVER" : $"frame {ord} ({now - ord} frame(s) ago)";
-            return $"ledger: waiting fence[{idx}], last submit under it {last}; " +
-                   $"frames {now}, submits {Interlocked.Read(ref _submitsTotal)}" +
+            var rejected = Interlocked.Read(ref _submitsRejected);
+            return $"ledger: waiting fence[{idx}], last submit under it {last}" +
+                   (Volatile.Read(ref _submitPending[idx]) == 0 ? " (NOTHING PENDING)" : "") +
+                   $"; frames {now}, submits {Interlocked.Read(ref _submitsTotal)}" +
+                   (rejected > 0 ? $", REJECTED {rejected}" : "") +
                    (_deviceLost ? "; DEVICE_LOST seen" : "");
         }
+    }
+
+    /// <summary>
+    /// Replace one frame index's image-available semaphore after a submit the driver rejected. The acquire
+    /// signaled it and the rejected submit never queued the wait that would consume that signal, so it is
+    /// signaled-but-not-pending: legal to destroy, and unsafe to reuse, because the next acquire on this
+    /// index would otherwise signal an already-signaled binary semaphore.
+    /// </summary>
+    private void ReplaceImageAvailableSemaphore(int frameIndex)
+    {
+        DeviceApi.vkDestroySemaphore(_imageAvailableSemaphores[frameIndex]);
+        VkSemaphoreCreateInfo ci = new();
+        DeviceApi.vkCreateSemaphore(&ci, null, out var replacement).CheckResult();
+        _imageAvailableSemaphores[frameIndex] = replacement;
+        Console.Error.WriteLine(
+            $"[VulkanContext] vkQueueSubmit rejected frame {frameIndex} (ErrorInitializationFailed); " +
+            "dropped the frame and replaced its acquire semaphore.");
     }
 
     /// <summary>
@@ -359,7 +382,17 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // forced to kill it). TryDrainDevice caps the wait and forces the teardown on timeout: a
         // clean rebuild-after-timeout is recoverable (or at worst surfaces as a recovery failure the
         // event loop turns into a clean exit), whereas the unbounded wait could not escape the hang.
-        TryDrainDevice(DrainTimeoutNs, "GPU-error recovery");
+        //
+        // attemptEvenIfStuck: on the stuck-fence escalation this method runs on the sacrificial
+        // recovery task, where even a pathological block is abandonable — so unlike the UI-thread
+        // resize path there is no reason to skip the bounded drain. And the drain matters here:
+        // a stuck fence is usually a frame that is merely SLOW (Windows has never logged a TDR for
+        // these — the GPU is alive), and destroying its fences and semaphores while the submission
+        // still references them is illegal. A 2026-08-04 capture showed exactly that teardown being
+        // followed by the driver rejecting every subsequent vkQueueSubmit; giving in-flight work up
+        // to the drain cap to retire first makes the teardown legal whenever the frame completes,
+        // and on a truly dead fence it degrades to today's behaviour after the cap.
+        TryDrainDevice(DrainTimeoutNs, "GPU-error recovery", attemptEvenIfStuck: true);
 
         for (var i = 0; i < MaxFramesInFlight; i++)
         {
@@ -378,6 +411,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         _frameBegun = false;
         _renderPassBegun = false;
         Array.Clear(_submitOrdinal);
+        Array.Clear(_submitPending);   // fresh fences are signaled but have nothing behind them
         // This ran on the sacrificial task's thread; let the render thread re-seat ownership.
         ReseatFrameThread();
 
@@ -393,28 +427,39 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// caller is about to destroy + recreate the sync objects and swapchain regardless, so a
     /// timed-out drain degrades to a recoverable rebuild (or a clean exit) instead of a hang.
     /// </summary>
-    private bool TryDrainDevice(ulong timeoutNs, string context)
+    private bool TryDrainDevice(ulong timeoutNs, string context, bool attemptEvenIfStuck = false)
     {
         // Guard on the GPU's known-good state. When the per-frame fence is already known stuck,
         // BeginFrame has been timing out — which is exactly how the event loop escalated into
-        // recovery — so the GPU is wedged and a drain here would just burn the full timeout before
-        // failing. Skip straight to the teardown (the fences are recreated next regardless). Only
-        // attempt the drain when the GPU still looks alive: the other recovery trigger is a
-        // mid-frame submit/present error with a healthy fence, where draining in-flight work before
-        // destroying sync objects is both safe and useful.
-        if (_fenceWaitStuck)
+        // recovery — and on the UI-thread callers (resize, surface loss) burning the full timeout
+        // before failing is a stall the window can't afford, so those skip straight to the teardown
+        // (the fences are recreated next regardless). The sacrificial recovery path passes
+        // attemptEvenIfStuck instead: it can afford the bounded wait, and a "stuck" fence is usually
+        // a slow frame whose in-flight work makes the teardown illegal until it retires — see the
+        // caller. The other recovery trigger is a mid-frame submit/present error with a healthy
+        // fence, where the drain always runs.
+        if (_fenceWaitStuck && !attemptEvenIfStuck)
         {
             Console.Error.WriteLine(
                 $"[VulkanContext] GPU already known stuck; skipping drain before {context}.");
             return false;
         }
 
+        // Only wait on fences that have a submission behind them. A fence whose submit was rejected
+        // (see SubmitFrame) is unsignaled with nothing in flight — waiting on it can only ever burn
+        // the full cap. No pending fences at all means the device is drained by definition.
         var fences = stackalloc VkFence[MaxFramesInFlight];
+        var pending = 0u;
         for (var i = 0; i < MaxFramesInFlight; i++)
         {
-            fences[i] = _inFlightFences[i];
+            if (Volatile.Read(ref _submitPending[i]) != 0)
+                fences[pending++] = _inFlightFences[i];
         }
-        if (DeviceApi.vkWaitForFences(MaxFramesInFlight, fences, true, timeoutNs) == VkResult.Timeout)
+        if (pending == 0)
+        {
+            return true;
+        }
+        if (DeviceApi.vkWaitForFences(pending, fences, true, timeoutNs) == VkResult.Timeout)
         {
             Console.Error.WriteLine(
                 $"[VulkanContext] GPU did not idle within {timeoutNs / 1_000_000}ms during {context}; forcing teardown.");
@@ -445,14 +490,17 @@ public sealed unsafe partial class VulkanContext : IDisposable
         var n = 0;
         for (var i = 0; i < MaxFramesInFlight; i++)
         {
-            if (i != _currentFrame)
+            // Skip fences with no submission behind them (never submitted, or the submit was
+            // rejected — see SubmitFrame): they cannot signal, and nothing is sampling the atlas
+            // from a frame that never reached the GPU.
+            if (i != _currentFrame && Volatile.Read(ref _submitPending[i]) != 0)
             {
                 fences[n++] = _inFlightFences[i];
             }
         }
         if (n == 0)
         {
-            return true; // single frame in flight -> no prior frame can reference the atlas
+            return true; // nothing in flight -> no prior frame can reference the atlas
         }
         if (DeviceApi.vkWaitForFences((uint)n, fences, true, DrainTimeoutNs) == VkResult.Timeout)
         {
@@ -477,8 +525,13 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // stuck, retries use the short poll timeout so the loop stays responsive between attempts (see
         // FenceWaitTimeoutNs comment). A real device-loss comes back as a negative result (DEVICE_LOST),
         // which CheckResult turns into the destructive recovery path.
-        var waitResult = DeviceApi.vkWaitForFences(1, &fence, true,
-            _fenceWaitStuck ? FenceStuckPollTimeoutNs : FenceWaitTimeoutNs);
+        // Skip the wait entirely when nothing was ever submitted under this index (a submit the driver
+        // rejected). Such a fence is unsignaled with no pending work, so no wait and no escalation can
+        // ever satisfy it -- waiting on it was the wedge.
+        var waitResult = Volatile.Read(ref _submitPending[_currentFrame]) == 0
+            ? VkResult.Success
+            : DeviceApi.vkWaitForFences(1, &fence, true,
+                _fenceWaitStuck ? FenceStuckPollTimeoutNs : FenceWaitTimeoutNs);
         if (waitResult == VkResult.Timeout)
         {
             _fenceWaitStuck = true;
@@ -614,34 +667,55 @@ public sealed unsafe partial class VulkanContext : IDisposable
         _dev.AssertQueueThread(nameof(SubmitFrame));
         var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, frameFence);
         RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
-        if (submitResult is VkResult.Success or VkResult.ErrorInitializationFailed)
-        {
-            // Ledger: this frame index now has work in flight that will signal its fence. On a
-            // stuck fence the breadcrumb compares this against the index being waited on, which is
-            // what tells "the GPU is slow" apart from "nothing was ever submitted under it".
-            Volatile.Write(ref _submitOrdinal[_currentFrame], _frameOrdinal);
-            Interlocked.Increment(ref _submitsTotal);
-        }
         NoteDeviceLost(submitResult, "vkQueueSubmit");
 
-        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) can return VK_ERROR_INITIALIZATION_FAILED from
-        // vkQueueSubmit even though the work executes and the fence + semaphore signal normally. That is not
-        // a spec-legal return for vkQueueSubmit (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY and DEVICE_LOST
-        // are), so it can NEVER denote a real failure here — a genuine failure arrives as one of those and
-        // still throws via CheckResult below.
+        // Qualcomm Adreno X1-85 (qcdx8380, Windows-on-ARM) returns VK_ERROR_INITIALIZATION_FAILED from
+        // vkQueueSubmit, which is not a spec-legal return here (only SUCCESS, OUT_OF_{HOST,DEVICE}_MEMORY
+        // and DEVICE_LOST are). It used to be tolerated on the belief that the work executed anyway and the
+        // fence signaled normally, which made it free to ignore.
         //
-        // The ROOT CAUSE of the per-frame storm was an unsynchronized atlas image swap in
-        // VkSdfFontAtlas.Grow / VkFontAtlas.Grow (fixed there with a vkDeviceWaitIdle before the swap). This
-        // tolerance is KEPT DELIBERATELY as defense-in-depth: it's free, it cannot mask a real error, and it
-        // breaks the throw -> rebuild-swapchain-every-frame feedback loop for ANY other latent trigger (that
-        // recovery churn was itself what sustained the storm). The RenderDiag.Vk call above still logs every
-        // occurrence in DEBUG, so a new trigger stays visible without freezing the app.
+        // MEASURED 2026-08-04: that belief is wrong — the work does NOT execute. A field capture caught the
+        // failure mode exactly. After each escalation-recovery, precisely TWO frames were submitted, both
+        // rejected with this code, and the third frame then waited forever on the first one's fence. That is
+        // what the "GPU wedge" has been all along: not a hung GPU (Windows logged no TDR across any wedge,
+        // and the GPU sat idle) but a submission that never happened, leaving a fence nothing could ever
+        // signal. Escalation rebuilt the sync objects, which bought exactly two more frames, and it looped —
+        // 7 cycles, 14 rejected submits, in one capture.
         //
-        // Throwing here leaves the fence reset-but-unsignaled, which is the one orphan case this method
-        // cannot avoid — but a genuine submit failure is exactly what the event loop's mid-frame VkException
-        // handler recovers from, and RecoverFromGpuError recreates the fences (fresh fences start signaled).
-        if (submitResult != VkResult.ErrorInitializationFailed)
+        // So a rejected submit is now treated as what it is: a DROPPED FRAME. Nothing is in flight, so
+        //   - the fence is left unmarked, and BeginFrame skips the wait for an index with no pending submit
+        //     (a fence with no submission behind it can never signal; waiting on it WAS the wedge);
+        //   - present is skipped, because it would wait on a render-finished semaphore that will never be
+        //     signaled either;
+        //   - the acquire semaphore is replaced (see ReplaceImageAvailableSemaphore).
+        // The frame index still advances, so this degrades to one visibly dropped frame, not a stall.
+        var submitted = submitResult == VkResult.Success;
+        if (submitted)
+        {
+            // Ledger: this index now has work in flight that will signal its fence. On a stuck fence the
+            // breadcrumb compares this against the index being waited on, which is what tells "the GPU is
+            // slow" apart from "nothing was ever submitted under it".
+            Volatile.Write(ref _submitOrdinal[_currentFrame], _frameOrdinal);
+            Volatile.Write(ref _submitPending[_currentFrame], 1);
+            Interlocked.Increment(ref _submitsTotal);
+        }
+        else if (submitResult == VkResult.ErrorInitializationFailed)
+        {
+            Interlocked.Increment(ref _submitsRejected);
+            ReplaceImageAvailableSemaphore(_currentFrame);
+            // A thumbnail copy recorded into this frame died with it. Cancel it, or the next
+            // BeginFrame on this index — which skips the fence wait, there being nothing to wait
+            // for — would snapshot a readback buffer the GPU never wrote.
+            if (_thumbPending && _thumbPendingIndex == _currentFrame)
+                _thumbPending = false;
+            _frameBegun = false;
+            _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
+            return;
+        }
+        else
+        {
             submitResult.CheckResult();
+        }
 
         // Present is intentionally not CheckResult'd — ErrorOutOfDateKHR/SuboptimalKHR on resize are
         // handled by the next BeginFrame's acquire. Log it (DEBUG only) so we can confirm present is

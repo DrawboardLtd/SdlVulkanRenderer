@@ -154,6 +154,15 @@ env:
   #      synchronization is asserted (single-owner submission) rather than locked. NEW:
   #      VulkanContext.AbortFrame/SubmissionLedger/DeviceLost, VkRenderer.AbortFrame/SubmissionLedger.
   #      ADDITIVE.
+  #      ALSO in 7.9 — the actual root cause of the field wedges, caught live by the ledger above:
+  #      Adreno's spec-illegal VK_ERROR_INITIALIZATION_FAILED from vkQueueSubmit is a REAL rejection
+  #      (the work never executes; the old tolerance believed it did), so a rejected submit is now a
+  #      dropped frame: fence left unmarked and never waited on (a fence with no submission behind it
+  #      cannot signal — waiting on it WAS the wedge), present skipped, acquire semaphore replaced,
+  #      pending thumbnail capture cancelled, frame index advanced. The stuck-fence recovery drain now
+  #      runs even in stuck mode (it is on the sacrificial task, and destroying sync objects a slow
+  #      frame still references is what poisoned the driver into rejecting), and all drains skip
+  #      fences with nothing pending.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
