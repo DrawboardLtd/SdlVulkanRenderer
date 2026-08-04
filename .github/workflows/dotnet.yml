@@ -135,13 +135,14 @@ env:
   #      targets in DIR.Lib's own docs now resolve. DIR.Lib's SharpAstro.LALR.CC pin also moves 3.1.* ->
   #      4.7.*, which only ever bound CI — a local build swaps it for the sibling ProjectReference, which
   #      is how it sat a major behind unnoticed. ADDITIVE.
-  # 7.8 - wedge forensics: the breadcrumb logged when a fence sticks now carries device-object churn
+  # 7.9 - GPU-WEDGE ROOT CAUSE, plus the forensics that found it. Four parts, one release.
+  #      (1) wedge forensics: the breadcrumb logged when a fence sticks now carries device-object churn
   #      (buffer/image/memory create+free since the frame that hung, counted on VulkanDevice and noted
   #      by VkTexture) and the idle gap since the last clean frame — a field wedge arrived with the
   #      atlas half of the breadcrumb reading all zeros and the actual churn had to be dug out of host
   #      logs. The "fence late" line carries the gap too, so recovered episodes are data points as
   #      well. NEW: VulkanDevice.ChurnCounters/DeviceChurn, VkRenderer.DeviceChurnBreadcrumb. ADDITIVE.
-  # 7.9 - a frame's fence is now reset immediately before the submit that signals it, instead of in
+  #      (2) a frame's fence is now reset immediately before the submit that signals it, instead of in
   #      BeginFrame. Everything in between — atlas flush/grow, texture uploads, the consumer's whole
   #      render callback — used to run with a fence only EndFrame could signal, so any exit that
   #      skipped EndFrame orphaned it permanently and the next BeginFrame waited on a fence nothing
@@ -154,7 +155,7 @@ env:
   #      synchronization is asserted (single-owner submission) rather than locked. NEW:
   #      VulkanContext.AbortFrame/SubmissionLedger/DeviceLost, VkRenderer.AbortFrame/SubmissionLedger.
   #      ADDITIVE.
-  #      ALSO in 7.9 — the actual root cause of the field wedges, caught live by the ledger above:
+  #      (3) the actual root cause of the field wedges, caught live by the ledger above:
   #      Adreno's spec-illegal VK_ERROR_INITIALIZATION_FAILED from vkQueueSubmit is a REAL rejection
   #      (the work never executes; the old tolerance believed it did), so a rejected submit is now a
   #      dropped frame: fence left unmarked and never waited on (a fence with no submission behind it
@@ -163,7 +164,7 @@ env:
   #      runs even in stuck mode (it is on the sacrificial task, and destroying sync objects a slow
   #      frame still references is what poisoned the driver into rejecting), and all drains skip
   #      fences with nothing pending.
-  #      ALSO in 7.9 — the renderer's unconditional diagnostics (wedge forensics, recovery decisions,
+  #      (4) the renderer's unconditional diagnostics (wedge forensics, recovery decisions,
   #      driver anomalies) now log through an injectable ILogger: SdlVulkanLog.Logger (defaults to a
   #      stderr sink so unwired hosts keep today's output — the breadcrumbs are the black box and
   #      must not be droppable by omission), with every message a [LoggerMessage] source-generated
