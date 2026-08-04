@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using Vortice.Vulkan;
 using static Vortice.Vulkan.Vulkan;
@@ -211,9 +212,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         VkSemaphoreCreateInfo ci = new();
         DeviceApi.vkCreateSemaphore(&ci, null, out var replacement).CheckResult();
         _imageAvailableSemaphores[frameIndex] = replacement;
-        Console.Error.WriteLine(
-            $"[VulkanContext] vkQueueSubmit rejected frame {frameIndex} (ErrorInitializationFailed); " +
-            "dropped the frame and replaced its acquire semaphore.");
+        SdlVulkanLog.Logger.SubmitRejectedFrameDropped(frameIndex);
     }
 
     /// <summary>
@@ -226,9 +225,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     {
         if (result != VkResult.ErrorDeviceLost || _deviceLost) return;
         _deviceLost = true;
-        Console.Error.WriteLine(
-            $"[VulkanContext] VK_ERROR_DEVICE_LOST from {where} — the device is gone (GPU reset / TDR). " +
-            "This is a real device loss, not a late fence.");
+        SdlVulkanLog.Logger.DeviceLostReported(where);
     }
 
     /// <summary>
@@ -440,8 +437,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // fence, where the drain always runs.
         if (_fenceWaitStuck && !attemptEvenIfStuck)
         {
-            Console.Error.WriteLine(
-                $"[VulkanContext] GPU already known stuck; skipping drain before {context}.");
+            SdlVulkanLog.Logger.DrainSkippedGpuStuck(context);
             return false;
         }
 
@@ -461,8 +457,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         }
         if (DeviceApi.vkWaitForFences(pending, fences, true, timeoutNs) == VkResult.Timeout)
         {
-            Console.Error.WriteLine(
-                $"[VulkanContext] GPU did not idle within {timeoutNs / 1_000_000}ms during {context}; forcing teardown.");
+            SdlVulkanLog.Logger.DrainTimedOut(timeoutNs / 1_000_000, context);
             return false;
         }
         return true;
@@ -483,7 +478,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     {
         if (_fenceWaitStuck)
         {
-            Console.Error.WriteLine($"[VulkanContext] GPU already known stuck; skipping {context} drain.");
+            SdlVulkanLog.Logger.AtlasDrainSkippedGpuStuck(context);
             return false;
         }
         var fences = stackalloc VkFence[MaxFramesInFlight];
@@ -504,8 +499,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         }
         if (DeviceApi.vkWaitForFences((uint)n, fences, true, DrainTimeoutNs) == VkResult.Timeout)
         {
-            Console.Error.WriteLine(
-                $"[VulkanContext] {context} drain timed out after {DrainTimeoutNs / 1_000_000}ms; proceeding (atlas swap may race a wedged GPU that is about to be recovered).");
+            SdlVulkanLog.Logger.AtlasDrainTimedOut(context, DrainTimeoutNs / 1_000_000);
             return false;
         }
         return true;

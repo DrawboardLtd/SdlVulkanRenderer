@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 #if DEBUG
 using Vortice.Vulkan;
 
@@ -27,7 +28,7 @@ public sealed unsafe partial class VulkanContext
         // Returns null; the caller surfaces a "readback unavailable" result instead of crashing.
         if (_fenceWaitStuck)
         {
-            Console.Error.WriteLine("[VulkanContext] screenshot readback skipped: GPU known stuck.");
+            SdlVulkanLog.Logger.ReadbackSkippedGpuStuck();
             return null;
         }
 
@@ -99,8 +100,7 @@ public sealed unsafe partial class VulkanContext
         DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &si, readbackFence).CheckResult();
         if (DeviceApi.vkWaitForFences(1, &readbackFence, true, DrainTimeoutNs) == VkResult.Timeout)
         {
-            Console.Error.WriteLine(
-                $"[VulkanContext] screenshot readback timed out after {DrainTimeoutNs / 1_000_000}ms; aborting (GPU saturated).");
+            SdlVulkanLog.Logger.ReadbackTimedOut(DrainTimeoutNs / 1_000_000);
             return null;
         }
         DeviceApi.vkDestroyFence(readbackFence);

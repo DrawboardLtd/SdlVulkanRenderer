@@ -163,6 +163,15 @@ env:
   #      runs even in stuck mode (it is on the sacrificial task, and destroying sync objects a slow
   #      frame still references is what poisoned the driver into rejecting), and all drains skip
   #      fences with nothing pending.
+  #      ALSO in 7.9 — the renderer's unconditional diagnostics (wedge forensics, recovery decisions,
+  #      driver anomalies) now log through an injectable ILogger: SdlVulkanLog.Logger (defaults to a
+  #      stderr sink so unwired hosts keep today's output — the breadcrumbs are the black box and
+  #      must not be droppable by omission), with every message a [LoggerMessage] source-generated
+  #      event (compile-time templates, IsEnabled-gated, allocation-free; ids 1xx event loop,
+  #      2xx context, 3xx readback, 4xx validation). Templates reproduce the exact former stderr
+  #      text, so log-grepping tooling is unaffected. RenderDiag stays [Conditional("DEBUG")] raw
+  #      stderr. NEW dependency: Microsoft.Extensions.Logging.Abstractions (interface-only). NEW:
+  #      SdlVulkanLog. ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
