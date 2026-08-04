@@ -135,6 +135,12 @@ env:
   #      targets in DIR.Lib's own docs now resolve. DIR.Lib's SharpAstro.LALR.CC pin also moves 3.1.* ->
   #      4.7.*, which only ever bound CI — a local build swaps it for the sibling ProjectReference, which
   #      is how it sat a major behind unnoticed. ADDITIVE.
+  # 7.8 - wedge forensics: the breadcrumb logged when a fence sticks now carries device-object churn
+  #      (buffer/image/memory create+free since the frame that hung, counted on VulkanDevice and noted
+  #      by VkTexture) and the idle gap since the last clean frame — a field wedge arrived with the
+  #      atlas half of the breadcrumb reading all zeros and the actual churn had to be dug out of host
+  #      logs. The "fence late" line carries the gap too, so recovered episodes are data points as
+  #      well. NEW: VulkanDevice.ChurnCounters/DeviceChurn, VkRenderer.DeviceChurnBreadcrumb. ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
