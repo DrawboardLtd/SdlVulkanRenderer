@@ -219,6 +219,13 @@ env:
   #        batch step passing argsJson previously reported success and then did nothing, because every
   #        field fell back to its default, and for a set-view signal whose fields all mean "leave
   #        unchanged" that is indistinguishable from working. DEBUG-only surface; 12 tests come with it.
+  # 7.14 - BeginThumbnailCapture takes the clear colour instead of assuming white. The capture target was
+  #        cleared to a hard-coded (1,1,1,1) "white page background", which is fine while every page is
+  #        white and wrong the moment a consumer renders a dark one: the ink inverts, the sheet does not,
+  #        so the thumbnail comes back as light text on white paper and reads as a bug in the ink. Now
+  #        explicit, matching BeginOffscreenFrame, which has always taken its clear colour. Breaking for
+  #        direct callers of BeginThumbnailCapture / BeginThumbnailCapturePass -- pass white to keep the
+  #        old behaviour.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
