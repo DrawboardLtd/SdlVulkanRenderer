@@ -209,6 +209,16 @@ env:
   #        the same and fails loudly rather than returning an unwritten buffer as pixels. Also fixes the
   #        swapchain path leaving a stale pending mark when a rejection followed an earlier successful
   #        submit on the same frame index. No API change.
+  # 7.13 - the inspector says what a refused request was missing, and a batch step and a direct call
+  #        accept the same parameters. Brings the inspector request parsing in line with upstream, which
+  #        had moved on: readers now NAME the parameter they wanted instead of surfacing GetProperty's
+  #        "The given key was not present in the dictionary", which reached the caller as the entire
+  #        explanation of a refused step and said nothing about which step, which parameter, or what
+  #        would have worked. `text` accepts either the batch contract's spelling or the `s` the direct
+  #        verb has always sent, and postSignal reads args as an object OR argsJson as a string -- a
+  #        batch step passing argsJson previously reported success and then did nothing, because every
+  #        field fell back to its default, and for a set-view signal whose fields all mean "leave
+  #        unchanged" that is indistinguishable from working. DEBUG-only surface; 12 tests come with it.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
