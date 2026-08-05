@@ -198,6 +198,17 @@ env:
   #        SharpAstro.Fonts 1.8, which loads PDF subset fonts whose cmap a subsetter malformed
   #        (previously the whole font was rejected and every glyph fell back to a system face).
   #        No renderer API change.
+  # 7.12 - offscreen rendering survives a rejected queue submit instead of hanging on it. The dropped
+  #        frame handling added in 7.9 covered the swapchain path only, so on hardware that returns
+  #        VK_ERROR_INITIALIZATION_FAILED from vkQueueSubmit an offscreen frame threw, and threw before
+  #        advancing the frame index — leaving that fence reset with nothing behind it to signal it, so
+  #        the next offscreen frame waited on it forever with no timeout. A TIFF export or thumbnail
+  #        capture of a heavy page could therefore hang outright. Offscreen submits now retry a
+  #        rejection (the frame IS the output, so it is retried rather than dropped) and a submit that
+  #        never took is recorded as such, so no wait can park on an unsignalable fence. Readback does
+  #        the same and fails loudly rather than returning an unwritten buffer as pixels. Also fixes the
+  #        swapchain path leaving a stale pending mark when a rejection followed an earlier successful
+  #        submit on the same frame index. No API change.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
