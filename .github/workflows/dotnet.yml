@@ -230,6 +230,13 @@ env:
   #        fields, so a host can theme the tab strip, and TabBarColors.FromPalette derives that palette
   #        from the UiPalette chrome roles a host may already hold. No renderer code change; the pin
   #        moves so consumers building through this submodule see the new API.
+  # 7.16 - rebuild against DIR.Lib 7.11: BREAKING for anyone constructing a UiPalette. It gains eight
+  #        roles and becomes a sealed record with required members, so default(UiPalette) — every role
+  #        transparent black, painted silently — is now a compile error instead. Five of the new roles
+  #        derive from the role they extend. Note HeaderText moved from required to derived-from-Accent:
+  #        a palette that omits it gets the accent, so a near-white header colour has to stay stated
+  #        rather than falling out of the port. No renderer code change; the pin moves so consumers
+  #        building through this submodule see the new API. See DIR.Lib's MIGRATION.md.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
