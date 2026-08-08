@@ -249,6 +249,13 @@ env:
   #        Directory.Packages.props' scope. Bumping one alone fails restore on NU1605. Also
   #        Microsoft.Extensions.Logging.Abstractions 10.0.0 -> 10.0.10, SourceLink 10.0.300 ->
   #        10.0.301, and a DIR.Lib submodule bump carrying the same kind of refresh.
+  # 7.19 - the Inspector follows SharpAstro.Png 3.4 -> 3.8, and the hashed shader sources are pinned
+  #        `-text` in a new .gitattributes. The bake check compares source hashes against
+  #        Shaders/spirv/sources.sha256, which makes those files' exact bytes part of the build
+  #        contract — with no .gitattributes, core.autocrlf could rewrite them on checkout and SVR0001
+  #        would fire on a tree nobody had edited. Re-baking is the WRONG response to that: the
+  #        recorded hashes are right and the SPIR-V is byte-identical, so committing hashes taken from
+  #        CRLF bytes only moves the warning to Linux. Submodule bump for DIR.Lib's matching refresh.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
