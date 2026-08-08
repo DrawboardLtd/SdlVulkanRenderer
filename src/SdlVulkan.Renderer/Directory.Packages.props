@@ -8,7 +8,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageVersion Include="DIR.Lib" Version="7.9.*" />
+    <!-- Inert in this fork — the csproj reaches DIR.Lib through the submodule ProjectReference, not
+         the feed (see CLAUDE.md). Central Package Management still requires a version for the
+         PackageReference upstream's conditional path uses, so the line stays and is kept in step with
+         whatever the submodule is pinned at, rather than being left to rot at whatever it said when
+         the divergence was introduced. -->
+    <PackageVersion Include="DIR.Lib" Version="7.11.*" />
     <!-- Interface-only (no implementation assemblies): the renderer logs its unconditional
          diagnostics through an injectable ILogger (SdlVulkanLog) with a stderr fallback. -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
