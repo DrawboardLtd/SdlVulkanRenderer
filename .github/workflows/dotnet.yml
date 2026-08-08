@@ -237,6 +237,12 @@ env:
   #        a palette that omits it gets the accent, so a near-white header colour has to stay stated
   #        rather than falling out of the port. No renderer code change; the pin moves so consumers
   #        building through this submodule see the new API. See DIR.Lib's MIGRATION.md.
+  # 7.17 - a space moves the pen. An ink-free glyph keeps its own hmtx advance now (DIR.Lib 7.11
+  #        submodule bump), and VkFontAtlas caches that blank entry rather than discarding it, so a
+  #        glyph with no pixels stops re-entering rasterization on every draw. Text laid out through
+  #        the bitmap atlas gets the font's real space width where it used to get the 'n' glyph's —
+  #        visibly narrower, and correct. Text laid out by glyph id (any shaped run) gets a space at
+  #        all, where it previously ran every word together.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
