@@ -256,6 +256,11 @@ env:
   #        would fire on a tree nobody had edited. Re-baking is the WRONG response to that: the
   #        recorded hashes are right and the SPIR-V is byte-identical, so committing hashes taken from
   #        CRLF bytes only moves the warning to Linux. Submodule bump for DIR.Lib's matching refresh.
+  # 7.20 - rebuild against DIR.Lib 7.12: TextInputRenderer takes a palette, the same shape TabBar got
+  #        in 7.10 — a TextInputColors record whose defaults are what it has always drawn, a
+  #        FromPalette factory, and a settable TextInputRenderer.Colors. Additive: a consumer that
+  #        sets nothing is unchanged. No renderer code change; the pin moves so consumers building
+  #        through this submodule see the new API.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
