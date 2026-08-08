@@ -243,6 +243,12 @@ env:
   #        the bitmap atlas gets the font's real space width where it used to get the 'n' glyph's —
   #        visibly narrower, and correct. Text laid out by glyph id (any shaped run) gets a space at
   #        all, where it previously ran every word together.
+  # 7.18 - dependency refresh, no renderer code change. Vortice.Vulkan 3.2.1 -> 3.2.3 is the only one
+  #        a consumer sees, and it moves in TWO places: the CPM file here and an inline pin in
+  #        SdlVulkan.Renderer.Tests, which sits outside src/SdlVulkan.Renderer/ and so is out of that
+  #        Directory.Packages.props' scope. Bumping one alone fails restore on NU1605. Also
+  #        Microsoft.Extensions.Logging.Abstractions 10.0.0 -> 10.0.10, SourceLink 10.0.300 ->
+  #        10.0.301, and a DIR.Lib submodule bump carrying the same kind of refresh.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
