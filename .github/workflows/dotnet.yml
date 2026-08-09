@@ -261,6 +261,17 @@ env:
   #        FromPalette factory, and a settable TextInputRenderer.Colors. Additive: a consumer that
   #        sets nothing is unchanged. No renderer code change; the pin moves so consumers building
   #        through this submodule see the new API.
+  # 7.21 - rebuild against DIR.Lib 7.13, which follows SharpAstro.Fonts 1.11. No renderer code
+  #        change, no API change — but GLYPH SELECTION changes, so text can draw differently.
+  #        An embedded PDF subset whose only cmap subtable is Mac Roman (1,0) now selects through
+  #        it rather than falling back to treating the char code as a glyph index. macOS Quartz
+  #        writes exactly that shape, and the guess failed two ways at once: inside a large subset
+  #        it picked an unrelated glyph (Korean body text drew as correctly-shaped nonsense in
+  #        codepoint-sorted order), and in a 2-20 glyph Latin subset it indexed off the end and
+  #        drew nothing (commas, list markers and page numbers vanished). Also carried in from the
+  #        skipped 1.10 pin: three compounding TrueType hint-interpreter fixes and RTL mark
+  #        attachment. Consumers rasterizing text through an unhinted path (e.g. MTSDF atlases)
+  #        see no baseline movement from the hinting half.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
