@@ -272,6 +272,15 @@ env:
   #        skipped 1.10 pin: three compounding TrueType hint-interpreter fixes and RTL mark
   #        attachment. Consumers rasterizing text through an unhinted path (e.g. MTSDF atlases)
   #        see no baseline movement from the hinting half.
+  # 7.22 - rebuild against DIR.Lib 7.14: a glyph the SDF atlas can never rasterize is given up on
+  #        after three attempts and recorded blank, instead of being retried forever. No renderer
+  #        code change. What changes for a consumer is the failure MODE of a broken font: previously
+  #        the atlas re-claimed such a glyph every frame and IsDirty never cleared, so
+  #        VkRenderer.FontAtlasDirty stayed true for the session — an event loop redrew forever and
+  #        an offscreen capture waited out its whole frame budget, reporting a pixel difference with
+  #        nothing about fonts anywhere in it. Now the glyph draws as nothing, the atlas reports
+  #        clean, and one line per font names the glyph, the attempts, and whether the font was
+  #        registered when we gave up. Also brings ManagedFontRasterizer.IsFontRegistered.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
