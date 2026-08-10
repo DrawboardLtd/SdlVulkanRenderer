@@ -13,7 +13,7 @@
          PackageReference upstream's conditional path uses, so the line stays and is kept in step with
          whatever the submodule is pinned at, rather than being left to rot at whatever it said when
          the divergence was introduced. -->
-    <PackageVersion Include="DIR.Lib" Version="7.11.*" />
+    <PackageVersion Include="DIR.Lib" Version="7.15.*" />
     <!-- Interface-only (no implementation assemblies): the renderer logs its unconditional
          diagnostics through an injectable ILogger (SdlVulkanLog) with a stderr fallback. -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
