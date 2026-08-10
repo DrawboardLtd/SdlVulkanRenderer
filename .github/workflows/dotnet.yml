@@ -329,6 +329,11 @@ env:
   #        instead of being borrowed from the 'n' glyph, and in DejaVu every measured space had been
   #        1.99x too wide. Text laid out with space padding is therefore narrower since 7.20; U+2007
   #        FIGURE SPACE is the pad that holds a column, being digit-width by definition.
+  # 7.24 - Rebuild on DIR.Lib 7.16, whose TabBar can draw a "+" after the last tab and report its click
+  #        (ShowNewTabButton / NewTabActive / NewTabHovered / HitNewTabButton). Additive there and here:
+  #        nothing in this repo consumes it, and a consumer that sets nothing is unchanged. Bumped so the
+  #        viewer can pin a renderer whose DIR.Lib carries the button, rather than reaching around the
+  #        chain for it.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
