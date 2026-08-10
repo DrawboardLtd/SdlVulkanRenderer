@@ -281,6 +281,54 @@ env:
   #        nothing about fonts anywhere in it. Now the glyph draws as nothing, the atlas reports
   #        clean, and one line per font names the glyph, the attempts, and whether the font was
   #        registered when we gave up. Also brings ManagedFontRasterizer.IsFontRegistered.
+  # 7.23 - the fallout of one device-loss investigation, plus a rebuild against DIR.Lib 7.15.
+  #        Five renderer changes had landed on main since 7.22 WITHOUT a version, so they were
+  #        publishing as 7.22 build-counter republishes; this bump is what gives them one. Four of
+  #        the five are things the validation layer had been unable to tell us, because on a host
+  #        with no Khronos layer installed it was never actually running (see below).
+  #        VK_ERROR_DEVICE_LOST is now TERMINAL rather than entering mid-frame recovery. Recovery
+  #        rebuilds sync and the swapchain and continues, which cannot work once the device and every
+  #        object it owns are gone: each later call returns DEVICE_LOST again, so the rebuild re-failed
+  #        on the next submit. Three attempts burned inside 34ms, and the right outcome (hand the
+  #        session to a successor) was reached only because the recover-streak detector happened to
+  #        trip. That detector logs a "recovery storm" and asks the app to shed load, which reads as a
+  #        workload problem and points diagnosis away from a dead device. Event 110 "Recovering
+  #        swapchain" is now logged only for errors that path can actually recover; new event 115 names
+  #        device loss for what it is.
+  #        Each swapchain image gets its OWN present-wait semaphore. render-finished was allocated per
+  #        frame in flight and indexed by frame slot, but vkQueuePresentKHR's wait completes only when
+  #        the presentation engine is done with the IMAGE, and image count is not bounded by
+  #        MaxFramesInFlight, so with more images than frames a new submit could re-signal a semaphore
+  #        an earlier present was still waiting on (VUID-vkQueueSubmit-pSignalSemaphores-00067). Its
+  #        lifetime moves onto the swapchain so a resize that changes the image count rebuilds it.
+  #        Latent while presentation is regular, which is why it surfaced over Remote Desktop.
+  #        ONE shared subpass-dependency pair, in VulkanDevice.FillSubpassDependencies, used by all six
+  #        creation sites. Every pass had written its own: render-pass compatibility covers
+  #        dependencies, so pre-baked pipelines drawing in a pass with a different dependency count
+  #        were rejected (VUID-vkCmdDraw-renderPass-02684, "2 != 1"). And every external dependency
+  #        used srcAccessMask = 0, which orders execution but creates no memory dependency against the
+  #        previous frame's storeOp write, so the layout transition raced it, a WRITE_AFTER_WRITE
+  #        hazard on every alternating pair of frames. srcAccessMask is now ColorAttachmentWrite.
+  #        Diagnostics that were lying: validationReport now reports layerAvailable and active, not
+  #        just the DEBUG + SDLVK_VALIDATION gate. On a host with no Khronos layer installed it read
+  #        enabled:true with zero messages and zero hazards, indistinguishable from a clean run, and
+  #        was read as one during the very investigation above. A zero message count is evidence only
+  #        when active is true. The sync-hazard counter matched only the retired "SYNC-HAZARD" token
+  #        and so reported zero while the ring buffer plainly held WRITE_AFTER_WRITE messages.
+  #        And a DiscreteGpu PREFERENCE (never a requirement, so integrated-only hosts are
+  #        unaffected): both pickers took the first device meeting their requirements, so a machine
+  #        with both cards ran on whatever the loader enumerated first, possibly integrated graphics on
+  #        shared memory. New event 501 records device name, type, driver version, API version, queue
+  #        family and how many devices were enumerated. Nothing had logged the selection, so no GPU
+  #        report could be attributed to hardware from our own logs.
+  #        Then the rebuild: DIR.Lib 7.15 makes TextFit.ShrinkToWidth return a size it actually
+  #        measured, so a run fitted with TextTrim.Shrink stops drawing a fraction of a pixel past its
+  #        rect. Shrink is opt-in and the default is End, so a consumer that never asks for it renders
+  #        byte-identically. That release also records, late, a behaviour change that shipped
+  #        unannounced in DIR.Lib 7.12 (this repo's 7.20): a whitespace advance comes from the font
+  #        instead of being borrowed from the 'n' glyph, and in DejaVu every measured space had been
+  #        1.99x too wide. Text laid out with space padding is therefore narrower since 7.20; U+2007
+  #        FIGURE SPACE is the pad that holds a column, being digit-width by definition.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
