@@ -334,6 +334,13 @@ env:
   #        nothing in this repo consumes it, and a consumer that sets nothing is unchanged. Bumped so the
   #        viewer can pin a renderer whose DIR.Lib carries the button, rather than reaching around the
   #        chain for it.
+  # 7.25 - Additive, two things. SdlVulkanWindow.SetIcon(RgbaImage) sets the window's icon: title bar,
+  #        taskbar or dock button, alt-tab entry (synced from upstream SdlVulkan.Renderer 7.12). Not a
+  #        Windows convenience, since a Win32 icon resource in the exe covers Windows and nothing else:
+  #        X11 and Wayland read the icon off the window. SDL copies the pixels, so the caller's array is
+  #        free on return. And DIR.Lib 7.17, whose TabBar takes a Pointer position and hovers itself from
+  #        it: the tab under the pointer lifts, and its close mark plates. Both additive; a consumer that
+  #        calls neither is unchanged. The viewer consumes both.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
