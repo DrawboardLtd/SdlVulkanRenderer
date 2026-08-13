@@ -341,6 +341,17 @@ env:
   #        free on return. And DIR.Lib 7.17, whose TabBar takes a Pointer position and hovers itself from
   #        it: the tab under the pointer lifts, and its close mark plates. Both additive; a consumer that
   #        calls neither is unchanged. The viewer consumes both.
+  # 7.26 - Four rounds, three of which shipped under 7.25 without saying so; this entry covers them.
+  #        The inspector synthesizes double and triple clicks (a `clicks` count on click / clickLabel,
+  #        emitted as the full run 1..N, the way SDL delivers one). CursorKind.ToSystemCursor maps
+  #        DIR.Lib's cursor vocabulary to SDL's, beside the existing scancode and keymod mappings — so
+  #        a widget states a cursor on the region it drew and the host does not keep its own table.
+  #        The inspector's `scroll` now takes modifiers too, like click and drag: a wheel tick usually
+  #        means something else with one held (Ctrl zooms, Shift scrolls sideways), and an app reading
+  #        that off the global keyboard state cannot be driven there by any synthesized input.
+  #        And DIR.Lib to 7.24: cursor as a property of a clickable region, TextInputColors as a
+  #        per-call parameter, caret icons, a width sample for a readout that must not jitter, and
+  #        padding stated per axis. All additive.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
