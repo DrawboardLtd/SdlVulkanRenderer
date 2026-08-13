@@ -363,6 +363,13 @@ env:
   #        whole list, against a row-at-a-time fill that here costs a quad and a push-constant update
   #        per scanline. That was the last primitive the viewer's shared chrome had to reach past the
   #        abstraction for.
+  # 7.29 - Follows DIR.Lib to 7.20, where clips nest: a push inside a push draws in the intersection and
+  #        a pop restores the enclosing clip. The base owns the stack now, so VkRenderer implements
+  #        ApplyClip/ClearClip -- one absolute, already-intersected region, which is what
+  #        vkCmdSetScissor takes anyway -- instead of overriding PushClip/PopClip. BeginFrame and
+  #        BeginOffscreenFrame drop the stack: a scissor lives on the command buffer, so a fresh one has
+  #        already discarded the region, and a widget that threw between its push and its pop must not
+  #        leave every later frame clipped to a rect nobody can name.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
