@@ -352,6 +352,11 @@ env:
   #        And DIR.Lib to 7.24: cursor as a property of a clickable region, TextInputColors as a
   #        per-call parameter, caret icons, a width sample for a readout that must not jitter, and
   #        padding stated per axis. All additive.
+  # 7.27 - Follows DIR.Lib to 7.18: RgbaImageRenderer honours PushClip/PopClip, and PixelWidgetBase
+  #        gains PushClip(x, y, w, h) / PopClip so a widget can state a clip in the same x/y/w/h terms
+  #        as everything else it draws. No renderer change -- VkRenderer already overrode the pair onto
+  #        the Vulkan scissor -- but it is what lets a widget stop calling SetScissor by name, which is
+  #        the last renderer method the shared chrome could not express through the base class.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
