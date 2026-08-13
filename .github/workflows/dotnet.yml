@@ -357,13 +357,12 @@ env:
   #        as everything else it draws. No renderer change -- VkRenderer already overrode the pair onto
   #        the Vulkan scissor -- but it is what lets a widget stop calling SetScissor by name, which is
   #        the last renderer method the shared chrome could not express through the base class.
-  # 7.28 - Follows DIR.Lib to 7.19: Renderer.DrawTriangles, a triangle list with a scanline default in
-  #        terms of FillRectangle. VkRenderer already had a method of that name and shape, so the base's
-  #        arrival turned it into a HIDE -- which compiles, draws identically through a VkRenderer
-  #        reference, and quietly takes the software path the moment a caller holds the renderer as a
-  #        Renderer<TSurface>. It OVERRIDES now, so a widget can draw an arrowhead without naming this
-  #        renderer and still get the FlatPipeline. That was the last primitive the shared chrome had to
-  #        reach past the abstraction for.
+  # 7.28 - Follows DIR.Lib to 7.19: Renderer.DrawTriangles, a triangle list with a scanline default
+  #        written in terms of FillRectangle, so every backend has one. VkRenderer overrides it, so a
+  #        caller holding this as a Renderer<TSurface> keeps the FlatPipeline: one draw call for the
+  #        whole list, against a row-at-a-time fill that here costs a quad and a push-constant update
+  #        per scanline. That was the last primitive the viewer's shared chrome had to reach past the
+  #        abstraction for.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
