@@ -390,6 +390,29 @@ env:
   #        an anonymous rect. "Which box is focused" is the question every text-input bug starts from.
   #        DIR.Lib 7.22 makes TextInputRenderer.Render binary-breaking (it returns the caret rect and
   #        takes a fallback resolver), so this is a required rebuild rather than bookkeeping.
+  # 7.32 - Follows DIR.Lib to 7.23: which field in the window has the keyboard, and where its caret was
+  #        drawn, move onto the shared WindowUiSettings. Held per widget, a host had to know WHICH widget
+  #        painted the focused field in order to ask the right one -- a question with no stable answer,
+  #        since the field holding the keyboard moves between them.
+  # 7.33 - Follows DIR.Lib to 7.24: TabBar.Font / .Pad / .Border become public, joining .Height, for a
+  #        host that has to draw a tab somewhere the bar does not.
+  #        A LATER BUILD of the same 7.33 also moved the submodule to DIR.Lib 7.25 (frame-scoped regions
+  #        + wrapping result lists) without bumping Major.Minor, so two 7.33.<run> builds carry different
+  #        DIR.Lib content. Bump the version with the pin, not only when this repo's own source changes:
+  #        the pin IS what this package ships.
+  # 8.0  - Follows DIR.Lib to 8.0, which is BREAKING (see its MIGRATION.md). Nothing in this repo's own
+  #        source changes, and nothing here uses the type -- but the package re-exports DIR.Lib to its
+  #        consumers, so a consumer that draws a tab strip has to port. TabBar becomes
+  #        TabBar<TSurface> : PixelWidgetBase<TSurface>: it takes its Renderer at construction and reads
+  #        the window's font, fallback chain and DPI from the shared WindowUiSettings, so TabBar.Scale
+  #        and the font/fallback constructor arguments are gone and Render drops its renderer parameter.
+  #        The bar now registers each tab, each close button and the + as it paints them, so a press
+  #        resolves against the strip that is on screen -- and, through 7.25's frame stamp, against no
+  #        strip at all on a frame the host did not draw one.
+  #        Additive in the same release: ClickableRegionTracker.Regions / PixelWidgetBase.RegisteredRegions
+  #        (read back your own regions without the per-call copy) and PixelWidgetBase.DrewThisFrame, for
+  #        the input a host resolves by geometry rather than by region and which therefore cannot decline
+  #        a stale frame by itself.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
