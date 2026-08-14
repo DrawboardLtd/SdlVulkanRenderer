@@ -370,6 +370,10 @@ env:
   #        BeginOffscreenFrame drop the stack: a scissor lives on the command buffer, so a fresh one has
   #        already discarded the region, and a widget that threw between its push and its pop must not
   #        leave every later frame clipped to a rect nobody can name.
+  # 7.30 - Follows DIR.Lib to 7.21: Layout.Builder.TextInput(state, fontSize) declares an editable field,
+  #        and the painter registers its TextInputHit + I-beam, so click-to-focus, blur-on-outside and
+  #        Tab order follow from a registration a consumer cannot forget to make. Adds TextInputFocus and
+  #        TextInputInteraction. Additive -- no API this backend implements changed.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
