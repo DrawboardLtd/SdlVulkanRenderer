@@ -374,6 +374,22 @@ env:
   #        and the painter registers its TextInputHit + I-beam, so click-to-focus, blur-on-outside and
   #        Tab order follow from a registration a consumer cannot forget to make. Adds TextInputFocus and
   #        TextInputInteraction. Additive -- no API this backend implements changed.
+  # 7.31 - Follows DIR.Lib to 7.22, and surfaces the input-method events SDL was already delivering.
+  #        SdlWindowView.OnTextEditing carries the in-progress composition (its text, its caret and its
+  #        selection length); this backend had a TextInput case and no TextEditing case at all, so the
+  #        preedit was read off the wire and dropped. With a CJK input method every keystroke before the
+  #        commit arrives on that event and nowhere else, which is why an app handling only TextInput can
+  #        accept Latin and nothing else and shows nothing on screen while the user types. An empty text
+  #        is the normal end-of-composition signal and is passed through rather than skipped, since the
+  #        app has to be told the preedit is gone.
+  #        SdlVulkanWindow.SetTextInputArea wraps SDL_SetTextInputArea. SDL does not track the app's
+  #        caret, so this is the only way the platform can learn where text is being typed; without it an
+  #        input method has nothing to anchor to and puts its candidate window over the text.
+  #        DebugInspector's layout dump now names a text field: what it holds, whether it has the
+  #        keyboard, and its placeholder -- the last so an EMPTY field is still identifiable rather than
+  #        an anonymous rect. "Which box is focused" is the question every text-input bug starts from.
+  #        DIR.Lib 7.22 makes TextInputRenderer.Render binary-breaking (it returns the caret rect and
+  #        takes a fallback resolver), so this is a required rebuild rather than bookkeeping.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
