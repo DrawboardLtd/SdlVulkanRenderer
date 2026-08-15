@@ -413,6 +413,14 @@ env:
   #        (read back your own regions without the per-call copy) and PixelWidgetBase.DrewThisFrame, for
   #        the input a host resolves by geometry rather than by region and which therefore cannot decline
   #        a stale frame by itself.
+  # 8.1  - Follows DIR.Lib to 8.1, which is additive. Nothing in this repo's own source changes, but the
+  #        package re-exports DIR.Lib, so a consumer gains it by taking this version.
+  #        PixelWidgetBase.Pointer tells a widget where the pointer is; Layout.Node.BgHover(colour) paints
+  #        a second fill while it is inside a node's rect, and RenderDropdownMenu highlights the row under
+  #        it (that one previously tracked the keyboard alone, so a dropdown stayed dead under the mouse).
+  #        The fill resolves against the rect the engine arranged, so what lights up and what the pointer
+  #        is over cannot drift apart -- which is what a consumer computing the rect a second time could
+  #        never guarantee. Inert unless a host sets Pointer, and a host that does must repaint on motion.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
