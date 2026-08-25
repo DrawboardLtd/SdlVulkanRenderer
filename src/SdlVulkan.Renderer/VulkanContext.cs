@@ -42,6 +42,37 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // which case we force the teardown rather than block the UI thread on an unbounded wait.
     private const ulong DrainTimeoutNs = 1_000_000_000UL;
 
+    // Set when the event loop has given up waiting for a sacrificial recovery task and declared the
+    // device abandoned. Two independent bounded waits meet here, and each is correct alone: the loop
+    // stops waiting after GpuWedgeRecoveryDeadlineMs, and TryDrainDevice below stops waiting after
+    // DrainTimeoutNs and then FORCES its teardown. So the abandoned task is not, as the loop's comment
+    // assumed, a permanently blocked thread -- it is guaranteed to wake up and carry on rebuilding,
+    // into a process that has already torn its device down. Observed as an access violation inside
+    // vkGetPhysicalDeviceSurfaceCapabilitiesKHR, reached from CreateSwapchain, on a surface Dispose
+    // had destroyed (the handle is not nulled, so it is dangling rather than Null and no null check
+    // would have caught it).
+    //
+    // Volatile because it is written by the render thread and read by the recovery task.
+    private volatile bool _abandoned;
+
+    /// <summary>
+    /// Whether the event loop has abandoned an in-flight recovery on this context. Once true, the
+    /// context is terminal: recovery stops at its next checkpoint and <see cref="Dispose"/> leaks
+    /// rather than frees.
+    /// </summary>
+    public bool IsAbandoned => _abandoned;
+
+    /// <summary>
+    /// Declare this context abandoned, after the event loop has stopped waiting for a recovery task
+    /// it can no longer account for.
+    /// </summary>
+    /// <remarks>
+    /// One-way and idempotent. Call this BEFORE tearing anything down: the abandoned task may still
+    /// be running, so this is the only thing that stops it touching handles the teardown is about to
+    /// invalidate.
+    /// </remarks>
+    public void Abandon() => _abandoned = true;
+
     // Per-window fence-stuck state. Wrapped in a property so the one setter is the single writer
     // that also mirrors the state onto the shared device (_dev.IsGpuStuck) — that way device-level
     // teardown and cross-component render-thread drains can consult one known-good signal, and no
@@ -398,6 +429,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // and on a truly dead fence it degrades to today's behaviour after the cap.
         TryDrainDevice(DrainTimeoutNs, "GPU-error recovery", attemptEvenIfStuck: true);
 
+        // The drain is where this method spends its time, so it is where the loop's deadline is
+        // realistically blown. If that happened, stop: everything below either destroys or rebuilds
+        // objects the host is now entitled to free.
+        if (_abandoned) return;
+
         // Present-wait semaphores are deliberately absent here: they belong to the swapchain, and the
         // CleanupSwapchain/CreateSwapchain pair at the end of this method replaces them. Destroying
         // them here as well would double-free them.
@@ -420,6 +456,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
         Array.Clear(_submitPending);   // fresh fences are signaled but have nothing behind them
         // This ran on the sacrificial task's thread; let the render thread re-seat ownership.
         ReseatFrameThread();
+
+        // Checked again rather than only above, because the sync-object teardown between the two
+        // checkpoints can itself block on a wedged driver -- which is the whole reason this runs on
+        // a sacrificial task. CreateSwapchain is the observed crash site.
+        if (_abandoned) return;
 
         CleanupSwapchain();
         CreateSwapchain(width, height);
@@ -483,7 +524,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// render thread the way the old unbounded <c>vkDeviceWaitIdle</c> here could. On a healthy GPU it
     /// is equivalent (the prior frame's fence signals promptly), so the Adreno protection is preserved.
     /// </summary>
-    internal bool TryWaitPriorFramesIdle(string context)
+    /// <remarks>
+    /// Public because a consumer can own GPU images too -- a pipeline that destroys a sampled
+    /// texture faces exactly the hazard this exists for, and without this its only options were an
+    /// unbounded vkDeviceWaitIdle or nothing.
+    /// </remarks>
+    public bool TryWaitPriorFramesIdle(string context)
     {
         if (_fenceWaitStuck)
         {
@@ -549,6 +595,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // capture's copy rode this fence index, its GPU work is complete — snapshot it now without
         // any extra GPU wait. Done before the reset below so the fence is still in its signaled state.
         ConsumeThumbnailReadback();
+        // Same contract for the DEBUG-only inspector screenshot capture (a partial method, so the
+        // call compiles away in Release along with its implementation file).
+        ConsumePresentCaptureReadback();
 
         var result = DeviceApi.vkAcquireNextImageKHR(Swapchain, ulong.MaxValue,
             _imageAvailableSemaphores[_currentFrame], VkFence.Null, out _currentImageIndex);
@@ -627,6 +676,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
         {
             DeviceApi.vkCmdEndRenderPass(cmd);
             _renderPassBegun = false;
+            // A requested inspector screenshot is recorded HERE — after the render pass left the image
+            // in PresentSrcKHR, before the present below releases it — the only window in which this
+            // process owns the acquired image. It used to run post-present against an image the
+            // presentation engine already owned, which the validation layer flags on every screenshot
+            // and which entitles a driver to park the queue (the stuck-fence wedge shape).
+            RecordPresentCapture(cmd);
         }
         DeviceApi.vkEndCommandBuffer(cmd);
 
@@ -720,6 +775,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
             // for — would snapshot a readback buffer the GPU never wrote.
             if (_thumbPending && _thumbPendingIndex == _currentFrame)
                 _thumbPending = false;
+            CancelPresentCaptureOnRejectedSubmit();
             _frameBegun = false;
             _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
             return;
@@ -767,6 +823,14 @@ public sealed unsafe partial class VulkanContext : IDisposable
         SubmitFrame(_commandBuffers[_currentFrame], endRenderPass: _renderPassBegun);
     }
 
+    // DEBUG-only inspector screenshot capture, implemented in VulkanContext.SwapchainReadback.cs
+    // (a file wrapped in #if DEBUG). Partial methods with no implementation have their calls removed
+    // by the compiler, so a Release build carries neither the code nor the call sites.
+    partial void RecordPresentCapture(VkCommandBuffer cmd);
+    partial void CancelPresentCaptureOnRejectedSubmit();
+    partial void ConsumePresentCaptureReadback();
+    partial void CleanupPresentCapture();
+
     [Conditional("DEBUG")]
     private static void DebugLogBufferFull(int vertexOffset, int requestLength)
     {
@@ -797,6 +861,18 @@ public sealed unsafe partial class VulkanContext : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        // An abandoned recovery task is still running on a thread nobody can join -- that is what
+        // being abandoned means. Freeing the device, surface and instance out from under it is what
+        // turns a benign leak into an access violation, so leak them instead and let process exit
+        // reclaim them. The loop already chose to leak the THREAD; leaking what that thread can still
+        // reach is the same decision carried through, and it is only reachable while the app is on
+        // its way down.
+        if (_abandoned)
+        {
+            SdlVulkanLog.Logger.AbandonedContextLeaked();
+            return;
+        }
+
         // Drain before teardown so we don't destroy resources the GPU is still reading — but skip
         // it when the GPU is already known stuck (an unbounded vkDeviceWaitIdle on a wedged device
         // would hang the quit, the same "Not responding" failure mode the recovery path avoids).
@@ -806,8 +882,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
         }
 
         CleanupSwapchain();
+        CleanupLoadRenderPass();
         if (_isOffscreen) CleanupOffscreenTarget();
         CleanupThumbnailTarget();
+        CleanupCachedLayerTargets();
+        CleanupPresentCapture();
 
         for (var i = 0; i < MaxFramesInFlight; i++)
         {
@@ -1001,6 +1080,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
                 new VkImageSubresourceRange(VkImageAspectFlags.Color, 0, 1, 0, 1));
             DeviceApi.vkCreateImageView(&msaaViewCI, null, out _msaaImageView).CheckResult();
         }
+
+        // A swapchain image that has just been created holds nothing, and a resized one holds the
+        // wrong size, so no frame may be preserved until each has been painted once.
+        CleanupLoadRenderPass();
+        _loadRenderPass = CreateLoadRenderPass(SwapchainFormat);
+        ResetDamageState((int)imgCount);
 
         // Create framebuffers
         _framebuffers = new VkFramebuffer[imgCount];

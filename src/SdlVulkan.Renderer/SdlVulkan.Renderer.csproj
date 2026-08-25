@@ -41,6 +41,32 @@
     <ProjectReference Include="../../DeviceIndependentRenderingLibrary/src/DIR.Lib/DIR.Lib.csproj" />
   </ItemGroup>
 
+  <!--
+    SharpAstro.AppShell supplies IActivatableWindow, which SdlVulkanWindow implements so that a
+    single-instance hand-off can activate a window without each consuming application writing its
+    own adapter (two of them did, and both got the restore rule wrong).
+
+    Upstream's conditional-sibling shape is kept VERBATIM here, unlike the DIR.Lib block above,
+    because AppShell is not forked: the probe below misses in this layout (three up from here is
+    the consumer's lib/, not a sibling tree) and the PackageReference it falls through to resolves
+    the real published package, so the fallback is correct rather than a different codebase. That
+    makes it one less line for a sync round to re-apply by hand.
+
+    Referenced on EVERY TFM, android included. Its Windows foreground-grant is already guarded by
+    OperatingSystem.IsWindows(), so what ships to android is an unreachable P/Invoke rather than a
+    broken one; activation is a real concern there too (launch modes, moveTaskToFront), so excluding
+    the android leg would be asserting the opposite.
+  -->
+  <PropertyGroup>
+    <UseLocalAppShell Condition="'$(UseLocalAppShell)' == '' AND Exists('..\..\..\AppShell\src\SharpAstro.AppShell\SharpAstro.AppShell.csproj')">true</UseLocalAppShell>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(UseLocalAppShell)' == 'true'">
+    <ProjectReference Include="..\..\..\AppShell\src\SharpAstro.AppShell\SharpAstro.AppShell.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalAppShell)' != 'true'">
+    <PackageReference Include="SharpAstro.AppShell" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- SDL3-CS publishes preview versions only, so NuGet's stable-package-with-prerelease-dependency
          warning (NU5104) fires on every pack; suppressed for this reference alone. -->

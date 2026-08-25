@@ -257,7 +257,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         // Record pending texture uploads before the render pass (transfers can't happen inside)
         OnPreRenderPass?.Invoke(_currentCmd);
 
-        Surface.BeginRenderPass(_currentCmd, clearColor.Red / 255f, clearColor.Green / 255f, clearColor.Blue / 255f, clearColor.Alpha / 255f);
+        // Preserves the previous contents and confines painting to the accumulated damage when the
+        // caller supplied any, otherwise clears and paints in full. Sets _damageRegion so every clip
+        // below is bounded by it.
+        Surface.BeginFrameRenderPass(_currentCmd, clearColor.Red / 255f, clearColor.Green / 255f, clearColor.Blue / 255f, clearColor.Alpha / 255f);
+        var region = Surface.LastFrameRegion;
+        _damageRegion = (region.offset.x, region.offset.y, (int)region.extent.width, (int)region.extent.height);
         _lastBoundPipeline = VkPipeline.Null; // fresh command buffer — nothing is bound
         return true;
     }
@@ -271,6 +276,75 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     }
 
     // ---- Live-device thumbnail capture (see VulkanContext.ThumbnailCapture.cs) ----
+
+    // ---- Cached layer (see VulkanContext.CachedLayer.cs) ----
+
+    /// <summary>
+    /// Allocate the cached-layer targets, one per frame in flight, at a fixed capacity. Size it to
+    /// the largest region you will cache; a consumer that wants panning to cost nothing should add a
+    /// margin so a pan inside it is a blit rather than a re-render.
+    /// </summary>
+    public bool EnsureCachedLayerTargets(uint maxW, uint maxH)
+        => Surface.EnsureCachedLayerTargets(maxW, maxH);
+
+    /// <summary>Drop the targets (drains first) so they can be rebuilt at a new capacity on resize.</summary>
+    public void ReleaseCachedLayerTargets() => Surface.ReleaseCachedLayerTargets();
+
+    /// <summary>True once the targets exist.</summary>
+    public bool CachedLayerTargetReady => Surface.CachedLayerTargetReady;
+
+    /// <summary>
+    /// The slot this frame must render into and sample from. It alternates with the frame-in-flight
+    /// index, which is what keeps a frame from writing a target another may still be reading.
+    /// </summary>
+    public int CachedLayerSlot => Surface.CachedLayerSlot;
+
+    /// <summary>How many slots exist; a content change has to dirty them all.</summary>
+    public int CachedLayerSlotCount => Surface.CachedLayerSlotCount;
+
+    /// <summary>Whether this slot has ever been rendered, and so is legal to sample.</summary>
+    public bool IsCachedLayerSlotRendered(int slot) => Surface.IsCachedLayerSlotRendered(slot);
+
+    /// <summary>
+    /// The slot's descriptor set, for <see cref="DrawTexture"/> / <see cref="DrawTextureRegion"/>.
+    /// Pass UVs derived from the sub-rect actually rendered, since that is usually smaller than the
+    /// allocated capacity.
+    /// </summary>
+    public VkDescriptorSet CachedLayerDescriptorSet(int slot) => Surface.CachedLayerDescriptorSet(slot);
+
+    /// <summary>
+    /// Opens the cached-layer render pass on this frame's command buffer and redirects the projection
+    /// so draws land at cached-layer scale. MUST be called from the OnPreRenderPass hook (before the
+    /// main render pass) and bracketed by <see cref="EndCachedLayer"/>.
+    /// </summary>
+    public bool BeginCachedLayer(uint w, uint h, DIR.Lib.RGBAColor32 clearColor)
+    {
+        if (_currentCmd == VkCommandBuffer.Null || _inCachedLayer) return false;
+        if (!Surface.BeginCachedLayerPass(_currentCmd, w, h, clearColor)) return false;
+
+        _savedLayerWidth = _width;
+        _savedLayerHeight = _height;
+        _width = w;
+        _height = h;
+        UpdateProjection();
+        _inCachedLayer = true;
+        return true;
+    }
+
+    /// <summary>Closes the pass opened by <see cref="BeginCachedLayer"/> and restores the projection.</summary>
+    public void EndCachedLayer()
+    {
+        if (!_inCachedLayer) return;
+        Surface.EndCachedLayerPass(_currentCmd);
+        _width = _savedLayerWidth;
+        _height = _savedLayerHeight;
+        UpdateProjection();
+        _inCachedLayer = false;
+    }
+
+    private bool _inCachedLayer;
+    private uint _savedLayerWidth;
+    private uint _savedLayerHeight;
 
     /// <summary>
     /// Allocate the live-device thumbnail capture target once, up front (never mid steady-state).
@@ -424,6 +498,12 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         Surface.RecoverFromGpuError(_width, _height);
         UpdateProjection();
     }
+
+    /// <summary>
+    /// Declare this renderer's device abandoned, after the event loop has stopped waiting for a
+    /// recovery task it can no longer account for. See <see cref="VulkanContext.Abandon"/>.
+    /// </summary>
+    public void AbandonDevice() => Surface.Abandon();
 
     /// <summary>
     /// Resolve a frame that was begun but will not reach <see cref="EndFrame"/>, so its fence and
@@ -887,14 +967,41 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// </summary>
     public void ResetScissor()
     {
-        SetScissor(0, 0, _width, _height);
+        // The damaged region, not the whole surface: it is the OUTERMOST clip for the frame, so
+        // popping every clip returns here rather than opening painting back up to the full window.
+        SetScissor(_damageRegion.X, _damageRegion.Y, (uint)_damageRegion.W, (uint)_damageRegion.H);
     }
+
+    // The region this frame is allowed to paint, in surface pixels. The full surface for an
+    // ordinary frame; the accumulated damage for a partial one. Every clip intersects with it, so a
+    // widget that clips to its own pane cannot paint outside the damage even though it knows
+    // nothing about it.
+    private (int X, int Y, int W, int H) _damageRegion;
+
+    /// <summary>Declares a damaged rect for the frame about to be drawn, in surface pixels.</summary>
+    public void AddFrameDamage(float x, float y, float width, float height)
+        => Surface.AddFrameDamage(x, y, width, height);
+
+    /// <summary>Declares that the whole surface must be repainted. The safe answer.</summary>
+    public void MarkFullFrameDamage() => Surface.MarkFullFrameDamage();
+
+    /// <summary>Whether the frame just begun is confined to a damaged region.</summary>
+    public bool LastFrameWasPartial => Surface.LastFrameWasPartial;
 
     // DIR.Lib's clip stack → Vulkan scissor. The base owns the nesting and hands down one absolute
     // region already intersected with its parents, which is exactly what vkCmdSetScissor takes; the
     // rect arrives normalized too, so there is nothing to order here.
     protected override void ApplyClip(in DIR.Lib.RectInt rect)
-        => SetScissor(rect.UpperLeft.X, rect.UpperLeft.Y, (uint)rect.Width, (uint)rect.Height);
+    {
+        // Intersected with the frame's damaged region. DIR.Lib has already intersected this rect
+        // with its parent clips, but it knows nothing about damage -- so a widget clipping to its own
+        // pane would otherwise paint the whole pane on a frame that only needed a status bar.
+        var x = Math.Max(rect.UpperLeft.X, _damageRegion.X);
+        var y = Math.Max(rect.UpperLeft.Y, _damageRegion.Y);
+        var right = Math.Min(rect.UpperLeft.X + rect.Width, _damageRegion.X + _damageRegion.W);
+        var bottom = Math.Min(rect.UpperLeft.Y + rect.Height, _damageRegion.Y + _damageRegion.H);
+        SetScissor(x, y, (uint)Math.Max(0, right - x), (uint)Math.Max(0, bottom - y));
+    }
 
     protected override void ClearClip() => ResetScissor();
 

@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-    <!-- Allow floating versions (e.g. "8.3.*") so the DIR.Lib pin auto-picks up new CI publishes
+    <!-- Allow floating versions (e.g. "8.9.*") so the DIR.Lib pin auto-picks up new CI publishes
          without a manual bump here. -->
     <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
   </PropertyGroup>
@@ -13,7 +13,12 @@
          PackageReference upstream's conditional path uses, so the line stays and is kept in step with
          whatever the submodule is pinned at, rather than being left to rot at whatever it said when
          the divergence was introduced. -->
-    <PackageVersion Include="DIR.Lib" Version="8.3.*" />
+    <PackageVersion Include="DIR.Lib" Version="8.9.*" />
+    <!-- IActivatableWindow, which SdlVulkanWindow implements. Unlike the DIR.Lib line above this one
+         is LIVE: there is no drawboard fork of AppShell, so the csproj's sibling probe misses in both
+         the nested-submodule layout and a standalone clone, and the PackageReference path is the one
+         that actually resolves. -->
+    <PackageVersion Include="SharpAstro.AppShell" Version="1.1.*" />
     <!-- Interface-only (no implementation assemblies): the renderer logs its unconditional
          diagnostics through an injectable ILogger (SdlVulkanLog) with a stderr fallback. -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
