@@ -19,22 +19,6 @@ The fork now mirrors upstream's **full source** — the Android host (`Android/`
 
 A fix to anything **outside** that list belongs upstream first, then comes back down on the next round — putting it here first either loses it to the next `git checkout upstream/main -- .` or grows this list, and the list is what a sync round has to re-apply by hand every time.
 
-### Fork-first fixes awaiting upstream (re-apply or retire each round)
-
-Deliberate exceptions to the rule above: proven here first, to be contributed up once settled. **Each one
-is a line a sync round must re-apply by hand, so this section should keep emptying.** When upstream takes
-one, delete the entry — do not leave it claiming a divergence that is no longer there.
-
-- **`VulkanContext.ResizeOffscreen` drains with `TryDrainDevice`, not `vkDeviceWaitIdle`.** It was the
-  last unbounded, unguarded device wait in the class: every sibling is either bounded
-  (`TryWaitPriorFramesIdle` for the atlas paths, `TryDrainDevice` for swapchain recreate / surface loss)
-  or `IsGpuStuck`-guarded, and `VkFontAtlas` engineered its per-Flush wait away entirely. On a wedged
-  GPU the raw call blocks its caller forever; the offscreen path is reached from TIFF export, so an
-  export would hang without ever saying why. `TryDrainDevice` is the right one rather than
-  `TryWaitPriorFramesIdle` because the latter excludes the CURRENT frame's fence by design — correct for
-  a mid-record atlas grow, wrong here, since `ResizeOffscreen` runs between frames where that index can
-  still hold the pending submit most likely to be reading the old target.
-
 ## Build commands
 
 ```bash
