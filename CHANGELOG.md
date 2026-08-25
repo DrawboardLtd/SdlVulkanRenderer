@@ -69,6 +69,16 @@ effects would mean a declined frame reconfigures the next one.
 `TryWaitPriorFramesIdle` is public, so a consumer destroying its own sampled texture can use the
 bounded drain instead of an unbounded `vkDeviceWaitIdle`.
 
+`ResizeOffscreen` now drains with `TryDrainDevice` instead of `vkDeviceWaitIdle` — it was the last
+unbounded, unguarded device wait in the class, where every sibling is either bounded or
+`IsGpuStuck`-guarded and `VkFontAtlas` engineered its per-Flush wait away entirely. On a wedged GPU the
+raw call blocks its caller forever, and the offscreen path is reached from export, so an export would
+hang without ever saying why. `TryDrainDevice` rather than `TryWaitPriorFramesIdle`, because the latter
+excludes the CURRENT frame's fence by design — right for a mid-record atlas grow, wrong here, since
+`ResizeOffscreen` runs between frames where that index can still hold the pending submit most likely to
+be reading the old target. Same trade the swapchain-recreate and surface-loss paths already take: on
+timeout it proceeds, because the target is being destroyed and recreated regardless.
+
 Follows DIR.Lib to 8.9 for `LayoutDamage` and its unconditional layout capture.
 
 CI: every job is now bounded by `timeout-minutes` (GitHub's default is six hours, which is how an
