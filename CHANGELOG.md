@@ -13,6 +13,17 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.12
+
+Follows DIR.Lib to 8.12: `Node.Anchored` places one child at its own measured size inside a rect rather
+than filling it, so a floating panel over a canvas states WHERE it floats instead of computing pixels;
+`IconKind.Pan` and `IconKind.IBeam` join the icon family; and DIR.Lib's icon drawings move to their own
+partial file.
+
+Nothing here changes. `Anchored` is arranged by the engine and reaches `PixelWidgetBase`'s painter as
+one more node in the pre-order list, and the two marks arrive at `DrawLayoutIcon` as two more kinds.
+The inert `DIR.Lib` `PackageVersion` moves with the pin, as ever.
+
 ## 8.11
 
 Follows DIR.Lib to 8.11, which adds `IconKind.Search` -- a lens with a handle -- and
