@@ -13,6 +13,21 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.11
+
+Follows DIR.Lib to 8.11, which adds `IconKind.Search` -- a lens with a handle -- and
+`Content.TextInput.LeadingIcon`, a mark drawn inside a field at its leading edge with the text starting
+after it.
+
+Nothing here changes for either. The mark reaches `PixelWidgetBase`'s existing `DrawLayoutIcon` as one
+more kind, and the field's leading room is stated in `TextInputRenderer` where the measure pass and the
+paint both already read their shared inset from. What it buys a consumer is that a search bar stops
+being a box with a placeholder in it: the affordance survives the first keystroke, which is when a
+reader glancing back at a bar full of results needs to know which box was the query.
+
+The inert `DIR.Lib` `PackageVersion` moves with the pin, as ever -- it decides nothing here, and left
+behind it rots in silence.
+
 ## 8.10
 
 Follows DIR.Lib to 8.10, where an icon takes its size from the text it sits beside:
