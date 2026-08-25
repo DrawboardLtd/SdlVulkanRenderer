@@ -13,6 +13,68 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.9
+
+Damage-based repaint: a frame can preserve the previous one and paint only the region that changed.
+`BeginFrameRenderPass` picks a `loadOp = Load` variant of the swapchain pass — identical in
+attachments, samples, subpass refs and dependency pair, so the pre-baked pipelines stay compatible —
+and confines the frame to the accumulated damage. Render area and scissor are the region while the
+VIEWPORT stays the full surface: an app submits geometry in surface coordinates, so shrinking the
+viewport would squash the frame into the region rather than crop it to it. `AddFrameDamage` /
+`MarkFullFrameDamage` declare it, and every clip is intersected with it, since DIR.Lib has already
+intersected a clip with its parents but knows nothing about damage.
+
+Damage is tracked PER SWAPCHAIN IMAGE, which is the only hard part. With 2-3 images in rotation the
+image acquired this frame holds the frame from 2-3 frames ago, so what must be repainted into it is
+the union of every frame's damage since THAT image was last painted. Using the current frame's damage
+leaves stale pixels that appear only at particular frame counts and only in the images that missed an
+update — an intermittent glitch with no visible connection to bookkeeping. `SwapchainDamage` is a
+separate type so that algorithm is testable with no device, and nine tests do exercise it.
+
+MSAA takes the clearing path unconditionally: the multisample attachment is transient and cannot be
+reloaded from the resolved image, so `CreateLoadRenderPass` returns Null, which is correct rather than
+merely safe.
+
+`VulkanContext.CachedLayer` renders expensive, rarely-changing content into a sampleable secondary
+target on the live device, so a frame that changed nothing but its chrome blits it instead of
+re-shading it. It is a sibling of `ThumbnailCapture`, not of `CreateOffscreen` — the pass is recorded
+into the frame's OWN command buffer from `OnPreRenderPass`, so there is no extra submit, no extra
+fence and no queue-stalling wait. ONE TARGET PER FRAME IN FLIGHT is correctness, not tuning: the
+frame fence retires frame N-2, never N-1, so a single shared target would be rewritten while the
+previously submitted frame was still sampling it — the hazard `VkFontAtlas.Grow` guards with a drain,
+and the one an Adreno X1-85 answers by failing the next submit.
+
+`SdlVulkanWindow` implements `SharpAstro.AppShell.IActivatableWindow`, so a single-instance hand-off
+can bring a window forward with the correct restore behaviour. The three members it needed already
+existed; what was missing was the RULE, and two applications wrote it independently and both got it
+wrong the same way — restore, then raise. Restoring un-maximises, so opening a second file knocked a
+maximised window back to its floating size; raising without restoring leaves a minimised window
+off-screen at -21333,-21333 while holding input focus. Restore only when actually minimised.
+
+That adds a dependency on SharpAstro.AppShell, one small managed assembly whose own only dependency
+(`Microsoft.Extensions.Logging.Abstractions`) this package already had. It is taken from nuget.org
+through upstream's conditional-sibling shape kept verbatim, unlike the DIR.Lib submodule reference:
+AppShell is not forked, so the PackageReference the probe falls through to is the real package rather
+than a different codebase.
+
+The inspector gains a `move` verb. Both existing pointer verbs press a button, and a press means
+something — in a viewer it starts a pan — so hover-driven behaviour was undrivable: highlights,
+tooltips, the cursor shape, and any repaint decided by where the pointer is.
+
+`SdlWindowView.OnBeforeFrame` runs once a frame is committed to, before the pass opens, because damage
+has to be declared there — by the time `OnRender` runs the pass is already begun. Deliberately
+distinct from `CheckNeedsRedraw`, which is a predicate deciding WHETHER to draw; giving that side
+effects would mean a declined frame reconfigures the next one.
+
+`TryWaitPriorFramesIdle` is public, so a consumer destroying its own sampled texture can use the
+bounded drain instead of an unbounded `vkDeviceWaitIdle`.
+
+Follows DIR.Lib to 8.9 for `LayoutDamage` and its unconditional layout capture.
+
+CI: every job is now bounded by `timeout-minutes` (GitHub's default is six hours, which is how an
+unreachable apt archive parked a job for an afternoon), and the WebKitGTK install goes through a
+caching composite action, so the common path reaches no archive at all.
+
 ## 8.3
 
 Follows DIR.Lib to 8.3, which is additive. Nothing in this repo's own source changes, but the

@@ -24,6 +24,10 @@ env:
 
 jobs:
   build:
+    # Every job is bounded. GitHub's default is 6 hours, which is how an unreachable apt archive
+    # parked webview-smoke-linux for an afternoon; healthy runs here are minutes, so a job over
+    # these limits is stuck rather than slow.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     # Published for the test job, so the version is resolved ONCE per run rather than each job
     # re-deriving it.
@@ -132,6 +136,7 @@ jobs:
   # in publish-nuget's needs) until proven stable across runners. If a runner's Mesa does not
   # auto-fall-back to software, add LIBGL_ALWAYS_SOFTWARE=1 + WEBKIT_DISABLE_DMABUF_RENDERER=1 below.
   webview-smoke-linux:
+    timeout-minutes: 20
     needs: build
     strategy:
       fail-fast: false
@@ -142,13 +147,21 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
-    # Plain apt-get (not cache-apt-pkgs-action): the cache action installs only the named packages
-    # without their dependencies, so mesa-vulkan-drivers landed without the driver libs its ICD needs
-    # -> "vkCreateInstance: Found no drivers" (-9). apt-get resolves dependencies and installs the ICD.
+    # Cached, so the common path needs no network at all -- which is the actual fix. Bounding the
+    # apt-get stopped a wedged mirror costing six hours, but it still wedged: upstream saw this step
+    # stall on libjavascriptcoregtk-4.1-0 (8.1 MB) twice in a row on ubuntu-latest while the aarch64
+    # twin installed the same set in 1m9s, so a retry only ever bought a slower failure. A cache hit
+    # skips the archive entirely; a miss is still bounded and retried, so the worst case is no worse.
+    #
+    # NOT cache-apt-pkgs-action (which `test` above uses): it installs only the named packages
+    # without their dependencies, which is how mesa-vulkan-drivers previously landed without the
+    # driver libs its ICD needs -> "vkCreateInstance: Found no drivers" (-9). The composite action
+    # downloads the resolved dependency closure and dpkg's it, so it keeps apt's resolution.
     - name: Install WebKitGTK + software Vulkan + Xvfb
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y mesa-vulkan-drivers libvulkan1 libgtk-3-0 libwebkit2gtk-4.1-0 xvfb
+      uses: ./.github/actions/apt-install
+      with:
+        cache-name: webview
+        packages: mesa-vulkan-drivers libvulkan1 libgtk-3-0 libwebkit2gtk-4.1-0 xvfb
     - uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.x

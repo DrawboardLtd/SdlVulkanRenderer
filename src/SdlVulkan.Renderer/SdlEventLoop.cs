@@ -40,8 +40,9 @@ public sealed class SdlEventLoop
     // INSIDE the teardown entry points (observed on Adreno, 2026-07-10 dump: RecoverFromGpuError →
     // CleanupSwapchain → vkFreeMemory never returned; the render thread froze permanently). So the
     // stuck-fence recovery runs on a background task the render thread only POLLS: past the deadline
-    // the task is abandoned (a leaked blocked thread on a dead device) and the loop exits cleanly via
-    // OnGpuWedged instead of freezing. The escalation limit bounds the stuck→recover→stuck ping-pong:
+    // the task is abandoned (a leaked thread, which may be blocked on a dead device OR merely slow --
+    // see VulkanContext.Abandon, which is what makes the second case safe) and the loop exits cleanly
+    // via OnGpuWedged instead of freezing. The escalation limit bounds the stuck→recover→stuck ping-pong:
     // that many stuck escalations without one clean frame in between = the device isn't coming back.
     private const long GpuWedgeRecoveryDeadlineMs = 4000;
     private const int GpuStuckEscalationLimit = 3;
@@ -141,6 +142,9 @@ public sealed class SdlEventLoop
     /// <summary>Background color for the primary window's frame clear.</summary>
     public RGBAColor32 BackgroundColor { get => Primary.BackgroundColor; set => Primary.BackgroundColor = value; }
     public Action? OnRender { get => Primary.OnRender; set => Primary.OnRender = value; }
+
+    /// <inheritdoc cref="SdlWindowView.OnBeforeFrame"/>
+    public Action? OnBeforeFrame { get => Primary.OnBeforeFrame; set => Primary.OnBeforeFrame = value; }
     public Action<uint, uint>? OnResize { get => Primary.OnResize; set => Primary.OnResize = value; }
     public Func<InputKey, InputModifier, bool>? OnKeyDown { get => Primary.OnKeyDown; set => Primary.OnKeyDown = value; }
     public Func<byte, float, float, byte, InputModifier, bool>? OnMouseDown { get => Primary.OnMouseDown; set => Primary.OnMouseDown = value; }
@@ -246,6 +250,8 @@ public sealed class SdlEventLoop
                 // events were already dispatched above, so the window stays responsive while waiting.
                 if (Environment.TickCount64 < v.NextRenderAttemptTick) continue;
                 v.NeedsRedraw = false;
+                // Committed to a frame: let the app configure it before the pass opens.
+                v.OnBeforeFrame?.Invoke();
                 if (RenderView(v))
                     renderedAny = true;
             }
@@ -347,9 +353,18 @@ public sealed class SdlEventLoop
             }
             else if (Environment.TickCount64 >= v.GpuRecoveryDeadlineTick)
             {
-                // The driver is blocking inside teardown on a hung device. Abandon the task (its
-                // thread stays blocked — leaked deliberately; the alternative is freezing THIS
-                // thread) and hand the terminal decision to the host.
+                // The recovery task has overrun its deadline: either the driver is blocking inside a
+                // teardown entry point on a hung device, or the recovery is merely slower than the
+                // deadline. Abandon it either way — the alternative is freezing THIS thread — and hand
+                // the terminal decision to the host.
+                //
+                // Tell the renderer first. This used to just drop the task on the assumption that its
+                // thread stays blocked forever, which is not true and cost a crash: TryDrainDevice is
+                // BOUNDED, so a slow recovery reliably wakes up and carries on rebuilding the swapchain
+                // against a surface the host has since destroyed. Abandon() is what stops it at its next
+                // checkpoint, and what tells Dispose to leak rather than free — because a thread nobody
+                // can join is still entitled to read those handles.
+                renderer.AbandonDevice();
                 SdlVulkanLog.Logger.GpuWedgedRecoveryDeadline(GpuWedgeRecoveryDeadlineMs, v.Window.WindowId);
                 try { v.OnGpuWedged?.Invoke(); }
                 catch (Exception ex) { SdlVulkanLog.Logger.OnGpuWedgedHandlerThrew(ex.GetType().Name, ex.Message); }
