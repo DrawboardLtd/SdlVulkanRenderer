@@ -13,6 +13,18 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.10
+
+Follows DIR.Lib to 8.10, where an icon takes its size from the text it sits beside:
+`Layout.Builder.Icon(kind, color: c)` with no size puts the mark at `Content.Icon.TextSizeRatio` of
+the font size of the run in the same container. Nothing in this repo has to change for it -- the
+resolution happens in DIR.Lib's container factories, so `Content.Icon.Size` still arrives at
+`PixelWidgetBase`'s painter as one concrete number -- and a consumer's chip stops restating its own
+label's font size to size its caret.
+
+The inert `DIR.Lib` `PackageVersion` moves with it. It decides nothing here (the csproj reaches
+DIR.Lib through the submodule `ProjectReference`), but left behind it rots silently, which is what
+`fix(deps)` had to correct once already after it had drifted to 7.16 against a submodule at 8.3.
 ## 8.9
 
 Damage-based repaint: a frame can preserve the previous one and paint only the region that changed.
