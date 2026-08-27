@@ -13,6 +13,64 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.13
+
+**BEHAVIOUR CHANGE: text sits on the FACE's baseline, not on its own ink.** Following DIR.Lib 8.13,
+`DrawText` stops centring the measured bounds of the run it was handed. Centring the ink made the
+baseline a function of the text: "a" landed at one height, "b" lower because its ascender inflated the
+box, "g" higher because its descender did. One label never looks wrong; a ROW of independently centred
+labels cannot agree, which is where it shows (a board's file letters step at b, d and g; a toolbar steps
+wherever one caption carries a descender). Every vertically centred run moves slightly, and runs that
+used to disagree now line up.
+
+The formula is no longer restated here. It lives in `DIR.Lib.TextBaseline` (`LineHeightFactor`,
+`LineHeight`, `WithinLine`), because it had four copies, this renderer among them, one of them inverted.
+Face metrics come from `SdfFontAtlas.Rasterizer.GetVerticalMetrics`; a face that declares no hhea falls
+back to the run's ink exactly as before.
+
+**Deferred destruction** (`VulkanContext.DeferDestroy` / `VkRenderer.DeferDestroy`,
+`PendingDeferredDestroys`). Hand an image view, image, memory, buffer or shared-pool descriptor set to
+the context instead of destroying it, and it is destroyed once every frame that could reference it has
+retired: the frame being recorded and every frame in flight. Retirement is read off the fence waits the
+frame loop already performs, so it costs no drain. `VkTexture.Dispose` goes through it, so disposing a
+texture in the frame that drew it is now legal.
+
+The drains this library offered retire PREVIOUS frames and cannot retire the one being recorded, so
+destroying a resource mid-frame was correct only if nothing earlier in the same frame had bound it, a
+property of call order across hooks a consumer usually does not own. Getting it wrong reaches the GPU as
+a dangling view: validation reads it as `vkCmdBindDescriptorSets(): ... VkImageView was destroyed`, the
+NVIDIA driver as `nvlddmkm 153`, Windows as a `LiveKernelEvent 141` watchdog with the process gone.
+Adoption notes, including the per-frame descriptor-set pattern that goes with it, are in
+`docs/deferred-destroy-adoption.md`.
+
+**`TryWaitAllFramesIdle`**, the between-frames drain a consumer needs: bounded, and it reports failure
+rather than throwing, so a wedged GPU cannot hang the caller.
+
+**Swapchain teardown flushes the present queue.** `RecreateSwapchain` / `PrepareForSurfaceLoss` /
+`RecoverFromGpuError` follow their bounded fence drain with a `vkQueueWaitIdle` before
+`CleanupSwapchain` destroys the swapchain and its per-image render-finished semaphores, but only when
+the drain SUCCEEDED. The fence drain waits on graphics submits; present is a separate queue operation
+gated by no fence, so a fence-only drain left the images and present semaphores still in use by
+`vkQueuePresentKHR` when they were destroyed. Validation flagged it on every window resize
+(VUID-vkDestroySwapchainKHR-swapchain-01282, VUID-vkDestroySemaphore-semaphore-05149): harmless on
+desktop NVIDIA, which serialised, but this is the destroy-while-in-use pattern that surfaces on Adreno
+as a rejected `vkQueueSubmit`. Gating on drain success keeps the no-hang property: a wedged GPU still
+forces the teardown, exactly as before.
+
+**The damage pass's `loadOp LOAD` is ordered after its own layout transition.** The shared external
+dependency admitted `COLOR_ATTACHMENT_WRITE` alone, and a LOAD reads, so synchronization validation
+reported a READ_AFTER_WRITE hazard once per swapchain image on every partial frame. The read is
+admitted for every pass, not just the LOAD one: dependencies are not among the things render-pass
+compatibility exempts, so widening one pass alone made it incompatible with the framebuffers and
+pipelines built against the other (VUID 00904 / 02684). Only consumers of `AddFrameDamage` ran it.
+
+**Inspector:** `move` is declared as an MCP tool. The verb has been on the wire since 8.9, added
+precisely because press-based verbs cannot drive hover (`click`, `drag` and `press_hold` all arrive
+with a button DOWN), but it was never declared, so every MCP-driven session had a hole exactly where
+hover behaviour lives. A missing argument now says WHICH argument was missing.
+
+CI runs on current action majors (checkout v7, setup-dotnet v6, upload-artifact v7).
+
 ## 8.12
 
 Follows DIR.Lib to 8.12: `Node.Anchored` places one child at its own measured size inside a rect rather

@@ -34,10 +34,10 @@ jobs:
     outputs:
       version-prefix: ${{ steps.version.outputs.prefix }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
-    - uses: actions/setup-dotnet@v4
+    - uses: actions/setup-dotnet@v6
       with:
         dotnet-version: 10.0.x
     - name: Resolve version prefix
@@ -67,7 +67,7 @@ jobs:
     - name: Build
       run: dotnet build -c $BUILD_CONF --no-restore -p:BuildAndroidHost=true -p:Version=${VERSION_PREFIX}${VERSION_REV}${VERSION_HASH} -p:FileVersion=${VERSION_PREFIX}.${VERSION_REV} -p:ContinuousIntegrationBuild=true
     - name: Upload NuGet package
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: nuget-packages
         path: '**/*.nupkg'
@@ -96,7 +96,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
     - uses: SharpAstro/cache-apt-pkgs-action@v1
@@ -112,7 +112,7 @@ jobs:
         vulkaninfo --summary || true
         echo "--- instance layers ---"
         vulkaninfo 2>/dev/null | grep -iA1 "VK_LAYER_KHRONOS_validation" || echo "validation layer NOT visible to loader"
-    - uses: actions/setup-dotnet@v4
+    - uses: actions/setup-dotnet@v6
       with:
         dotnet-version: 10.0.x
     - name: Restore dependencies
@@ -144,7 +144,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
     # Cached, so the common path needs no network at all -- which is the actual fix. Bounding the
@@ -162,7 +162,7 @@ jobs:
       with:
         cache-name: webview
         packages: mesa-vulkan-drivers libvulkan1 libgtk-3-0 libwebkit2gtk-4.1-0 xvfb
-    - uses: actions/setup-dotnet@v4
+    - uses: actions/setup-dotnet@v6
       with:
         dotnet-version: 10.0.x
     - name: WebView messaging self-test (headless via Xvfb)
