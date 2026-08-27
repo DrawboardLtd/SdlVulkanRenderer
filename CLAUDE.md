@@ -35,7 +35,7 @@ Package version is `Major.Minor.RunNumber` where `RunNumber` is the CI build num
 
 It covers **every** package here — renderer, Inspector, WebView, WebView.Native — because CI stamps a single `-p:Version` across all of them. No csproj declares its own `VersionPrefix`: a per-project one silently overrides the props file, which is how Inspector/WebView/WebView.Native sat at 6.0.0 while the renderer shipped 7.5.0.
 
-Add the matching entry to the changelog comment block in `.github/workflows/dotnet.yml` — that block is the chain's de-facto release notes.
+Add the matching entry to [CHANGELOG.md](CHANGELOG.md) at the repo root, in the same commit — newest first, one `## Major.Minor` section each. (The notes used to live in a comment block in `.github/workflows/dotnet.yml`, justified by the double hyphen several of them contain, which XML forbids inside a comment — but that only ever ruled out putting them in a csproj, nothing ever read them there, and they had reached 431 of that file's 590 lines.)
 
 Central package versioning via `src/SdlVulkan.Renderer/Directory.Packages.props` — update there, not in `.csproj`.
 
@@ -52,7 +52,14 @@ After pulling this repo fresh, run `git submodule update --init --recursive` bef
 ## Architecture
 
 **Rendering pipeline flow:**
-`SdlVulkanWindow` (SDL3 window + Vulkan instance/surface) → `VulkanContext` (device, swapchain, command buffers, per-frame sync with `MaxFramesInFlight = 2`, `CurrentFrame` exposed for side-cars) → `VkRenderer` (2D draw API: rectangles, ellipses, lines, text, textures) → `VkPipelineSet` (pipelines built from pre-baked SPIR-V — flat, textured, ellipse, page, stroke, SDF, round-rect, blend variants)
+`SdlVulkanApp` (process-wide SDL lifecycle + shared `VkInstance` and `VulkanDevice` for a multi-window app) → `SdlVulkanWindow` (per-window SDL3 window + Vulkan surface) → `VulkanContext` (per-window swapchain, command buffers, per-frame sync with `MaxFramesInFlight = 2`, vertex ring, `CurrentFrame` exposed for side-cars; references a `VulkanDevice`) → `VkRenderer` (2D draw API: rectangles, ellipses, lines, text, textures) → `VkPipelineSet` (pipelines built from pre-baked SPIR-V — flat, textured, ellipse, page, stroke, SDF, round-rect, blend variants)
+
+**Device vs. context split (6.0+):** device-level state (logical device, queue, command pool, render pass, descriptor pool/layout, pipeline layout, MSAA) lives in `VulkanDevice`; per-window state (swapchain, framebuffers, sync, vertex ring, command buffers) lives in `VulkanContext`. `VulkanContext` forwards the device-level members (`ctx.RenderPass`, `ctx.PipelineLayout`, …) so existing consumers keep working. Three construction paths:
+- `SdlVulkanApp.CreateWindow` + `VulkanContext.CreateForSharedDevice` — multi-window; one `VulkanDevice` shared across windows, so GPU resources stay valid in all of them and a document tab can move between windows without re-uploading geometry.
+- `VulkanContext.Create(instance, surface, …)` — single-window; the context creates and owns its own device.
+- `VulkanContext.CreateOffscreen(instance, …)` — headless render-to-`VkImage`; no surface, swapchain or SDL window. Used by tests, thumbnail/raster workers, and CI without a display.
+
+A context tears down the device only when it created it; shared-device windows leave teardown to the device owner (the `SdlVulkanApp`).
 
 **Key design patterns:**
 - **Push-constant-only uniforms** — no UBOs; all per-draw data (projection matrix, color, extra params) goes through an 84-byte push constant block.
@@ -61,8 +68,9 @@ After pulling this repo fresh, run `git submodule update --init --recursive` bef
 - **Per-frame vertex ring buffer** — two host-visible/coherent buffers (one per in-flight frame), written linearly and reset each `BeginFrame`.
 - **Deferred texture upload** — `VkTexture.CreateDeferred` + `RecordUpload` records GPU uploads into the frame command buffer before `BeginRenderPass`, avoiding `vkQueueWaitIdle` stalls. `VkTexture.Dispose` resets `IsUploaded=false` to prevent use-after-free.
 - **Font atlas lifecycle** — `VkFontAtlas` manages a growable glyph atlas (up to 4096x4096) with dirty-region staging upload; eviction is deferred one frame to prevent stale UV sampling; `skipUnflushed` guards draw loops from sampling unuploaded glyphs.
-- **MTSDF side-car for text** — `VkSdfFontAtlas` uses R8G8B8A8Unorm textures for resolution-independent text: RGB carry pseudo-distance (the shader reconstructs via median, which is what preserves corners) and A the true distance. Emoji go through the regular RGBA atlas.
-- **Idle-suppressing event loop** — `SdlEventLoop` uses `WaitEventTimeout` when idle, throttles mouse-motion redraws to ~30 fps. Touch: pinch/pinch-end gesture events.
+- **MTSDF side-car for text** — `VkSdfFontAtlas` is a list of fixed-size R8G8B8A8Unorm page textures for resolution-independent text: RGB carry pseudo-distance (the shader reconstructs via median, which is what preserves corners) and A the true distance. A full page appends a new page rather than reallocating — no `vkDeviceWaitIdle` + realloc + re-upload stall — with per-page LRU eviction. Emoji go through the regular RGBA atlas.
+- **Idle-suppressing event loop** — `SdlEventLoop` uses `WaitEventTimeout` when idle, throttles mouse-motion redraws to ~30 fps, and drives every window of a multi-window app. Touch: pinch/pinch-end gesture events.
+- **Live-device thumbnail capture** — `VkRenderer.BeginThumbnailCapture` / `EndThumbnailCapture` / `TryGetThumbnailCapture` re-issue already-tessellated geometry into an offscreen target at thumbnail scale, with non-blocking readback (`VulkanContext.ThumbnailCapture`).
 
 **Side-car (custom) pipeline pattern:**
 Consumer projects can create their own Vulkan pipelines that render within the same render pass. To create a side-car pipeline:
@@ -75,13 +83,16 @@ Consumer projects can create their own Vulkan pipelines that render within the s
 The 84-byte push-constant block is only a constraint if you use `ctx.PipelineLayout`. Side-cars with their own layout can define any push-constant shape.
 
 **Key files:**
+- `SdlVulkanApp.cs` — process-wide SDL lifecycle + the shared `VkInstance`/`VulkanDevice` a multi-window app hangs off.
+- `SdlVulkanWindow.cs` — per-window SDL3 window + Vulkan surface. Implements AppShell's `IActivatableWindow`, so a single-instance hand-off can raise it.
 - `VkRenderer.cs` — high-level draw API, extends `Renderer<VulkanContext>` from DIR.Lib; GPU-optimized DrawLine/DrawEllipse.
-- `VulkanContext.cs` — Vulkan device/swapchain/sync lifecycle.
+- `VulkanContext.cs` — per-window swapchain/sync/vertex-ring lifecycle (references a `VulkanDevice`). Partials carry the paths that need their own: `VulkanContext.Offscreen.cs` (headless render-to-image), `.SwapchainReadback.cs`, `.ThumbnailCapture.cs`, `.Damage.cs` (repaint only what changed), `.CachedLayer.cs` (so a chrome-only redraw does not re-shade the picture), `.DeferredDestroy.cs` (release a bound object without a full drain).
 - `VkFontAtlas.cs` — glyph rasterization cache + GPU texture management (drives DIR.Lib's `ManagedFontRasterizer`).
 - `VkSdfFontAtlas.cs` — MTSDF glyph atlas for resolution-independent text.
 - `VkPipelineSet.cs` — pipeline creation from the pre-baked SPIR-V embedded in the assembly. Shaders are authored as GLSL 450 in `Shaders/*.vert|*.frag` and baked to `Shaders/spirv/*.spv` (committed) by `tools/BakeShaders`; re-run it from the repo root after editing one — `dotnet run --project tools/BakeShaders -c Release -- src/SdlVulkan.Renderer/Shaders`. Commit `Shaders/spirv/sources.sha256` with the `.spv`: it records the source hashes the bake was made from, and build warning SVR0001 compares the sources against it. That check is content-based, so it catches a forgotten re-bake in CI as well as locally — `Shaders/.gitattributes` pins the sources' line endings to keep the hashes reproducible from any checkout.
 - `VulkanDevice.cs` — instance/device/queue/render-pass creation and the descriptor-pool chain; shared across windows, so a torn-out window reuses one device.
 - `VkTexture.cs` — per-image Vulkan texture with blocking and deferred upload modes.
-- `SdlEventLoop.cs` — event-driven render loop with resize handling, touch gestures.
-- `VkMenuWidget.cs` — self-contained menu UI widget implementing `IWidget`.
+- `SdlEventLoop.cs` — event-driven, multi-window render loop with resize handling, touch gestures.
 - `SdlInputMapping.cs` — SDL3 scancode/keymod → DIR.Lib `InputKey`/`InputModifier` mapping.
+- `DebugInspector.cs` / `DebugInspectorOptions.cs` — the in-process debug inspector, DEBUG-only; its client lives in `SdlVulkan.Renderer.Inspector`.
+- `VulkanValidation.cs` / `RenderDiag.cs` — opt-in validation-layer reporting and the wedge/device-churn breadcrumb.
