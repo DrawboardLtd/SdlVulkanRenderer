@@ -277,6 +277,27 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
     // ---- Live-device thumbnail capture (see VulkanContext.ThumbnailCapture.cs) ----
 
+    // ---- Deferred destruction (see VulkanContext.DeferredDestroy.cs) ----
+
+    /// <summary>
+    /// Destroys the given handles once every frame that could reference them has retired: the frame
+    /// being recorded and every frame in flight. The ONLY correct way for a consumer to release a GPU
+    /// object a frame may have bound; a fence drain at the call site retires previous frames but never
+    /// the one being recorded, which is how a mid-frame destroy submits a frame against freed objects
+    /// and the GPU faults. Null handles are ignored. Render thread only.
+    /// </summary>
+    public void DeferDestroy(
+        VkImageView view = default, VkImage image = default, VkDeviceMemory memory = default,
+        VkBuffer buffer = default, VkDescriptorSet descriptorSet = default)
+        => Surface.DeferDestroy(view, image, memory, buffer, descriptorSet);
+
+    /// <summary>Runs <paramref name="destroy"/> once every frame that could reference what it frees has
+    /// retired. For objects the typed overload does not cover.</summary>
+    public void DeferDestroy(System.Action destroy) => Surface.DeferDestroy(destroy);
+
+    /// <summary>How many deferred destroys are still waiting for their frames to retire.</summary>
+    public int PendingDeferredDestroys => Surface.PendingDeferredDestroys;
+
     // ---- Cached layer (see VulkanContext.CachedLayer.cs) ----
 
     /// <summary>
@@ -2022,7 +2043,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var lineCount = text.Count('\n') + 1;
 
         var glyphScale = _sdfFontAtlas!.GetGlyphScale(fontSize);
-        var lineHeight = fontSize * 1.3f;
+        var lineHeight = DIR.Lib.TextBaseline.LineHeight(fontSize);
         var totalHeight = lineCount * lineHeight;
 
         var layoutX = (float)layout.UpperLeft.X;
@@ -2111,7 +2132,14 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
             };
             var penY = startY + lineIdx * lineHeight;
 
-            var baseline = penY + (lineHeight + maxAscent - maxDescent) / 2f;
+            // The FACE's metrics, not this run's ink: measuring the ink makes the baseline depend on
+            // which letters are present, so independently drawn labels of one size cannot share one.
+            // Falls back to the ink for a face that declares no hhea.
+            var faceMetrics = _sdfFontAtlas.Rasterizer.GetVerticalMetrics(fontFamily, fontSize);
+            var (baseAscent, baseDescent) = faceMetrics is { } fm
+                ? (fm.Ascent, fm.Descent)
+                : (maxAscent, maxDescent);
+            var baseline = penY + DIR.Lib.TextBaseline.WithinLine(lineHeight, baseAscent, baseDescent);
 
             foreach (ref readonly var sg in CollectionsMarshal.AsSpan(_shapedLine))
             {

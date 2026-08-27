@@ -362,11 +362,38 @@ public sealed unsafe partial class VulkanContext : IDisposable
 
     public void DestroyBuffer(VkBuffer buffer, VkDeviceMemory memory) => _dev.DestroyBuffer(buffer, memory);
 
+    /// <summary>
+    /// Flush the present queue after a SUCCESSFUL bounded fence drain, so vkQueuePresentKHR has
+    /// finished reading the swapchain images and consuming the per-image render-finished semaphores
+    /// before <see cref="CleanupSwapchain"/> destroys them
+    /// (VUID-vkDestroySwapchainKHR-swapchain-01282 / VUID-vkDestroySemaphore-semaphore-05149).
+    /// <para>
+    /// <see cref="TryDrainDevice"/> waits only on the graphics-SUBMIT fences; present is a separate
+    /// queue operation gated by no fence, so the fence drain alone leaves the swapchain images and the
+    /// present semaphores still in use by the queue -- which is exactly what a validation run flags on
+    /// every resize (destroy-while-in-use), benign on desktop NVIDIA but a rejected vkQueueSubmit on
+    /// Adreno. Gated on the drain having SUCCEEDED: a successful drain proves the GPU is healthy, so
+    /// this vkQueueWaitIdle returns within a frame; on a drain timeout (wedged GPU) the caller skips
+    /// it and forces the teardown regardless, preserving the "never hang the UI thread on a wedged
+    /// GPU" property TryDrainDevice exists for. A device lost during the flush is routed through
+    /// <see cref="NoteDeviceLost"/> like every other queue op, never thrown.
+    /// </para>
+    /// </summary>
+    private void FlushPresentQueueAfterDrain(bool drained)
+    {
+        if (!drained) return;
+        NoteDeviceLost(DeviceApi.vkQueueWaitIdle(GraphicsQueue), "vkQueueWaitIdle (swapchain teardown)");
+    }
+
     public void RecreateSwapchain(uint width, uint height)
     {
         // Bounded drain (see TryDrainDevice): a resize that races a wedged GPU must not hang the
         // UI thread on an unbounded vkDeviceWaitIdle.
-        TryDrainDevice(DrainTimeoutNs, "swapchain recreate");
+        var drained = TryDrainDevice(DrainTimeoutNs, "swapchain recreate");
+        // The fence drain retires the graphics submits; present is a separate queue op gated by no
+        // fence, so the swapchain images and present semaphores CleanupSwapchain destroys are still
+        // in use by vkQueuePresentKHR until the queue drains too. See FlushPresentQueueAfterDrain.
+        FlushPresentQueueAfterDrain(drained);
         CleanupSwapchain();
         CreateSwapchain(width, height);
     }
@@ -381,7 +408,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// </summary>
     public void PrepareForSurfaceLoss()
     {
-        TryDrainDevice(DrainTimeoutNs, "surface loss");
+        FlushPresentQueueAfterDrain(TryDrainDevice(DrainTimeoutNs, "surface loss"));
         CleanupSwapchain();
     }
 
@@ -427,12 +454,20 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // followed by the driver rejecting every subsequent vkQueueSubmit; giving in-flight work up
         // to the drain cap to retire first makes the teardown legal whenever the frame completes,
         // and on a truly dead fence it degrades to today's behaviour after the cap.
-        TryDrainDevice(DrainTimeoutNs, "GPU-error recovery", attemptEvenIfStuck: true);
+        var drained = TryDrainDevice(DrainTimeoutNs, "GPU-error recovery", attemptEvenIfStuck: true);
 
         // The drain is where this method spends its time, so it is where the loop's deadline is
         // realistically blown. If that happened, stop: everything below either destroys or rebuilds
         // objects the host is now entitled to free.
         if (_abandoned) return;
+
+        // Flush the present queue (VUID-...-01282 / -05149) before the sync-object teardown and
+        // CleanupSwapchain below, on the same drain-succeeded gate as the resize path.
+        FlushPresentQueueAfterDrain(drained);
+
+        // The drain retired (or gave up on) every frame that could reference a deferred object, and the
+        // fences the schedule is measured in are about to be destroyed: flush the queue now.
+        FlushAllDeferredDestroys();
 
         // Present-wait semaphores are deliberately absent here: they belong to the swapchain, and the
         // CleanupSwapchain/CreateSwapchain pair at the end of this method replaces them. Destroying
@@ -528,6 +563,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// Public because a consumer can own GPU images too -- a pipeline that destroys a sampled
     /// texture faces exactly the hazard this exists for, and without this its only options were an
     /// unbounded vkDeviceWaitIdle or nothing.
+    /// <para><b>But check which one you want first:</b> the current-frame exclusion above makes this
+    /// the MID-RECORD form. A consumer destroying a resource BETWEEN frames wants
+    /// <see cref="TryWaitAllFramesIdle"/> instead — the current index can hold a pending submit there,
+    /// and it is the likeliest reader of what is about to be destroyed. This is the wrong default for
+    /// that case despite being the one a consumer finds first.</para>
     /// </remarks>
     public bool TryWaitPriorFramesIdle(string context)
     {
@@ -560,6 +600,38 @@ public sealed unsafe partial class VulkanContext : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Bounded "wait for every in-flight frame" for a consumer about to destroy a GPU resource a
+    /// submitted frame may still be reading. Companion to <see cref="TryWaitPriorFramesIdle"/>, and the
+    /// difference between them is the whole reason this exists separately.
+    ///
+    /// <para><b>Which one to call.</b> <see cref="TryWaitPriorFramesIdle"/> deliberately skips the
+    /// CURRENT frame's fence, because it was written for an atlas grow that runs MID-RECORD — between
+    /// BeginFrame and EndFrame — where that fence has been reset and has nothing submitted behind it, so
+    /// waiting on it could only ever burn the cap. This one includes it, for a destroy that runs BETWEEN
+    /// frames: there the current index is what the next BeginFrame will wait on, and it can still hold a
+    /// pending submit from <c>MaxFramesInFlight</c> frames ago — the frame most likely to still be
+    /// reading the resource. Calling the prior-frames form from a between-frames destroy skips exactly
+    /// the fence that mattered, which trades a hang for a destroy-while-referenced; on an Adreno X1-85
+    /// that presents as a rejected <c>vkQueueSubmit</c> rather than as anything resembling a
+    /// use-after-free, so it is not a mistake the symptom leads you back from.</para>
+    ///
+    /// <para>Capped and skipped on a known-stuck GPU, like its companion, so a destroy coinciding with a
+    /// wedged device cannot hard-freeze the caller the way an unbounded <c>vkDeviceWaitIdle</c> would.
+    /// Fences with no submission behind them are not waited on at all.</para>
+    ///
+    /// <para><b>Returning <c>false</c> is a decision, not just a status.</b> It means the drain timed
+    /// out and nothing has been waited for. A caller that is about to destroy AND RECREATE the resource
+    /// can proceed regardless — that is what the internal resize and surface-loss paths do, since the
+    /// worst case degrades to the rebuild they were already doing. A caller with no rebuild behind it is
+    /// choosing to destroy something the GPU may still be reading, which is usually still better than
+    /// hanging, but should be an explicit choice with a comment on it rather than an inherited default.
+    /// </para>
+    /// </summary>
+    /// <param name="context">Short label for the diagnostic logged if the drain is skipped or times out.</param>
+    /// <returns><c>true</c> when nothing is in flight or every pending fence signalled inside the cap.</returns>
+    public bool TryWaitAllFramesIdle(string context) => TryDrainDevice(DrainTimeoutNs, context);
+
     public VkCommandBuffer BeginFrame(out bool resized)
     {
         AssertFrameThread(nameof(BeginFrame));
@@ -590,6 +662,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
         waitResult.CheckResult();
         _fenceWaitStuck = false;
         _frameOrdinal++;
+        // The wait above is the proof that frame (ordinal - MaxFramesInFlight) and everything before it
+        // has retired, so this is where deferred destroys scheduled against those frames become legal.
+        FlushRetiredDeferredDestroys();
 
         // The fence for _currentFrame is now signaled (just waited, not yet reset). If a thumbnail
         // capture's copy rode this fence index, its GPU work is complete — snapshot it now without
@@ -881,6 +956,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
             DeviceApi.vkDeviceWaitIdle();
         }
 
+        // Everything a consumer deferred is destroyed here, before the objects it may depend on go.
+        FlushAllDeferredDestroys();
+
         CleanupSwapchain();
         CleanupLoadRenderPass();
         if (_isOffscreen) CleanupOffscreenTarget();
@@ -1156,8 +1234,10 @@ public sealed unsafe partial class VulkanContext : IDisposable
         if (Swapchain != VkSwapchainKHR.Null)
             DeviceApi.vkDestroySwapchainKHR(Swapchain);
 
-        // Per-image present-wait semaphores die with the swapchain that sized them. Callers drain the
-        // device before getting here (resize / GPU-error recovery / dispose), so nothing is waiting.
+        // Per-image present-wait semaphores die with the swapchain that sized them. Callers flush the
+        // present queue before getting here -- resize / surface-loss / GPU-error recovery via
+        // FlushPresentQueueAfterDrain, dispose via vkDeviceWaitIdle -- so nothing is waiting. A fence
+        // drain alone would NOT be enough: present is a queue op gated by no fence.
         foreach (var s in _renderFinishedSemaphores)
             DeviceApi.vkDestroySemaphore(s);
         _renderFinishedSemaphores = [];
