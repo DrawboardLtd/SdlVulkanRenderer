@@ -13,6 +13,29 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.14
+
+**The stroke pipeline is instanced: 16 bytes a segment, not 144.** A stroked line segment is drawn
+as a quad — two triangles, six vertices — and the vertex buffer used to hold all six, each carrying
+the segment's two endpoints (`aP0`, `aP1`) plus a per-vertex `(side, end)` selector: 6 floats x 6
+vertices = 144 bytes to describe one line. The endpoints were identical across all six.
+
+Now one INSTANCE per segment carries just the two endpoints (`vec2` + `vec2` = 16 bytes), and the
+six quad vertices are expanded from `gl_VertexIndex` in `stroke.vert` against a constant corner
+table. `DrawPersistentStrokes` / `DrawStrokeSegments` take a SEGMENT count and issue
+`vkCmdDraw(6, segmentCount, ...)`; the binding is `VkVertexInputRate.Instance` at a 4-float stride.
+The rasterised result is unchanged — the corner table reproduces the old six vertices in the same
+winding — so this is a memory/bandwidth change with no visual one.
+
+It is a ~9x cut in stroke vertex data, which on a dense CAD sheet (millions of hatch segments) is
+the dominant cost in three places at once: GPU vertex memory, the managed heap that holds the
+buffer before upload, and the on-disk geometry cache. One sheet of a 47-page architectural set went
+from ~1.2GB of resident stroke vertices to a small fraction of that.
+
+**Vertex-format break for stroke producers.** A consumer feeding `DrawPersistentStrokes` /
+`DrawStrokeSegments` must now emit 4 floats per segment (`P0.xy, P1.xy`) rather than 36, and pass a
+segment count rather than a vertex count. Nothing else in the draw API changes.
+
 ## 8.13
 
 **BEHAVIOUR CHANGE: text sits on the FACE's baseline, not on its own ink.** Following DIR.Lib 8.13,
