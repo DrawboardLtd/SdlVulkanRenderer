@@ -13,6 +13,28 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.15
+
+**A depth-tested offscreen scene target, for content whose visibility is geometry rather than draw
+order.** Everything this renderer drew was painter's-order 2D — the back-to-front sequence of draws IS
+the occlusion — so no pass had a depth attachment. A mesh cannot be drawn that way: its own triangles
+occlude each other in an order that depends on the camera, and no CPU-side sort is correct for every
+view.
+
+`VulkanContext.SceneTarget` is a sampleable colour+depth target built to `CachedLayer`'s rules — one
+target per frame in flight, fixed capacity, colour finalising to `ShaderReadOnlyOptimal` with its own
+descriptor set — so the result composites through the existing `DrawTexture`. It is a separate pass
+rather than depth on the main one because compatibility is per-attachment and the pre-baked pipelines
+are shared: a depth attachment on the swapchain pass would force one onto the cached-layer, damage and
+thumbnail passes too. `VkMeshPipeline` draws into it, with its own 96-byte push-constant layout, and
+`VkRenderer` gains `EnsureSceneTargets` / `BeginScene` / `DrawMesh` / `EndScene`.
+
+`FillSubpassDependencies` is widened with the depth stages rather than the scene pass carrying its own
+list, since dependencies are part of render-pass compatibility and the count has to match everywhere.
+
+Synced from upstream (SharpAstro/SdlVulkan.Renderer#89), where it landed first as generic renderer
+capability. The drawboard consumer is the PDF viewer's `/3D` annotation support.
+
 ## 8.14
 
 **The stroke pipeline is instanced: 16 bytes a segment, not 144.** A stroked line segment is drawn
