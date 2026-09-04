@@ -15,7 +15,13 @@ The fork now mirrors upstream's **full source** — the Android host (`Android/`
 - keep `submodules: recursive` on every CI checkout — the submodule DIR.Lib `ProjectReference` needs the nested checkout to exist;
 - keep the **android host TFM opt-in** — upstream targets `net10.0;net10.0-android` unconditionally, but desktop consumers reference this project by source (the viewer's submodule `ProjectReference`) and `dotnet restore` evaluates every TFM, so an unconditional android TFM would force the android workload on every consumer/CI. The csproj defaults to `net10.0` and adds the android TFM only when `BuildAndroidHost=true`, which the fork CI's build job sets (it installs the workload); the test/webview jobs stay `net10.0`;
 - keep `src/Directory.Build.props`, and keep every csproj FREE of `VersionPrefix` — upstream versions per-csproj, and a csproj `VersionPrefix` overrides the props file, so a sync round silently restores the drift it exists to prevent (see Versioning);
+- don't overwrite `CHANGELOG.md`. The two version lines diverged at 7.6 and the file says so in its own header, so taking upstream's replaces this repo's release history with one numbered differently — and because the entries LOOK right, nothing about the result reads as wrong until someone matches a `Major.Minor` here against a package that never carried it;
+- keep `src/SdlVulkan.Renderer/Directory.Packages.props`. Its `DIR.Lib` line is inert here (the csproj reaches DIR.Lib through the submodule `ProjectReference`) and its comments say why, which is exactly the knowledge a wholesale overwrite discards;
 - then bump the submodule pin + `VersionMajorMinor` in `src/Directory.Build.props`.
+
+Those last two were found the hard way, by diffing before overwriting: a sync round that trusts this
+list alone would have taken upstream's changelog and dropped this fork's version line from 8.14 to
+7.30. Diff first, every round — the list is a reminder, not an inventory.
 
 A fix to anything **outside** that list belongs upstream first, then comes back down on the next round — putting it here first either loses it to the next `git checkout upstream/main -- .` or grows this list, and the list is what a sync round has to re-apply by hand every time.
 
