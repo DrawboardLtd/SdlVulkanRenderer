@@ -56,6 +56,10 @@ model (including half off the frame), the cached-layer pass depth-tests too, and
 is silent under the validation layer at 4x MSAA. BREAKING for the scene-target API, which shipped
 only in 8.15.
 
+Also new since 8.15: DIR.Lib at a5d500b, which fills arbitrary polygons into an `RgbaImage`
+anti-aliased (the polygon coverage rasterizer) and carries that rasterizer's tests. The pin moved on
+`main` between the two releases without an entry of its own, so this is where it is recorded.
+
 Synced from upstream (SharpAstro/SdlVulkan.Renderer#90). The drawboard consumer is the PDF viewer's
 `/3D` annotation, which now draws its model in the page pass like any other page content.
 
