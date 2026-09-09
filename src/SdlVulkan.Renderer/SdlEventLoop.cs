@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using DIR.Lib;
 using Vortice.Vulkan;
@@ -146,7 +146,9 @@ public sealed class SdlEventLoop
     /// <inheritdoc cref="SdlWindowView.OnBeforeFrame"/>
     public Action? OnBeforeFrame { get => Primary.OnBeforeFrame; set => Primary.OnBeforeFrame = value; }
     public Action<uint, uint>? OnResize { get => Primary.OnResize; set => Primary.OnResize = value; }
-    public Func<InputKey, InputModifier, bool>? OnKeyDown { get => Primary.OnKeyDown; set => Primary.OnKeyDown = value; }
+    public Func<InputEvent.KeyDown, bool>? OnKeyDown { get => Primary.OnKeyDown; set => Primary.OnKeyDown = value; }
+    /// <inheritdoc cref="SdlWindowView.OnKeyUp"/>
+    public Func<InputEvent.KeyUp, bool>? OnKeyUp { get => Primary.OnKeyUp; set => Primary.OnKeyUp = value; }
     public Func<byte, float, float, byte, InputModifier, bool>? OnMouseDown { get => Primary.OnMouseDown; set => Primary.OnMouseDown = value; }
     public Func<float, float, bool>? OnMouseMove { get => Primary.OnMouseMove; set => Primary.OnMouseMove = value; }
     public Action<byte>? OnMouseUp { get => Primary.OnMouseUp; set => Primary.OnMouseUp = value; }
@@ -699,8 +701,25 @@ public sealed class SdlEventLoop
             case EventType.KeyDown:
                 if (TryView(evt.Key.WindowID, out var vk))
                 {
-                    vk.OnKeyDown?.Invoke(evt.Key.Scancode.ToInputKey, evt.Key.Mod.ToInputModifier);
+                    // Repeat rides along because only the platform knows it: SDL sends a held key as a
+                    // stream of KeyDown events, and a consumer that treats them all as presses toggles at
+                    // the repeat rate. Carried, never filtered here, since a step action wants them.
+                    vk.OnKeyDown?.Invoke(new InputEvent.KeyDown(evt.Key.Scancode.ToInputKey, evt.Key.Mod.ToInputModifier)
+                    {
+                        Repeat = evt.Key.Repeat,
+                    });
                     vk.NeedsRedraw = true;
+                }
+                break;
+
+            case EventType.KeyUp:
+                // No Repeat here by construction: the OS repeats a HELD key, and a released one is not
+                // held. Dispatched only when someone is listening, since the vast majority of bindings
+                // are press-triggered and a redraw per release would be work for nothing.
+                if (TryView(evt.Key.WindowID, out var vku) && vku.OnKeyUp is not null)
+                {
+                    vku.OnKeyUp.Invoke(new InputEvent.KeyUp(evt.Key.Scancode.ToInputKey, evt.Key.Mod.ToInputModifier));
+                    vku.NeedsRedraw = true;
                 }
                 break;
 

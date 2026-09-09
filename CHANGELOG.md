@@ -13,6 +13,31 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.17
+
+**BREAKING: `OnKeyDown` takes the DIR.Lib event, not the `(key, modifiers)` pair**, and there is a new
+`OnKeyUp` beside it. Both come down from upstream, on `SdlWindowView` and forwarded by `SdlEventLoop`.
+
+A key press carries a third fact no consumer can recover on its own: whether the OS is auto-repeating a
+key still held (`InputEvent.KeyDown.Repeat`, DIR.Lib 8.14). SDL sends a held key as a stream of KeyDown
+events, so a key bound to a TOGGLE flips at the repeat rate for as long as it is down, while a key bound
+to a STEP wants every one of them — which is what auto-repeat is for. The flag rides along and is never
+filtered here, because only the host can tell the two events apart and only the consumer knows which of
+the two it is. Migration is one line per consumer: `(key, mod) =>` becomes `e =>` with `e.Key` and
+`e.Modifiers`, which is the shape every consumer was already rebuilding by hand before handing it to a
+widget, and what the pointer side has always done.
+
+`OnKeyUp` is the release half, for a binding whose meaning is "while held" rather than "on press". It is
+dispatched only when a host actually sets it, since the vast majority of bindings are press-triggered and
+a redraw per release would be work for nothing. **A release is not guaranteed** — SDL delivers no key-up
+when the window loses focus mid-hold — so a consumer must treat "held" as a state it can be talked out
+of, and the safe shape is for the release to RESTORE something, never to be the only way out of a state
+that keeps running invisibly.
+
+DIR.Lib moves to 8.14 with them, which also brings a text-input fix: a selection highlight is painted
+UNDER the glyphs rather than over them, so a field that opens with its contents selected no longer reads
+as an empty box with a coloured block in it.
+
 ## 8.16
 
 **Every render pass carries a depth attachment, and a mesh is drawn inline in the frame.** 8.15's
