@@ -13,6 +13,17 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.19
+
+Takes DIR.Lib 8.19: a palette dropped on a different edge keeps where along that edge it was dropped.
+
+8.18's `SnapOnRelease` carried `OffsetAlong` across the change, and the offsets mean different axes on
+either side of it — floating, along is X; pinned to a side, along is Y — so a palette dragged from the
+right edge to the left had its X read as a distance down the left edge, was clamped back to the top,
+and the drop looked ignored. Both offsets are re-derived from the panel's rect now, and `Unpin` does
+the same conversion for the grip press that lifts a panel off its edge.
+
+Nothing in this repo changes.
 ## 8.18
 
 Takes DIR.Lib 8.18, where `FloatingPalette` learns the two things a palette the reader can re-dock
