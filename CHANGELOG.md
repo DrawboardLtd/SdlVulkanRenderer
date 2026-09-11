@@ -13,6 +13,20 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.18
+
+Takes DIR.Lib 8.18, where `FloatingPalette` learns the two things a palette the reader can re-dock
+needs: which edge it is on, and a placement it can hand a consumer to store.
+
+`Side` is state rather than a `Build` argument, since a drag changes it, and null is the free-floating
+state a drag passes through; `SnapOnRelease` takes the edge a panel was released near; `DragTo` and
+`PressGrip` move in both axes; and `PalettePlacement` is the whole placement as one invariant-culture
+token. Nothing in this repo changes — it is a dependency bump, and every DIR.Lib addition is an
+overload or a defaulted property.
+
+Also carries DIR.Lib 8.17's SharpAstro.Fonts 1.12, which bounds the TrueType hinting interpreter's
+CALL nesting so a font whose hint function calls itself abandons the glyph program instead of
+exhausting the machine stack — not a rendering difference, a crash that could not be caught.
 ## 8.17
 
 **BREAKING: `OnKeyDown` takes the DIR.Lib event, not the `(key, modifiers)` pair**, and there is a new
