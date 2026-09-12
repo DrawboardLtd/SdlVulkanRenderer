@@ -13,6 +13,17 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 8.20
+
+Takes DIR.Lib 8.20: a list a layout tree declares is navigable from the keyboard.
+
+A row that states `ListItemHit(list, index)` for its click binding is now reachable by the arrows and
+actionable by Enter on that alone — `PixelWidgetBase.ListCursor` resolves against the regions the last
+paint registered, and `Layout.Node.FocusBackground` (`.BgFocus`) lights it beside the hover fill it
+mirrors. A row that is not clickable registers no region and so cannot be reached, which removes the
+"can this row be acted on" predicate every list used to keep beside itself.
+
+Nothing in this repo changes.
 ## 8.19
 
 Takes DIR.Lib 8.19: a palette dropped on a different edge keeps where along that edge it was dropped.
