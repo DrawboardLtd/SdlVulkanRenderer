@@ -13,6 +13,25 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 9.0
+
+Takes DIR.Lib 9.0, which is a BREAKING release. No renderer source here references the affected
+APIs, so nothing in this repo changed — but a consumer's code does, and the major moves with the
+dependency rather than hiding a break behind a minor.
+
+What breaks is `float dpiScale` becoming `DesignScale`, a `(float X, float Y)` pair of surface units
+per design unit, on `ListScrollController.SetExtent`, `TapOrDragGesture.Arm` (whose `slopPx` is
+renamed `slopDesignUnits`, having never been pixels), `FloatingPalette`'s offset methods, and the
+`dpiScale:` argument of `RenderLayout` / `ArrangeLayout` / `PaintLayout` / `DrawTrackSlider`. Each of
+those had been keeping a private copy of a number the measure context already owned, and a single
+scalar asserts that a design unit is square — true on a pixel surface, false on a terminal cell.
+`WindowUiSettings.DpiScale` and `PixelWidgetBase.DpiScale` are unchanged: a host still sets one
+number, and only what components pass to each other moved. DIR.Lib's own `MIGRATION.md` carries the
+port recipe.
+
+Also in 9.0: the software renderer applies `ContentTransform`, so a CPU surface honours the same
+content-to-device mapping the GPU one does.
+
 ## 8.20
 
 Takes DIR.Lib 8.20: a list a layout tree declares is navigable from the keyboard.
