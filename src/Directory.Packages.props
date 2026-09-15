@@ -13,7 +13,7 @@
          PackageReference upstream's conditional path uses, so the line stays and is kept in step with
          whatever the submodule is pinned at, rather than being left to rot at whatever it said when
          the divergence was introduced. -->
-    <PackageVersion Include="DIR.Lib" Version="9.0.*" />
+    <PackageVersion Include="DIR.Lib" Version="9.1.*" />
     <!-- IActivatableWindow, which SdlVulkanWindow implements. Unlike the DIR.Lib line above this one
          is LIVE: there is no drawboard fork of AppShell, so the csproj's sibling probe misses in both
          the nested-submodule layout and a standalone clone, and the PackageReference path is the one
@@ -24,22 +24,36 @@
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
 
     <!-- SDL3-CS.Android has no 3.5.0 preview, so the android TFM pins a coherent managed+native
-         pair; desktop stays on the 3.5.0 preview. NB: SDL3-CS.Android 3.4.12.x ships a MISMATCHED
-         pair (Java bridge 3.4.10 vs native 3.4.12) that fails SDL's runtime C/Java version check,
-         so pin 3.4.10.5 where both halves agree.
-         BEFORE BUMPING, read the Android section of README.md. Two open constraints ride on this
-         pin: (1) the mismatch above, which only shows at launch on a device, never at build time;
-         (2) the shipped libSDL3.so is NOT 16 KB page-aligned (warning XA0141 in every consumer),
-         which Android 16 rejects and which only an upstream rebuild can fix. A newer release could
-         clear both at once: 3.4.12.6 is the latest as of 2026-07-27 and is well past the 3.4.12.x
-         that broke, but it is unverified here. Test on a real device, not just CI. -->
+         pair; desktop stays on the 3.5.0 preview.
+         The two constraints this pin used to carry are both CLEARED by 3.4.16: the mismatched
+         Java-bridge/native pair in 3.4.12.x that failed SDL's runtime version check, and the
+         libSDL3.so that was not 16 KB page-aligned (warning XA0141, rejected by Android 16). That
+         alignment needed an upstream rebuild and got one — it is what upstream's 7.36 was for.
+         Still worth testing on a real device rather than only CI when bumping again: the version
+         check only shows at launch, never at build time. -->
     <PackageVersion Include="SDL3-CS" Version="3.5.0-preview.20260213-150035" Condition="'$(TargetFramework)' != 'net10.0-android'" />
-    <PackageVersion Include="SDL3-CS" Version="3.4.10.5" Condition="'$(TargetFramework)' == 'net10.0-android'" />
-    <PackageVersion Include="SDL3-CS.Android" Version="3.4.10.5" />
+    <PackageVersion Include="SDL3-CS" Version="3.4.16" Condition="'$(TargetFramework)' == 'net10.0-android'" />
+    <PackageVersion Include="SDL3-CS.Android" Version="3.4.16" />
     <PackageVersion Include="Vortice.Vulkan" Version="3.2.3" />
     <!-- Vortice.ShaderCompiler (runtime GLSL->SPIR-V) is no longer referenced by the shipped package:
          shaders are pre-baked to SPIR-V by tools/BakeShaders (which pins its own version inline, outside
          this CPM scope). Kept out of runtime so the package has no shaderc native (no Android RID). -->
+
+    <!-- The test, inspector and webview projects. They are here rather than pinned inline in each
+         csproj because this file sits at src/ and so covers all of them — which is the whole point of
+         it being here. While it lived at src/SdlVulkan.Renderer/ those three were outside its scope,
+         and each carried ManagePackageVersionsCentrally=false to stop itself inheriting the CPM of
+         whatever repo the fork is checked out INSIDE (the viewer's, via the submodule layout). Three
+         opt-outs guarding against one hazard; one file in the right place removes the hazard. -->
+    <PackageVersion Include="coverlet.collector" Version="8.0.1" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.8" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
+    <PackageVersion Include="ModelContextProtocol" Version="2.2.0" />
+    <PackageVersion Include="SharpAstro.Png" Version="3.14.*" />
+    <PackageVersion Include="Shouldly" Version="4.3.0" />
+    <PackageVersion Include="WebView2Aot" Version="1.4.1" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="xunit.v3" Version="3.2.2" />
   </ItemGroup>
 
 </Project>
