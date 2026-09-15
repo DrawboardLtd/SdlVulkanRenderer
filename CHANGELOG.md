@@ -13,6 +13,39 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 9.1
+
+**Takes DIR.Lib 9.1, where a pointer can reach the caret.** A text field has had a full selection
+model since it was written and no way to drive any of it with a mouse, because nothing mapped a
+position to a character — so a click could focus a box and nothing more. Nothing in this repo
+changed for it; the field is DIR.Lib's and the hosts that paint one get the behaviour by rebuilding.
+
+**Central package management moved up to `src/`**, matching upstream, and it closes more than it
+looks like. The file used to sit at `src/SdlVulkan.Renderer/`, which put the test, inspector and
+webview projects outside its scope — so each carried
+`ManagePackageVersionsCentrally=false` and pinned its packages inline, guarding against inheriting
+the CPM of whatever repo this fork is checked out *inside* (the viewer's, through the submodule
+layout). Three opt-outs against one hazard; one file in the right place removes the hazard, and the
+three projects take their versions from here now. `tools/HdrProbe` opts out deliberately and still
+does — it is outside `src/` altogether and pins inline for exactly the reason those three used to.
+
+**The inspector's screenshot tool hands the PNG over as bytes.** MCP SDK 2.2.0 makes
+`ImageContentBlock.FromBytes` do the right thing, which retires this fork's manual base64 round-trip
+— that workaround existed because assigning raw bytes to `Data` used to put them on the wire as the
+`data` string and fail the client's base64 validation.
+
+**`tools/HdrProbe` arrives from upstream**: one question, per connected display — can this machine
+present HDR through SDL3 + Vulkan? `--show` puts scRGB patches above SDR white on the panel, which is
+the only thing that can judge them (a screenshot clips at 1.0). Not part of the solution or the
+package build. The README's platform table now records what it measured on Windows ARM64: HDR from
+Adreno driver 31.0.170.0, while the OEM-channel 31.0.137.0 offered no `VK_EXT_swapchain_colorspace`
+at all.
+
+**Android's two long-standing blockers are cleared** by `SDL3-CS.Android` 3.4.16, taken with
+upstream's README account of it: the mismatched Java-bridge/native pair that failed SDL's runtime
+version check at launch, and the `libSDL3.so` that was not 16 KB page-aligned — a hard Google Play
+requirement, and not fixable downstream. The android TFM here remains opt-in.
+
 ## 9.0
 
 Takes DIR.Lib 9.0, which is a BREAKING release. No renderer source here references the affected
