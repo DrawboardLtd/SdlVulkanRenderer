@@ -13,6 +13,20 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 9.4
+
+**Takes DIR.Lib 9.3**, the drawboard fork's take of upstream 9.2 and 9.3: the `InputRouter` wave
+(press / drag capture, tooltips, disabled nodes, declared shortcuts, scroll targets, grid column
+sizing, sliders, selectable text) and the dropdown node with keyboard navigation of a declared menu.
+Nothing in this repo changed for it; the rebuild is what upstream's 7.40 was, and it is mandatory for
+the same reason upstream gave: the engine's records reach consumers through this package, so a
+consumer on 9.1 and a renderer on 9.3 disagree about their shapes.
+
+The number: 9.2 and 9.3 here were this fork's own releases on DIR.Lib 9.1 (the memory budget, the
+growing vertex ring), so "tracks DIR.Lib's number" has slipped by one. From here the DIR.Lib pin and
+this version move together again unless a fork-only release intervenes, and the entry says so when
+one does.
+
 ## 9.3
 
 **The per-frame vertex ring grows on demand instead of dropping draws**, taken from upstream 7.41.
