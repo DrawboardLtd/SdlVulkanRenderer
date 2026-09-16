@@ -13,6 +13,31 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 9.2
+
+**The device reports its memory BUDGET, not just its heap capacity.** `VulkanDevice.TryGetDeviceMemoryBudget`
+and `MemoryBudgetAvailable`, over `VK_EXT_memory_budget`, taken from upstream 7.39. Every residency rule
+a consumer could write until now reasoned about `vkGetPhysicalDeviceMemoryProperties`, which reports
+how large a heap IS; on a unified-memory GPU that is all of system RAM, and it reads "plenty" at the
+exact moment the machine has begun paging. The budget is what the driver will actually let this
+process have right now, and the usage beside it is what it already holds. One device-local heap is
+reported — the one this process uses most, or the largest before anything is allocated — because
+summing heaps overcounts on a unified-memory device (an Adreno here reports a 7,989 MB heap and a
+4,095 MB one, together more than the machine has), and least-headroom picks the heap nothing
+allocates from.
+
+**The instance asks the loader for Vulkan 1.1, and chained queries answer.** `VkInstanceCreateInfo`
+carried no `pApplicationInfo`, so the instance was Vulkan 1.0 by spec and every core-1.1 `*2` query
+answered through the 1.0 entry point: base struct filled, `pNext` chain silently ignored. Every
+chained physical-device query in this renderer was returning zeroes — `VkPhysicalDeviceDriverProperties`
+reported an empty driver name until the instance asked for 1.1. `SdlVulkanWindow.InstanceApiVersion()`
+asks `vkEnumerateInstanceVersion` and caps at 1.1; the offscreen test fixture asks for the same, so the
+tests cannot disagree with the renderer they test. Also from upstream: the pinch reference distance is
+named for what it is (`PinchRefDist`, re-based every dispatch) rather than for its first value.
+
+DIR.Lib stays at 9.1. This is a take of upstream's renderer changes alone; the DIR.Lib 9.2/9.3 line
+(the input router, the dropdown node) is a separate round.
+
 ## 9.1
 
 **Takes DIR.Lib 9.1, where a pointer can reach the caret.** A text field has had a full selection
