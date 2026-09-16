@@ -13,6 +13,22 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 9.3
+
+**The per-frame vertex ring grows on demand instead of dropping draws**, taken from upstream 7.41.
+`vertexBufferSize` was a fixed allocation per frame in flight, committed at startup for every window
+whatever it turned out to draw, and a frame that needed more silently lost its remaining draws. The
+viewer therefore asked for the worst case up front — 256 MB a slot, 512 MB of host-visible mapped
+memory before a document was open, which on an integrated GPU is system RAM. A frame that runs out
+now records what the whole frame needed and the slot grows at the start of its next frame, once its
+fence has retired; the two slots grow a frame apart; `SdlEventLoop` re-arms the redraw so the next
+frame paints what the overflowing one could not; capped at `VertexRingMaxBytes` (512 MB a slot).
+`VertexRingPeakBytes`, `VertexRingCapacityBytes`, `VertexRingOverflowFrames` and
+`VertexRingOverflowed` are the telemetry to size an initial ring from, and `frame_stats` in the
+inspector reports the first three.
+
+DIR.Lib stays at 9.1, as in 9.2.
+
 ## 9.2
 
 **The device reports its memory BUDGET, not just its heap capacity.** `VulkanDevice.TryGetDeviceMemoryBudget`
