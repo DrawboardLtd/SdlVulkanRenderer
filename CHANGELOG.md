@@ -13,6 +13,24 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 10.2
+
+**Takes DIR.Lib 10.2**, the drawboard fork's take of upstream 10.1 plus the fork's own 10.2: the 10.0
+cuts (`IPixelWidget.HitTestAndDispatch`, `IKeyboardClaimant`, `RenderDropdownMenu`,
+`HitResult.SliderHit(int)`, `LayoutInspection`, the public `TextInputState.Activate`/`Deactivate`),
+9.4's floated wraps, 9.5's tab chords, 10.1's faded colour glyphs -- and 10.2's popover triggers
+(`Node.Opens`, `PopoverGroup`) and tab presses (`TabItem.OnPress`/`OnClose`, `TabBar.OnNewTab`), which
+were written for the viewer this fork ships in and go upstream from here.
+
+Exactly one cut reaches this library, and it is DEBUG-only, taken as upstream's 7.43 took it:
+`describe_ui` reports a slider's VALUE (from `SliderStateHit`) where it used to report an index into a
+parallel array the consumer no longer keeps. `dotnet build -c Release` could not have caught it --
+`DebugInspector` is inside `#if DEBUG`, so the build the package is made from never compiles the line.
+
+The number jumps from 9.4 to 10.2 because this repo tracks DIR.Lib's, and DIR.Lib went to 10 across a
+breaking release. A rebuild against a breaking dependency is still a rebuild; nothing this package
+exposes changed shape.
+
 ## 9.4
 
 **Takes DIR.Lib 9.3**, the drawboard fork's take of upstream 9.2 and 9.3: the `InputRouter` wave
