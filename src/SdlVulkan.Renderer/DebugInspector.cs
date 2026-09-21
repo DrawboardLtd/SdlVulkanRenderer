@@ -1,4 +1,4 @@
-#if DEBUG
+﻿#if DEBUG
 using System.Buffers;
 using System.Globalization;
 using System.IO;
