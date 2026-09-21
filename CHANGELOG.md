@@ -13,6 +13,23 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 10.3
+
+**Atlas uploads obey the queue's `minImageTransferGranularity`.** Both font atlases flushed their
+dirty rectangle with `vkCmdCopyBufferToImage` regardless of what the queue family allows, which is
+legal only at granularity (1,1,1) — every desktop driver, hence years without a symptom. A queue
+reporting **(0,0,0)** takes whole subresources only, and Mesa's `dzn` (Vulkan over D3D12, the only
+hardware Vulkan a WSL guest can reach) reports exactly that: Khronos validation flagged every glyph
+flush as `VUID-vkCmdCopyBufferToImage-imageOffset-07738`, and the undefined behaviour showed up as
+intermittent heap corruption at teardown. `VulkanDevice` now reads the granularity once at device
+creation (`MinImageTransferGranularity`, exposed on `VulkanContext` too), and
+`ImageTransferGranularity.Snap` widens a dirty rect to something the queue accepts: untouched at
+(1,1,1), the whole subresource at (0,0,0), and rounded out to a multiple otherwise, clamped at the
+image edge, which the spec permits. The snap happens before the staging copy, so the bytes uploaded
+are the bytes the copy region claims, and the result always CONTAINS the dirty rect — a narrower one
+would leave stale texels and draw the previous glyph. `VkTexture` needed no change; it already
+copies whole images. Measured on dzn: seven validation errors a run before, none after.
+
 ## 10.2
 
 **Takes DIR.Lib 10.2**, the drawboard fork's take of upstream 10.1 plus the fork's own 10.2: the 10.0
