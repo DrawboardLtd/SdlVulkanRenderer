@@ -2267,9 +2267,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// <see cref="RectInt"/> overload, with the hole given in LOCAL units rather than pixels.
     /// </summary>
     /// <remarks>
-    /// Corners are the images of the unit square's, exactly as for
-    /// <see cref="FillEllipse((float, float), (float, float), (float, float), (float, float), DIR.Lib.RGBAColor32)"/>,
-    /// and the same parallelogram requirement applies.
+    /// Corners are the images of the unit square's, exactly as for the four-corner <c>FillEllipse</c>
+    /// above, and the same parallelogram requirement applies. (Named in prose rather than with a
+    /// cref: a cref cannot spell a tuple parameter, and one that tries parses as far as the first
+    /// comma and warns CS1658 — visible only on the android target framework, where this repo turns
+    /// documentation generation on.)
     /// <para>
     /// The hole is a fraction of the semi-diameter, so the quad must span the stroke's OUTER edge: an
     /// ellipse of semi-axis <c>a</c> stroked with width <c>w</c> centred on its own boundary is a quad
