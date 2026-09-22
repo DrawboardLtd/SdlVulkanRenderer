@@ -2290,6 +2290,107 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                                    DIR.Lib.RGBAColor32 strokeColor, float innerRadius)
         => EllipseQuad(c00, c10, c11, c01, strokeColor, Math.Clamp(innerRadius, 0f, 1f));
 
+    /// <summary>
+    /// Fills an ellipse given as a centre and its two semi-axis VECTORS — the images of local (1,0)
+    /// and (0,1). Equivalent to the corner overload, and the form that cannot be malformed: four
+    /// corners must satisfy <c>c01 == c00 + c11 - c10</c>, where two axes describe a parallelogram
+    /// by construction.
+    /// </summary>
+    /// <remarks>
+    /// Prefer this when the caller already has screen-space axes, which is what a rotation or a
+    /// projection naturally produces — e.g. a major/minor direction plus lengths. It is also the
+    /// per-instance form <see cref="DrawEllipseInstances"/> takes, so a caller that may later move
+    /// to the bulk path is already speaking its language.
+    /// </remarks>
+    public void FillEllipse((float X, float Y) centre, (float X, float Y) semiAxisU,
+                            (float X, float Y) semiAxisV, DIR.Lib.RGBAColor32 fillColor)
+        => EllipseQuad(
+            (centre.X - semiAxisU.X - semiAxisV.X, centre.Y - semiAxisU.Y - semiAxisV.Y),
+            (centre.X + semiAxisU.X - semiAxisV.X, centre.Y + semiAxisU.Y - semiAxisV.Y),
+            (centre.X + semiAxisU.X + semiAxisV.X, centre.Y + semiAxisU.Y + semiAxisV.Y),
+            (centre.X - semiAxisU.X + semiAxisV.X, centre.Y - semiAxisU.Y + semiAxisV.Y),
+            fillColor, innerRadius: 0f);
+
+    /// <summary>
+    /// Draws a ring given as a centre and its two semi-axis vectors, with the hole in local units.
+    /// The axes counterpart of the corner overload — see it for what <paramref name="innerRadius"/>
+    /// can and cannot express.
+    /// </summary>
+    public void DrawEllipseOutline((float X, float Y) centre, (float X, float Y) semiAxisU,
+                                   (float X, float Y) semiAxisV, DIR.Lib.RGBAColor32 strokeColor,
+                                   float innerRadius)
+        => EllipseQuad(
+            (centre.X - semiAxisU.X - semiAxisV.X, centre.Y - semiAxisU.Y - semiAxisV.Y),
+            (centre.X + semiAxisU.X - semiAxisV.X, centre.Y + semiAxisU.Y - semiAxisV.Y),
+            (centre.X + semiAxisU.X + semiAxisV.X, centre.Y + semiAxisU.Y + semiAxisV.Y),
+            (centre.X - semiAxisU.X + semiAxisV.X, centre.Y - semiAxisU.Y + semiAxisV.Y),
+            strokeColor, Math.Clamp(innerRadius, 0f, 1f));
+
+    /// <summary>
+    /// Floats per instance for <see cref="DrawEllipseInstances"/>: <c>centre(2), axisU(2), axisV(2),
+    /// innerRadius(1), colour(4)</c> = 11, matching the attribute layout the pipeline declares.
+    /// </summary>
+    public const int EllipseInstanceFloats = 11;
+
+    /// <summary>
+    /// Writes one instance for <see cref="DrawEllipseInstances"/> into <paramref name="dst"/>, which
+    /// must be at least <see cref="EllipseInstanceFloats"/> long. Exists so the layout is stated once
+    /// here rather than open-coded by every caller building a buffer.
+    /// </summary>
+    public static void WriteEllipseInstance(Span<float> dst, (float X, float Y) centre,
+                                            (float X, float Y) semiAxisU, (float X, float Y) semiAxisV,
+                                            float innerRadius, DIR.Lib.RGBAColor32 color)
+    {
+        dst[0] = centre.X;      dst[1] = centre.Y;
+        dst[2] = semiAxisU.X;   dst[3] = semiAxisU.Y;
+        dst[4] = semiAxisV.X;   dst[5] = semiAxisV.Y;
+        dst[6] = Math.Clamp(innerRadius, 0f, 1f);
+        dst[7] = color.RedF;    dst[8] = color.GreenF;
+        dst[9] = color.BlueF;   dst[10] = color.AlphaF;
+    }
+
+    /// <summary>
+    /// Draws every ellipse in <paramref name="instances"/> in ONE call — the bulk counterpart of
+    /// <see cref="FillEllipse(in RectInt, DIR.Lib.RGBAColor32)"/>, for when there are hundreds or
+    /// thousands of them and a call apiece would be the cost rather than the shading.
+    /// </summary>
+    /// <remarks>
+    /// Each instance carries its own hole and its own colour, so one call covers fills and rings in
+    /// mixed colours; nothing per-draw is read from the push block but the projection. Build the
+    /// buffer with <see cref="WriteEllipseInstance"/>, <see cref="EllipseInstanceFloats"/> apiece.
+    /// <para>
+    /// Instances are written to the per-frame vertex ring like any other geometry, so a buffer too
+    /// large for the remaining slot is dropped for the frame exactly as an over-long vertex run is —
+    /// the ring grows at the next frame start and the redraw succeeds.
+    /// </para>
+    /// </remarks>
+    /// <param name="instances">Tightly packed instances; length must be a multiple of
+    /// <see cref="EllipseInstanceFloats"/>.</param>
+    public void DrawEllipseInstances(ReadOnlySpan<float> instances)
+    {
+        if (_pipelines is null || instances.IsEmpty) return;
+        if (instances.Length % EllipseInstanceFloats != 0)
+        {
+            throw new ArgumentException(
+                $"Length must be a multiple of {EllipseInstanceFloats}; got {instances.Length}.",
+                nameof(instances));
+        }
+
+        var api = Surface.DeviceApi;
+        var offset = Surface.WriteVertices(instances);
+        if (offset == uint.MaxValue) return;
+
+        BindPipeline(_pipelines.EllipseInstancedPipeline);
+        fixed (float* pPC = _pushConstants)
+            api.vkCmdPushConstants(_currentCmd, Surface.PipelineLayout,
+                VkShaderStageFlags.Vertex | VkShaderStageFlags.Fragment, 0, 84, pPC);
+
+        var buffer = Surface.VertexBuffer;
+        var vkOffset = (ulong)offset;
+        api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
+        api.vkCmdDraw(_currentCmd, 6, (uint)(instances.Length / EllipseInstanceFloats), 0, 0);
+    }
+
     public override void DrawText(ReadOnlySpan<char> text, string fontFamily, float fontSize,
         DIR.Lib.RGBAColor32 fontColor, in RectInt layout, TextAlign horizAlignment = TextAlign.Center,
         TextAlign vertAlignment = TextAlign.Near)
