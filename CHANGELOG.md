@@ -13,6 +13,27 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 10.4
+
+**Ellipses can be rotated and sheared.** `FillEllipse` and `DrawEllipseOutline` took an axis-aligned
+`RectInt`, so the EllipsePipeline's ring shader — already capable of any affine placement — could
+only ever be asked for an upright ellipse. Both now have an overload taking the four corners of a
+parallelogram, the images of the unit square's corners, and what is drawn is the image of the unit
+DISC under that same map. **No shader change was needed**: the local coordinate is a plain varying,
+and interpolating it across a parallelogram inverts an affine map exactly, so a rotated or sheared
+ellipse was always one vertex-buffer write away.
+
+The `RectInt` overloads are now thin wrappers that expand the rect to its own corners and reach the
+same single draw, so the two entry points cannot drift — the guard on that compares whole
+framebuffers rather than probe pixels. The quad ring takes its hole in LOCAL units rather than
+pixels, because one scalar describes a constant stroke width exactly when the untransformed shape is
+a circle; that limit is written on the method rather than approximated silently.
+
+The rotation test is at 45° deliberately. A right-angle turn is only a swap of width and height, so
+an implementation that quietly took the bounding box of the corners would pass it; at 45° that
+bounding box is a circle covering two probes the real ellipse rejects, and a second test asserts the
+circle does cover them — so the discrimination is demonstrated rather than assumed.
+
 ## 10.3
 
 **Atlas uploads obey the queue's `minImageTransferGranularity`.** Both font atlases flushed their
