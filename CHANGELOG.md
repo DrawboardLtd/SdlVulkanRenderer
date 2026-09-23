@@ -36,6 +36,9 @@ was the OS resetting the process's GPU context after one submission ran past the
   `OnPointerInput`, read as a press already read them. `OnMouseMove` keeps its `(x, y)` shape.
 - **Breaking only through DIR.Lib 11.0**: `PixelWidgetBase.FrameCount` is gone for `CaretPhase`, and
   `TextInputRenderer.Render` takes `caretVisible`. See DIR.Lib's `MIGRATION.md`.
+- **A text field no longer crashes the paint after Backspace at a collapsed anchor.** The pinned DIR.Lib
+  carries the fix ahead of upstream: a drag that ended where it began left the selection anchor on the
+  caret, Backspace moved the caret off it, and the resulting selection ran past the end of the text.
 
 ## 10.4
 
