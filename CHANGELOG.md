@@ -13,6 +13,65 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 10.4
+
+**An ellipse can be drawn at any affine placement, anti-aliased, with a pixel-width stroke, and a
+page of them in one call.** The primitive could only be drawn upright, one at a time, with a hard
+edge; all three limits are gone, and the shape itself now lives on the abstraction.
+
+- **Rotated and sheared ellipses are DIR.Lib 10.4's shape, overridden here.** `FillEllipse` and
+  `DrawEllipse` take the four corners of a parallelogram — the images of local `(-1,-1)`,
+  `(+1,-1)`, `(+1,+1)`, `(-1,+1)` — or a centre plus two semi-axis vectors. Declaring them on
+  `Renderer<TSurface>` rather than on `VkRenderer` is what makes them reachable from a CPU surface
+  as well, for the reason `DrawTriangles` already records in its own documentation; this repo
+  supplies the one-draw override of the two virtuals and inherits the convenience forms.
+- **The shader is the pixel-distance rule the base declares, evaluated with the GPU's gradient.**
+  `ellipse.frag` and `ellipseinst.frag` take `r = |local|` and divide `r - 1` by the length of
+  `(dFdx(r), dFdy(r))`, which is a signed distance in PIXELS at any rotation, scale or shear; a fill
+  covers `clamp(0.5 - d, 0, 1)` and a stroke of width `w` covers `clamp(0.5 + w/2 - |d|, 0, 1)`. So
+  the edge is anti-aliased, and a stroke is the same pixel width at every point of every ellipse.
+  The quad is padded by `w/2 + 1` px along each axis so the rim has somewhere to land, and the
+  single-discard shape is kept for the llvmpipe reason `ellipse.frag` records.
+- **The rect ring converts nothing any more.** `DrawEllipseOutline(rect, ..)` derived a local hole
+  fraction from the LONGER semi-axis where another backend derived its own from the SHORTER, so one
+  call drew two different rings. Both now expand the rect through DIR.Lib's one
+  `Renderer.EllipseCorners` and hand the stroke to the shader as the pixel width it already was.
+- **`EllipseInstancedPipeline` is the bulk form.** One draw per ellipse is right for chrome — a few
+  dots and swatches a frame — and wrong for a drawing full of circles or a marker overlay. One
+  instance carries its centre, both semi-axis vectors, its stroke width in pixels (0 fills) and its
+  colour in 44 bytes, and the quad's six vertices come from `gl_VertexIndex` exactly as the stroke
+  pipeline already does it, so there is no per-vertex binding at all; `DrawEllipseInstances` issues
+  one `vkCmdDraw` for the lot. Colour and stroke moving from the push block to the instance is what
+  makes this a second pipeline rather than a second entry point on the first, since the fragment
+  shader has to be built for it; the rule it evaluates is the same one.
+
+**A device that rejects every submit is reported, not counted as healthy.** A rejected
+`vkQueueSubmit` (`ErrorInitializationFailed`, the Adreno driver's answer) was absorbed as one dropped
+frame — right for the two-frame transient it was measured on in August, wrong for what happened on
+2026-09-22: every frame rejected for minutes, no exception thrown, each one counted by the event loop
+as a clean frame, so no recovery was ever attempted and the window froze on its last frame over a
+process that was otherwise alive and still changing state under the clicks. `VulkanContext.LastFrameSubmitted`
+now tells the loop a dropped frame from a drawn one, so it neither ends a recovery storm nor stops
+asking for a frame, and `RejectedSubmitStreakLimit` (three) consecutive rejections throw the driver's
+own result, which puts the device through the mid-frame recovery, the backoff and the host's
+load-shed callback like any other mid-frame failure. What it does NOT do, and what remains open, is
+recreate the device: one that stays dead across recoveries still leaves the window frozen on its last
+frame, which is the least bad outcome available to a renderer that does not own the host's GPU
+resources.
+
+**Takes DIR.Lib 10.4**, the release that declares the shape and states the rule, so the submodule pin
+moves with it. The number matches because this repo tracks DIR.Lib's.
+
+Fourteen ellipse tests, all running on the GPU rather than skipping, and the ones that matter measure
+rather than probe: a 2:1 ellipse stroked 3 px reads 3 px across the major axis AND the minor (the
+hole fraction this replaces read 1.5 across the minor), an edge pixel the boundary crosses just past
+its centre reads a fraction where the single-discard shader read 0 or 255 and nothing between, and
+one instance matches the single-draw path to one level of one channel, for a fill and for a stroke.
+The rotation case is at 45 degrees on purpose: a right-angle turn is only a swap of width and height,
+so a bounding-box implementation would pass it, while at 45 degrees that bounding box is a circle
+covering two probes the real ellipse rejects — and a second test asserts the circle does cover them.
+Full suite 74 passed, 3 skipped (validation-layer, ubuntu-only), 0 failed.
+
 ## 10.3
 
 **Atlas uploads obey the queue's `minImageTransferGranularity`.** Both font atlases flushed their
