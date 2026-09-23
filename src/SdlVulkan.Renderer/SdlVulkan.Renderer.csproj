@@ -147,7 +147,6 @@
     <Compile Remove="Android/**/*.cs" />
   </ItemGroup>
 
-
   <ItemGroup>
     <!-- The inspector's request parsing decides what an injected key or click MEANS, and getting that wrong
          looks like the app misbehaving rather than like a bad request. Reachable only through a live SDL
