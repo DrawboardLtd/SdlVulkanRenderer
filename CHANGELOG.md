@@ -13,6 +13,30 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.0
+
+**Every frame's GPU time is measured, and a window renders at most once per display refresh**, on
+DIR.Lib 11.0. Upstream's 7.47, taken whole. Both came out of the same wedge: every GPU wedge on record
+was the OS resetting the process's GPU context after one submission ran past the Windows GPU timeout,
+2 s by default (LiveKernelEvent 141), and nothing logged could say what ran long.
+
+- **GPU frame timing.** Each frame is bracketed with timestamp queries outside the render pass and
+  read back once its fence has been waited, so the readback never stalls. `LastGpuFrameMs`,
+  `PeakGpuFrameMs`, `SlowGpuFrames`, and `LastGpuSections` from `BeginGpuSection`/`EndGpuSection`;
+  a frame over `SlowGpuFrameBudgetMs` (250 ms) is logged as event 208 with its sections. Sections
+  are accurate on an immediate-mode GPU and only a hint on a tiler, which may bin the whole pass.
+- **Frame pacing.** The loop drew a frame per redraw request, and the swapchain prefers Mailbox,
+  which never waits for vblank, so a surface asking for a redraw on every pointer move drew at the
+  mouse's report rate. Each clean frame now sets the window's next due time one display refresh
+  (read from SDL, re-read once a second) after the frame started; requests before then fold into
+  that frame, and the loop waits for exactly the time until it is due rather than spinning.
+- **Inspector.** `frame_stats` reports `framesBegun` (sample twice for a frame rate) and the GPU
+  timing; `move` takes `mods`, carried on every motion event.
+- **A pointer move carries the keyboard's modifiers** (DIR.Lib 11.0's `MouseMove.Modifiers`) on
+  `OnPointerInput`, read as a press already read them. `OnMouseMove` keeps its `(x, y)` shape.
+- **Breaking only through DIR.Lib 11.0**: `PixelWidgetBase.FrameCount` is gone for `CaretPhase`, and
+  `TextInputRenderer.Render` takes `caretVisible`. See DIR.Lib's `MIGRATION.md`.
+
 ## 10.4
 
 **An ellipse can be drawn at any affine placement, anti-aliased, with a pixel-width stroke, and a
