@@ -64,6 +64,9 @@ internal static partial class LogEvents
     [LoggerMessage(114, LogLevel.Error, "[SdlEventLoop] AbortFrame after a mid-frame exception threw: {ExceptionType}: {ExceptionMessage}")]
     public static partial void AbortFrameThrew(this ILogger logger, string exceptionType, string exceptionMessage);
 
+    [LoggerMessage(117, LogLevel.Critical, "[SdlEventLoop] device is not taking work: {Recoveries} recoveries over {ElapsedMs}ms with no clean frame ({Result}, window {WindowId}); treating it as lost and stopping.")]
+    public static partial void DeviceNotTakingWork(this ILogger logger, int recoveries, long elapsedMs, VkResult result, uint windowId);
+
     [LoggerMessage(115, LogLevel.Critical, "[SdlEventLoop] device lost mid-frame (window {WindowId}); terminal by spec, abandoning the device without attempting swapchain recovery.")]
     public static partial void DeviceLostTerminal(this ILogger logger, uint windowId);
 
@@ -72,6 +75,19 @@ internal static partial class LogEvents
 
     [LoggerMessage(209, LogLevel.Information, "[VulkanContext] GPU frame timing unavailable on this queue (timestampValidBits = 0); LastGpuFrameMs stays NaN.")]
     public static partial void GpuTimingUnsupported(this ILogger logger);
+
+    [LoggerMessage(212, LogLevel.Information, "[VulkanContext] frame did not reach the queue ({Why}); put {Count} piece(s) of recorded work back in line for the next frame.")]
+    public static partial void FrameDroppedWorkRequeued(this ILogger logger, int count, string why);
+
+#if DEBUG
+    // Warning, not Information: a log carrying a faked wedge must say so where anyone reading it for a
+    // real one will look, because the lines the renderer writes in reply (201, 202, 207) are the real ones.
+    [LoggerMessage(210, LogLevel.Warning, "[VulkanContext] GPU FAULT INJECTION armed (DEBUG): {Fault}. The submit failures that follow are faked; nothing is sent to the GPU while it is armed.")]
+    public static partial void GpuFaultArmed(this ILogger logger, string fault);
+
+    [LoggerMessage(211, LogLevel.Warning, "[VulkanContext] GPU FAULT INJECTION cleared (DEBUG) after {Faked} faked submit result(s) on this device.")]
+    public static partial void GpuFaultCleared(this ILogger logger, long faked);
+#endif
 
     [LoggerMessage(207, LogLevel.Error, "[VulkanContext] {Streak} consecutive vkQueueSubmit rejections (ErrorInitializationFailed): the device is not taking work; escalating to mid-frame recovery.")]
     public static partial void SubmitRejectedStreak(this ILogger logger, int streak);

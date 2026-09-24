@@ -52,6 +52,20 @@ public sealed class SdlEventLoop
     // so the app can shed load (switch to a cheap view, reset a runaway). 2 => the 3rd quick recovery.
     private const int RenderDegradedStreakThreshold = 2;
 
+    // A device that keeps refusing work is dead, whatever it answers. The mid-frame recovery had no end:
+    // with every submit rejected (the Adreno X1-85 after an engine reset, faked with GpuFaultInjection)
+    // it rebuilt sync and swapchain about 1.8 times a second, forever, over a frozen window, and the
+    // recover streak could not bound it because its own backoff reaches the 1 s gap that resets the
+    // streak. So recoveries are counted since the last CLEAN frame, from the first failure after it, and
+    // both bounds must be met: enough attempts that it is not one bad moment, over long enough that the
+    // load-shed request (fired at the third quick recovery) has had its chance to make the frame cheap.
+    // About 5 s at the measured rate; the driver's own transient (two rejections, then work resumes)
+    // never reaches a recovery at all. Only a REFUSAL counts (VK_ERROR_INITIALIZATION_FAILED, what the
+    // rejected submits and a refused one-shot throw): an error the app causes every frame, an image too
+    // large to allocate say, is a bug to report, not a dead device, and must not end the process.
+    private const int DeadDeviceRecoveryLimit = 8;
+    private const long DeadDeviceWindowMs = 5000;
+
 #if DEBUG
     // Slow-frame diagnostics: a rolling average of real frame time (BeginFrame->EndFrame) plus a
     // threshold, so ANY stall (atlas evict/grow drain, heavy tessellation, a present hitch) logs one
@@ -505,6 +519,8 @@ public sealed class SdlEventLoop
             v.NextRenderAttemptTick = 0;
             v.LastCleanFrameTick = Environment.TickCount64;
             v.RecoverStreak = 0; // a clean frame ends any recovery storm accounting
+            v.RecoveriesSinceCleanFrame = 0; // ... and proves the device is taking work
+            v.FailingSinceTick = 0;
             v.StuckEscalations = 0; // ... and any stuck-fence escalation streak
             v.RenderDegradedNotified = false; // re-arm the load-shed request for the next storm
 
@@ -525,6 +541,17 @@ public sealed class SdlEventLoop
             // tearing the swapchain down on the FIRST timeout is what used to sustain recovery storms.
             if (vk.Result == VkResult.Timeout)
             {
+                // A timeout from INSIDE a frame (a one-shot upload that gave up, see
+                // VulkanDevice.ExecuteOneShot) leaves the frame begun, with an image acquired: resolve it
+                // first, as the non-Vulkan catch below does, or the retry acquires again over a signalled
+                // semaphore. A no-op in the usual case, BeginFrame's own fence wait, which throws before it
+                // begins anything.
+                try { renderer.AbortFrame(); }
+                catch (Exception abort)
+                {
+                    SdlVulkanLog.Logger.AbortFrameThrew(abort.GetType().Name, abort.Message);
+                }
+
                 if (v.FenceStuckSinceTick == 0)
                 {
                     v.FenceStuckSinceTick = now;
@@ -593,6 +620,23 @@ public sealed class SdlEventLoop
             // aggressive — try to rebuild sync + swapchain for this window and continue. Device loss
             // is handled above, so "recovering" is now always something this path can actually do.
             SdlVulkanLog.Logger.VulkanErrorMidFrame(v.Window.WindowId, vk.Result);
+
+            // Declared dead, not recovered again: see DeadDeviceRecoveryLimit. The same terminal hand-off
+            // as a device loss, which is what a device refusing all work is in every way that matters.
+            if (vk.Result == VkResult.ErrorInitializationFailed)
+            {
+                if (v.FailingSinceTick == 0) v.FailingSinceTick = now;
+                v.RecoveriesSinceCleanFrame++;
+            }
+            if (v.RecoveriesSinceCleanFrame >= DeadDeviceRecoveryLimit && now - v.FailingSinceTick >= DeadDeviceWindowMs)
+            {
+                SdlVulkanLog.Logger.DeviceNotTakingWork(v.RecoveriesSinceCleanFrame, now - v.FailingSinceTick, vk.Result, v.Window.WindowId);
+                try { v.OnGpuWedged?.Invoke(); }
+                catch (Exception ex) { SdlVulkanLog.Logger.OnGpuWedgedHandlerThrew(ex.GetType().Name, ex.Message); }
+                _running = false;
+                return false;
+            }
+
             try
             {
                 // Track consecutive recoveries (errors within 1s of each other) so we can back off
@@ -614,15 +658,14 @@ public sealed class SdlEventLoop
                 v.Window.GetSizeInPixels(out var sw, out var sh);
                 if (sw > 0 && sh > 0)
                 {
-                    renderer.RecoverFromGpuError();
-                    // Only re-run layout when the size actually changed — during a recovery storm
-                    // the size is unchanged, and re-notifying every cycle is pure churn.
-                    if ((uint)sw != v.LastRecoverW || (uint)sh != v.LastRecoverH)
-                    {
-                        v.OnResize?.Invoke((uint)sw, (uint)sh);
-                        v.LastRecoverW = (uint)sw;
-                        v.LastRecoverH = (uint)sh;
-                    }
+                    // On the sacrificial task, never this thread, exactly as the stuck-fence escalation
+                    // does: the rebuild tears down sync objects and the swapchain, and on a device that is
+                    // truly hung the driver can block INSIDE those calls (the 2026-07-10 dump). Run here, that
+                    // froze the window with no deadline; there, the poll at the top of this method bounds it
+                    // (GpuWedgeRecoveryDeadlineMs, then abandon and OnGpuWedged) and, on completion, re-runs
+                    // layout only if the size changed while it ran, as this used to.
+                    v.GpuRecoveryTask = Task.Run(renderer.RecoverFromGpuError);
+                    v.GpuRecoveryDeadlineTick = now + GpuWedgeRecoveryDeadlineMs;
                 }
                 v.NeedsRedraw = true;
 

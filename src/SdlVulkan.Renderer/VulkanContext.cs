@@ -37,6 +37,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // poll and rendering resumes with zero teardown.
     private const ulong FenceWaitTimeoutNs = 500_000_000UL;
     private const ulong FenceStuckPollTimeoutNs = 10_000_000UL;
+    // Set when a swapchain image acquire timed out; later attempts then poll with the short timeout, as a
+    // stuck fence's do, so the loop stays responsive. Cleared by the next acquire that succeeds.
+    private bool _acquireStuck;
     // Cap (ns) for the device drain on the UI-thread recovery/resize paths (see TryDrainDevice).
     // 1s is well past any legitimate frame; reaching it means the GPU is genuinely wedged, in
     // which case we force the teardown rather than block the UI thread on an unbounded wait.
@@ -278,13 +281,24 @@ public sealed unsafe partial class VulkanContext : IDisposable
             var now = Volatile.Read(ref _frameOrdinal);
             var last = ord == 0 ? "NEVER" : $"frame {ord} ({now - ord} frame(s) ago)";
             var rejected = Interlocked.Read(ref _submitsRejected);
-            return $"ledger: waiting fence[{idx}], last submit under it {last}" +
+            var ledger = $"ledger: waiting fence[{idx}], last submit under it {last}" +
                    (Volatile.Read(ref _submitPending[idx]) == 0 ? " (NOTHING PENDING)" : "") +
                    $"; frames {now}, submits {Interlocked.Read(ref _submitsTotal)}" +
                    (rejected > 0 ? $", REJECTED {rejected}" : "") +
                    (_deviceLost ? "; DEVICE_LOST seen" : "");
+#if DEBUG
+            // The breadcrumb is what a wedge report is read from, so it has to say when the wedge is ours.
+            if (_dev.FaultInjection.Describe() is { } fault) ledger += $"; {fault}";
+#endif
+            return ledger;
         }
     }
+
+#if DEBUG
+    /// <summary>DEBUG-only: this context's device's fault switch (see <see cref="GpuFaultInjection"/>). The
+    /// fault belongs to the device, so under a shared device arming it here reaches every window.</summary>
+    public GpuFaultInjection FaultInjection => _dev.FaultInjection;
+#endif
 
     /// <summary>
     /// Replace one frame index's image-available semaphore after a submit the driver rejected. The acquire
@@ -558,6 +572,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // objects the host is now entitled to free.
         if (_abandoned) return;
 
+        // A frame begun before the error dies below with its command buffer, and so does every upload
+        // it recorded. Put them back in line while the frame index still names the frame they rode.
+        if (_recordingFrameCmd != VkCommandBuffer.Null)
+            NoteFrameDropped("recovery discarded the frame");
+
         // Flush the present queue (VUID-...-01282 / -05149) before the sync-object teardown and
         // CleanupSwapchain below, on the same drain-succeeded gate as the resize path.
         FlushPresentQueueAfterDrain(drained);
@@ -734,6 +753,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     {
         AssertFrameThread(nameof(BeginFrame));
         resized = false;
+        NoteUnendedFrameDropped();
         var fence = _inFlightFences[_currentFrame];
         // Bounded wait. We rely on the submit signaling this fence — including on drivers (Adreno
         // X1-85) where vkQueueSubmit returns a bogus error yet still signals normally. If a fence is
@@ -759,6 +779,33 @@ public sealed unsafe partial class VulkanContext : IDisposable
         NoteDeviceLost(waitResult, "vkWaitForFences");
         waitResult.CheckResult();
         _fenceWaitStuck = false;
+
+        // Acquired HERE, before anything below advances frame state, and bounded. Unbounded (UINT64_MAX)
+        // it may block for good once every image is held, which is where rejected submits lead: a frame
+        // the driver refused skips its present, so its image is never handed back. A timeout is thrown
+        // like the fence wait's, for the same non-destructive retry and, if it persists, the escalation
+        // whose rebuild releases every image. It must precede the ordinal bump: a retry after the bump
+        // would count a frame that never ran, and the deferred destroys keyed on the ordinal would run
+        // under a frame still in flight.
+        var result = DeviceApi.vkAcquireNextImageKHR(Swapchain,
+            _acquireStuck ? FenceStuckPollTimeoutNs : FenceWaitTimeoutNs,
+            _imageAvailableSemaphores[_currentFrame], VkFence.Null, out _currentImageIndex);
+        NoteDeviceLost(result, "vkAcquireNextImageKHR");
+        if (result is VkResult.Timeout or VkResult.NotReady)
+        {
+            _acquireStuck = true;
+            throw new VkException(VkResult.Timeout, "swapchain image acquire timed out: every image is held");
+        }
+        _acquireStuck = false;
+        if (result == VkResult.ErrorOutOfDateKHR)
+        {
+            resized = true;
+            return VkCommandBuffer.Null;
+        }
+        // Any other failure (the surface lost, the device lost) must not reach a frame recorded against an
+        // image that was never acquired. Thrown before any state below moves.
+        if (result != VkResult.SuboptimalKHR) result.CheckResult();
+
         // The fence proves this slot's last submission finished, so what it measured is readable now.
         CollectGpuTiming(_currentFrame);
         _frameOrdinal++;
@@ -773,17 +820,6 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // Same contract for the DEBUG-only inspector screenshot capture (a partial method, so the
         // call compiles away in Release along with its implementation file).
         ConsumePresentCaptureReadback();
-
-        var result = DeviceApi.vkAcquireNextImageKHR(Swapchain, ulong.MaxValue,
-            _imageAvailableSemaphores[_currentFrame], VkFence.Null, out _currentImageIndex);
-
-        NoteDeviceLost(result, "vkAcquireNextImageKHR");
-
-        if (result == VkResult.ErrorOutOfDateKHR)
-        {
-            resized = true;
-            return VkCommandBuffer.Null;
-        }
 
         // NOTE: the fence is deliberately NOT reset here — see EndFrame, which resets it immediately
         // before the submit that signals it.
@@ -801,6 +837,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // instead means an abandoned frame leaves the fence SIGNALED and the next frame proceeds.
         var cmd = _commandBuffers[_currentFrame];
         DeviceApi.vkResetCommandBuffer(cmd, 0);
+        BeginFrameRecording(cmd);
 
         VkCommandBufferBeginInfo beginInfo = new()
         {
@@ -812,6 +849,8 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // buffer that must be resolved by a submit. AbortFrame does that when the frame is abandoned.
         _frameBegun = true;
         _renderPassBegun = false;
+        // Uploads a dropped frame carried away, recorded again before anything else this frame draws.
+        RecordRequeuedTextureUploads(cmd);
 
         // Grow the ring if the last frame in this slot ran out, and reset its cursor. Legal here
         // because the slot's fence was waited on above.
@@ -905,7 +944,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // between the two halves of this frame's queue work.
         VkResult presentResult;
         _dev.AssertQueueThread(nameof(SubmitFrame));
-        var submitResult = DeviceApi.vkQueueSubmit(GraphicsQueue, 1, &submitInfo, frameFence);
+        var submitResult = _dev.QueueSubmit(&submitInfo, frameFence);
         RenderDiag.Vk("submit", submitResult, $"frame={_currentFrame} img={_currentImageIndex}");
         NoteDeviceLost(submitResult, "vkQueueSubmit");
 
@@ -941,6 +980,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
             Interlocked.Increment(ref _submitsTotal);
             _rejectedSubmitStreak = 0;
             LastFrameSubmitted = true;
+            NoteFrameSubmitted();
         }
         else if (submitResult == VkResult.ErrorInitializationFailed)
         {
@@ -953,12 +993,11 @@ public sealed unsafe partial class VulkanContext : IDisposable
             // covered before.
             Volatile.Write(ref _submitPending[_currentFrame], 0);
             ReplaceImageAvailableSemaphore(_currentFrame);
-            // A thumbnail copy recorded into this frame died with it. Cancel it, or the next
-            // BeginFrame on this index — which skips the fence wait, there being nothing to wait
-            // for — would snapshot a readback buffer the GPU never wrote.
-            if (_thumbPending && _thumbPendingIndex == _currentFrame)
-                _thumbPending = false;
-            CancelPresentCaptureOnRejectedSubmit();
+            // Everything this frame recorded died with it: the uploads it carried go back in line, and a
+            // thumbnail copy on this index is cancelled, or the next BeginFrame on it — which skips the
+            // fence wait, there being nothing to wait for — would snapshot a readback buffer the GPU
+            // never wrote.
+            NoteFrameDropped("submit rejected");
             _frameBegun = false;
             _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
             LastFrameSubmitted = false;
@@ -984,6 +1023,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
             // take, so nothing will ever signal it. Clear the mark before throwing, or the throw leaves
             // the trap behind for whatever recovers.
             Volatile.Write(ref _submitPending[_currentFrame], 0);
+            NoteFrameDropped("submit failed");
             submitResult.CheckResult();
         }
 
@@ -1015,6 +1055,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
     public void AbortFrame()
     {
         if (!_frameBegun) return;
+        // A frame that threw inside a cached-layer pass still has it open; ending the command buffer
+        // inside a render pass is invalid, so close it first (it and the main pass never nest).
+        if (_inLayerPass) EndCachedLayerPass(_commandBuffers[_currentFrame]);
         // endRenderPass tracks reality: a frame that died before BeginRenderPass must not have
         // vkCmdEndRenderPass recorded into it (illegal), but still needs the submit to retire its
         // semaphore and fence.
@@ -1025,7 +1068,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // (a file wrapped in #if DEBUG). Partial methods with no implementation have their calls removed
     // by the compiler, so a Release build carries neither the code nor the call sites.
     partial void RecordPresentCapture(VkCommandBuffer cmd);
-    partial void CancelPresentCaptureOnRejectedSubmit();
+    partial void CancelPresentCaptureOnDroppedFrame();
     partial void ConsumePresentCaptureReadback();
     partial void CleanupPresentCapture();
 
