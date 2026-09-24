@@ -13,6 +13,32 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.3
+
+**Work recorded into a frame that never reaches the queue is recorded again, every wait in a frame is
+bounded, and a GPU wedge can be faked on demand**, on DIR.Lib 11.3. Upstream's 7.48, taken whole.
+
+- **Nothing recorded into a dropped frame is lost.** Glyph-atlas flushes, deferred texture uploads and a
+  cached-layer pass advanced their bookkeeping when RECORDED, so a frame the driver refused, one whose
+  submit failed, one recovery discarded or one begun and never ended took the work with it and nothing
+  uploaded it again: a notification written during a rejected-submit storm lost every letter first drawn
+  then. `VulkanContext.OnFrameDropped(cmd, rollback)` registers the undo, run exactly when the frame does
+  not reach the queue (DIR.Lib 11.2's `SdfFontAtlas.RequeueUpload` for the atlases). A swapchain image
+  whose frame was dropped repaints in full.
+- **No unbounded wait on the render thread.** `ExecuteOneShot` waits on a fence for at most 5 s and then
+  marks the device stuck and throws `VkException(Timeout)`; the swapchain acquire waits 500 ms; the
+  mid-frame recovery runs on the sacrificial task, as the fence-stall recovery does. A device that keeps
+  refusing work (eight `VK_ERROR_INITIALIZATION_FAILED` recoveries with no clean frame, over 5 s) is
+  declared dead and handed to `OnGpuWedged`.
+- **`VulkanContext.QueueTextureUpload(texture)`** records a deferred texture's upload at the start of the
+  next frame, for a texture made where a one-shot would block or submit mid-frame.
+- **A GPU wedge can be faked (DEBUG).** `GpuFaultInjection` on `VulkanDevice.FaultInjection` answers
+  submits with a rejected submit or a lost device instead of submitting; the inspector's `gpu_fault` arms
+  it in a live app. Compiled out of Release.
+- **DIR.Lib 11.3**: `ManagedFontRasterizer.TryDrawGlyphOutline`, a glyph's outline from an SFNT or an
+  embedded Type 1 face, for a vector consumer (the viewer's print path). 11.1's declared ButtonGroup,
+  Checkbox and DoubleClickable come with it.
+
 ## 11.0
 
 **Every frame's GPU time is measured, and a window renders at most once per display refresh**, on
