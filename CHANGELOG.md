@@ -13,6 +13,22 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.4
+
+**MTSDF text keeps strokes thinner than a pixel**, still on DIR.Lib 11.3. Upstream's 7.51, taken ahead
+of the rest of 7.49-7.51 because the viewer needs it now; the next sync round finds it already here.
+
+`sdf.frag` took a pixel's coverage from one sample of the distance field at its centre, blended over half
+a pixel, and across a stroke thinner than a pixel two neighbouring centres can both fall just outside it.
+The viewer drew an arXiv paper's Times `a` at reading size (29 px/em) without the hairline top of its
+bowl, and thinned `n`, `e` and `o`. The shader now averages four samples on a rotated grid inside the
+pixel, each over a quarter pixel, reaching at most 4.5 texels so no other glyph's ink is ever read; the
+`sdfEdge` push constant carries that per-sample band (`VkSdfFontAtlas.SampleHalfBand`, clamped at 0.45).
+Against exact area coverage: mean error 0.032 to 0.012, worst pixel 0.63 to 0.28. The new
+`MtsdfTextRenderTests` case draws hyphens at eight sub-pixel phases, whose ink varied 0.16 to 5.82 px²
+with the phase alone and now varies 3.07 to 3.32. Cost: four texture reads per text fragment instead of
+one.
+
 ## 11.3
 
 **Work recorded into a frame that never reaches the queue is recorded again, every wait in a frame is
