@@ -29,8 +29,10 @@ not 16**. The space around a cell holds whatever the page held before (the atlas
 and upstream's CI caught samples that strayed there picking up an earlier test's glyphs.
 Against exact area coverage: mean error 0.032 to 0.012, worst pixel 0.63 to 0.28. The new
 `MtsdfTextRenderTests` case draws hyphens at eight sub-pixel phases, whose ink varied 0.16 to 5.82 px²
-with the phase alone and now varies 3.07 to 3.32. Cost: four texture reads per text fragment instead of
-one, and twice the vertex bytes per glyph.
+with the phase alone and now varies 3.07 to 3.32. Text of 64 px/em and up, where one sample is as good
+as four, draws through a one-sample pipeline of its own (`SdfLargePipeline`, `sdflarge.frag`) and costs
+what it did. At reading size (29 px/em) a page of text costs about 0.6-1 ms more GPU a frame (Adreno
+X1-85, 1802×2332), and an SDF vertex is twice the bytes it was.
 
 ## 11.3
 
