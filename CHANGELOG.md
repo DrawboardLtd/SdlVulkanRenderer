@@ -13,6 +13,23 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.5
+
+**MTSDF text at pdfium's weight, for about half 11.4's cost**, still on DIR.Lib 11.3. Upstream's 7.52, taken
+ahead of the rest of upstream's 7.49-7.52 like 11.4 was.
+
+11.4 drew text at exact area coverage, which kept thin strokes but turned out about 11% lighter than pdfium (and
+so DB PDF), which draws small text heavier than its outlines. Both text shaders now shift the edge 0.1 px
+outward, bringing the ink to within 2-3% of pdfium's at 150-300 dpi at no cost, and small text takes two
+samples a pixel on a diagonal instead of four: a page of reading-size text takes 1.21 ms of GPU a frame against
+1.46 with four and 0.82 before 11.4 (Adreno X1-85, 1802×2332). The `sdfEdge` push constant is now one screen
+pixel in field units (`VkSdfFontAtlas.FieldUnitsPerPixel`, replacing `SdfEdgeConstant`). The thin-stroke test
+moves to 9 px/em, where one sample scores 0.38 and two 0.95.
+
+11.4's entry says the large-text pipeline is separate because a branch inside one shader kept the four-sample
+cost. That was measured on a page below the threshold, where the branch was never taken; the claim is unproven,
+and the separate pipeline stands on its own measurement.
+
 ## 11.4
 
 **MTSDF text keeps strokes thinner than a pixel**, still on DIR.Lib 11.3. Upstream's 7.51, taken ahead
