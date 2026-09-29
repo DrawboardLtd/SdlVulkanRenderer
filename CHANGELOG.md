@@ -13,6 +13,12 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.7
+
+**A text field can be a password field**, on DIR.Lib 11.7: `TextInputState.IsMasked` draws the value as bullets,
+measures the bullets for the caret and clicks, keeps the value off the clipboard, and takes the whole value for
+word motions. Nothing in the renderer changes; the viewer's password prompt is the first field to use it.
+
 ## 11.6
 
 **CFF and Type 1 text keeps its hairlines, and all text draws at pdfium's weight**, on DIR.Lib 11.6.
