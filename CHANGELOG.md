@@ -22,12 +22,15 @@ of the rest of 7.49-7.51 because the viewer needs it now; the next sync round fi
 a pixel, and across a stroke thinner than a pixel two neighbouring centres can both fall just outside it.
 The viewer drew an arXiv paper's Times `a` at reading size (29 px/em) without the hairline top of its
 bowl, and thinned `n`, `e` and `o`. The shader now averages four samples on a rotated grid inside the
-pixel, each over a quarter pixel, reaching at most 4.5 texels so no other glyph's ink is ever read; the
-`sdfEdge` push constant carries that per-sample band (`VkSdfFontAtlas.SampleHalfBand`, clamped at 0.45).
+pixel, each over a quarter pixel; the `sdfEdge` push constant carries that per-sample band
+(`VkSdfFontAtlas.SampleHalfBand`, clamped at 0.45). Every sample is clamped to half a texel inside the
+glyph's own atlas cell, which a new `sdf.vert` passes as a flat attribute, so **an SDF vertex is 32 bytes,
+not 16**. The space around a cell holds whatever the page held before (the atlas never clears a page),
+and upstream's CI caught samples that strayed there picking up an earlier test's glyphs.
 Against exact area coverage: mean error 0.032 to 0.012, worst pixel 0.63 to 0.28. The new
 `MtsdfTextRenderTests` case draws hyphens at eight sub-pixel phases, whose ink varied 0.16 to 5.82 px²
 with the phase alone and now varies 3.07 to 3.32. Cost: four texture reads per text fragment instead of
-one.
+one, and twice the vertex bytes per glyph.
 
 ## 11.3
 
