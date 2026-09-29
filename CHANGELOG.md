@@ -15,24 +15,24 @@ this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
 ## 11.4
 
-**MTSDF text keeps strokes thinner than a pixel**, still on DIR.Lib 11.3. Upstream's 7.51, taken ahead
-of the rest of 7.49-7.51 because the viewer needs it now; the next sync round finds it already here.
+**MTSDF text keeps strokes thinner than a pixel, at pdfium's weight**, still on DIR.Lib 11.3. Upstream's
+7.51, taken ahead of the rest of 7.49-7.51 because the viewer needs it now; the next sync round finds it
+already here.
 
-`sdf.frag` took a pixel's coverage from one sample of the distance field at its centre, blended over half
-a pixel, and across a stroke thinner than a pixel two neighbouring centres can both fall just outside it.
-The viewer drew an arXiv paper's Times `a` at reading size (29 px/em) without the hairline top of its
-bowl, and thinned `n`, `e` and `o`. The shader now averages four samples on a rotated grid inside the
-pixel, each over a quarter pixel; the `sdfEdge` push constant carries that per-sample band
-(`VkSdfFontAtlas.SampleHalfBand`, clamped at 0.45). Every sample is clamped to half a texel inside the
-glyph's own atlas cell, which a new `sdf.vert` passes as a flat attribute, so **an SDF vertex is 32 bytes,
-not 16**. The space around a cell holds whatever the page held before (the atlas never clears a page),
-and upstream's CI caught samples that strayed there picking up an earlier test's glyphs.
-Against exact area coverage: mean error 0.032 to 0.012, worst pixel 0.63 to 0.28. The new
-`MtsdfTextRenderTests` case draws hyphens at eight sub-pixel phases, whose ink varied 0.16 to 5.82 px²
-with the phase alone and now varies 3.07 to 3.32. Text of 64 px/em and up, where one sample is as good
-as four, draws through a one-sample pipeline of its own (`SdfLargePipeline`, `sdflarge.frag`) and costs
-what it did. At reading size (29 px/em) a page of text costs about 0.6-1 ms more GPU a frame (Adreno
-X1-85, 1802×2332), and an SDF vertex is twice the bytes it was.
+The viewer drew an arXiv paper's Times `a` at reading size (29 px/em) without the hairline top of its bowl,
+and thinned `n`, `e` and `o`: `sdf.frag` took a pixel's coverage from one sample at its centre, and across a
+stroke thinner than a pixel two neighbouring centres can both fall just outside it. Text below 64 px/em now
+takes two samples a pixel on a diagonal, and both text shaders shift the edge 0.1 px outward, which brings
+small text to within 3% of pdfium's ink (exact coverage was about 11% lighter, pdfium drawing small text
+heavier than its outlines). Every sample is clamped half a texel inside the glyph's own atlas cell, which a
+new `sdf.vert` passes as a flat attribute, so **an SDF vertex is 32 bytes, not 16**: the atlas never clears a
+page, and upstream's CI caught samples outside a cell picking up an earlier test's glyphs. Text of 64 px/em
+and up draws through a one-sample pipeline of its own (`SdfLargePipeline`, `sdflarge.frag`). The `sdfEdge`
+push constant is one screen pixel in field units (`VkSdfFontAtlas.FieldUnitsPerPixel`).
+
+The new `MtsdfTextRenderTests` case draws hyphens at eight sub-pixel phases at 9 px/em: one sample's ink
+varied 0.38:1 with the phase alone, two samples' holds to 0.95. Cost, on an Adreno X1-85 at 1802×2332: a
+page of reading-size text takes 1.21 ms of GPU a frame against 0.82 before, and large text what it did.
 
 ## 11.3
 
