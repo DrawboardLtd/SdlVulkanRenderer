@@ -13,6 +13,14 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.9
+
+**A thumbnail capture completes on an offscreen context**, still on DIR.Lib 11.8. Upstream's 7.54.
+`BeginOffscreenFrame` mirrors the swapchain `BeginFrame`'s contract after its fence wait but never snapshotted
+a recorded capture, so offscreen one was recorded and never came back: `ThumbnailCaptureBusy` stayed true and
+no later capture could start. One call, where the swapchain path makes it; `OffscreenThumbnailCaptureTests`
+fails without it. The viewer needed it to test its own capture logic headlessly.
+
 ## 11.8
 
 **A host can keep running after its GPU is declared wedged, and `OnLoopIteration` is public**, on DIR.Lib 11.8.
