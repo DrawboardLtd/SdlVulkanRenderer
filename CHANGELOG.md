@@ -13,6 +13,27 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.8
+
+**A host can keep running after its GPU is declared wedged, and `OnLoopIteration` is public**, on DIR.Lib 11.8.
+Upstream's 7.49 and 7.50, the two releases 11.4 skipped when it took 7.51 ahead of them. Additive.
+
+- **`SdlWindowView.IsGpuWedged`**, true once `OnGpuWedged` fires and never cleared. The loop then treats that
+  window as inert: no render, no swapchain resize, no recovery poll, while its events are still dispatched, so
+  `Run` can be called again and the window stays movable and closable.
+- **Every path that gives up on the device now tells the host.** A recovery task that faulted, and a recovery
+  that threw while starting, used to stop the loop without firing `OnGpuWedged`, which a host could only read as
+  the user quitting. All six terminal paths go through one hand-off; for the viewer, whose handler restarts it
+  in a successor process, those two paths now restart where they used to stop.
+- **The single-window loop forwards `OnGpuWedged` and `IsGpuWedged`**, as it already forwarded `OnRenderDegraded`.
+- **`SdlEventLoop.OnLoopIteration` is public in every configuration**: it fires every loop iteration whether or
+  not anything was drawn, so it is proof of life for a host that must tell something else it is not frozen. It
+  was DEBUG-only and internal. `OnPostFrame`'s summary no longer claims to run every iteration.
+- DEBUG: the inspector's screenshot answers at once, with an error, on a wedged window.
+
+DIR.Lib 11.8 adds `PixelWidgetBase.InterfaceScale`, a widget's own scale over the window's DPI; nothing here
+uses it.
+
 ## 11.7
 
 **A text field can be a password field**, on DIR.Lib 11.7: `TextInputState.IsMasked` draws the value as bullets,
