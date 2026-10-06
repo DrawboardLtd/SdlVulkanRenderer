@@ -13,6 +13,16 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.10
+
+**The stroke shader draws round caps**, still on DIR.Lib 11.8. Upstream's 7.55.
+`DrawPersistentStrokes(..., roundCaps: true)` gives each segment a half-disc fan of `StrokeRoundCapTriangles`
+(8) triangles at each end, built in `stroke.vert` from the vertex index alone: 54 vertices an instance instead
+of 6, and nothing stored. Segments meeting at a point both cap it, which covers a round join, and a
+zero-length segment is a disc. Without the flag the draw is the quad it always was. The viewer drops its
+tessellated cap and join wedges for opaque round-capped, round-joined strokes on the strength of it: on one
+CAD sheet they were 498 MB of a 518 MB upload. Additive; `StrokeRoundCapRenderTests` covers it.
+
 ## 11.9
 
 **A thumbnail capture completes on an offscreen context**, still on DIR.Lib 11.8. Upstream's 7.54.
