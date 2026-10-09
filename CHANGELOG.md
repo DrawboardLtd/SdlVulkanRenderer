@@ -13,6 +13,17 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.11
+
+**`MeasureText` remembers what it measured**, on DIR.Lib 11.9. Upstream's 7.56. A measurement runs the
+whole shaper and resolves every glyph, and chrome measures the same strings every frame it paints: the
+viewer's sidebar fitting its page labels, the tab strip fitting its titles, both re-measuring as they trim
+to an ellipsis. Results are now cached by font, size and text, looked up from the span without
+allocating. Only complete measurements are kept; the cache is dropped when `TextShaper` is replaced and
+cleared at 4,096 entries. Fitting twelve overflowing page labels went from 1.90-1.94 ms to 0.08-0.09 ms per
+frame. DIR.Lib 11.9 stops hashing a glyph's font path on every SDF lookup, which halves the viewer's
+text draw (16.7-17.0 to 8.2-8.3 ms on a 98,425-glyph sheet).
+
 ## 11.10
 
 **The stroke shader draws round caps**, still on DIR.Lib 11.8. Upstream's 7.55.
