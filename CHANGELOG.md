@@ -13,6 +13,14 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.14
+
+**DIR.Lib 11.11: a scrolled list follows its keyboard cursor, and reaches its end.** No renderer
+change. In a list declared `WithScroll`, the arrows step onto rows the viewport clips and bring the row
+they land on into view; a padded list scrolls far enough to show its last row whole; a wheel notch moves
+three rows rather than three pixels. The viewer's layer, bookmark and comment cards all stopped the
+cursor on a half-cut last row (SharpAstro/DIR.Lib#107).
+
 ## 11.13
 
 **A frame's main pass can run single-sampled, and lines antialias in the shader**, on DIR.Lib 11.10.
