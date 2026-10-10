@@ -26,7 +26,7 @@ namespace SdlVulkan.Renderer.WebView;
 /// Calls made before the controller is ready (e.g. an early <see cref="Navigate"/>) are queued.
 /// WebView2 requires an STA thread.
 /// </remarks>
-internal sealed class Win32WebView : INativeWebView
+internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebView
 {
     private SdlVulkanWindow? _window;
     private ComObject<ICoreWebView2Controller>? _controller;
@@ -37,6 +37,11 @@ internal sealed class Win32WebView : INativeWebView
     private string? _pendingNavigateHtml;
     private RectInt? _bounds;
     private bool _visible = true;
+    private readonly List<(string Script, TaskCompletionSource Done)> _pendingDocumentStartScripts = [];
+    // Document-start scripts WebView2 has not confirmed yet. AddScriptToExecuteOnDocumentCreated
+    // applies asynchronously, and a navigation sent before its completion handler runs may miss the
+    // script, so ApplyPendingNavigation holds any navigation until this is back to zero.
+    private int _documentStartScriptsInFlight;
 
     // Event-handler wrappers must be kept alive for as long as they're subscribed: the COM side
     // holds the only ref to the CCW, and dropping the managed object would break the callback.
@@ -91,7 +96,14 @@ internal sealed class Win32WebView : INativeWebView
             _bounds = new RectInt(new PointInt(w, h), new PointInt(0, 0));
         }
 
-        WebView2.Functions.CreateCoreWebView2EnvironmentWithOptions(PWSTR.Null, PWSTR.Null, null!,
+        var userDataFolder = PWSTR.Null;
+        if (options.UserDataFolder is { } folder)
+        {
+            Directory.CreateDirectory(folder);
+            userDataFolder = PWSTR.From(Path.GetFullPath(folder));
+        }
+
+        WebView2.Functions.CreateCoreWebView2EnvironmentWithOptions(PWSTR.Null, userDataFolder, null!,
             new CoreWebView2CreateCoreWebView2EnvironmentCompletedHandler((envResult, env) =>
             {
                 envResult.ThrowOnError();
@@ -107,6 +119,11 @@ internal sealed class Win32WebView : INativeWebView
                         WireTraceEvents(webView2);
                         EnableDiagnostics(webView2);
                         WireMessaging(webView2);
+                        // Before the first navigation, so the scripts reach its document: the
+                        // navigation below is held until WebView2 confirms every one of them.
+                        foreach (var (script, done) in _pendingDocumentStartScripts)
+                            AddDocumentStartScript(webView2, script, done);
+                        _pendingDocumentStartScripts.Clear();
                         ApplyPendingNavigation();
                     }));
             }));
@@ -130,7 +147,8 @@ internal sealed class Win32WebView : INativeWebView
 
     private void ApplyPendingNavigation()
     {
-        if (_webView2 is null)
+        // The last document-start completion handler calls back in here to release a held navigation.
+        if (_webView2 is null || _documentStartScriptsInFlight > 0)
             return;
         if (_pendingNavigateUrl is { } url)
         {
@@ -321,6 +339,48 @@ internal sealed class Win32WebView : INativeWebView
         _controller?.Object.put_IsVisible(visible).ThrowOnError();
     }
 
+    public Task AddScriptAtDocumentStartAsync(string javaScript)
+    {
+        ArgumentNullException.ThrowIfNull(javaScript);
+        // Completed on the UI thread; RunContinuationsAsynchronously for the same reason as
+        // ExecuteScriptAsync.
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (_webView2 is null)
+            _pendingDocumentStartScripts.Add((javaScript, done));
+        else
+            AddDocumentStartScript(_webView2, javaScript, done);
+        return done.Task;
+    }
+
+    private void AddDocumentStartScript(ICoreWebView2 webView2, string javaScript, TaskCompletionSource done)
+    {
+        _documentStartScriptsInFlight++;
+        var hr = webView2.AddScriptToExecuteOnDocumentCreated(PWSTR.From(javaScript),
+            new CoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler((errorCode, _) =>
+            {
+                if (errorCode.IsError)
+                    Fail(errorCode.Value);
+                else
+                    done.TrySetResult();
+                _documentStartScriptsInFlight--;
+                ApplyPendingNavigation();
+            }));
+        // Refused outright, so the handler will not run: release the hold here instead. Any navigation
+        // held meanwhile waits on another script, whose handler releases it.
+        if (hr.IsError)
+        {
+            Fail(hr.Value);
+            _documentStartScriptsInFlight--;
+        }
+
+        void Fail(int hresult)
+        {
+            Trace?.Invoke($"add-document-start-script failed: HRESULT 0x{hresult:X8}");
+            done.TrySetException(new InvalidOperationException(
+                $"AddScriptToExecuteOnDocumentCreated failed (HRESULT 0x{hresult:X8})."));
+        }
+    }
+
     public Task<string> ExecuteScriptAsync(string javaScript)
     {
         var webView2 = _webView2
@@ -339,6 +399,28 @@ internal sealed class Win32WebView : INativeWebView
                 else
                     // Result is a JSON-encoded value (a quoted string, a number, or "null").
                     tcs.TrySetResult(result.ToString() ?? "null");
+            })).ThrowOnError();
+        return tcs.Task;
+    }
+
+    public Task<string> CallDevToolsProtocolMethodAsync(string method, string parametersAsJson)
+    {
+        ArgumentNullException.ThrowIfNull(method);
+        ArgumentNullException.ThrowIfNull(parametersAsJson);
+        var webView2 = _webView2
+            ?? throw new InvalidOperationException(
+                "WebView2 is not ready yet. Call AttachToWindow and wait for the first navigation.");
+
+        // Completed on the UI thread, as ExecuteScriptAsync's.
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        webView2.CallDevToolsProtocolMethod(PWSTR.From(method), PWSTR.From(parametersAsJson),
+            new CoreWebView2CallDevToolsProtocolMethodCompletedHandler((errorCode, result) =>
+            {
+                if (errorCode.IsError)
+                    tcs.TrySetException(
+                        new InvalidOperationException($"{method} failed (HRESULT 0x{errorCode.Value:X8})."));
+                else
+                    tcs.TrySetResult(result.ToString() ?? "{}");
             })).ThrowOnError();
         return tcs.Task;
     }
@@ -383,6 +465,10 @@ internal sealed class Win32WebView : INativeWebView
         _webMessageHandler = null;
         _cdpHandlers.Clear();
         _cdpReceivers.Clear();
+        // Registered before an attach that never finished: they will never reach a browser.
+        foreach (var (_, done) in _pendingDocumentStartScripts)
+            done.TrySetCanceled();
+        _pendingDocumentStartScripts.Clear();
         _webView2 = null;
         _controller?.Dispose();
         _controller = null;
