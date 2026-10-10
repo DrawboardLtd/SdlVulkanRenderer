@@ -13,6 +13,26 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.12
+
+**A frame that outgrows the vertex ring keeps its draws, and frames are timed whole**, still on DIR.Lib
+11.9. Upstream's 7.57 to 7.59.
+
+- **The ring grows mid-frame.** The ring used to grow only at the next frame start, and the frame that
+  ran out was presented without its late draws. On the viewer's first draw of a dense sheet (98,425
+  glyphs into a 16 MB ring) that was a frame with no page on it, a flicker a reader reported. The slot a
+  frame runs out in now moves to a bigger buffer there and then; the old one is freed through
+  `DeferDestroy` once the frame has retired, and the bitmap glyph batch draws the part of its range left
+  in it. `VertexRingGrownMidFrame` counts the moves.
+- **The consumer's hooks are timed.** `VkRenderer.LastPreFlushMs` and `LastPreRenderPassMs` are the CPU
+  time the last `BeginFrame` spent in them, which is where the viewer draws its cached content layer.
+  `frame.slow` reports them as `hooks`, where they used to read as `begin`, the GPU. `SDLVK_FRAME_LOG=1`
+  logs every frame drawn, in every build, with the GPU time and sections of the latest frame to complete,
+  and every cached-layer pass is its own GPU section (`CachedLayerGpuSection`), recorded outside the pass.
+- **Upstream's window and web view additions** (7.57, 7.58): `SdlVulkanWindow.IsActive`,
+  `SetMaximizable`, `SetMinimumSize`, `TryGetUsableDisplayBounds`; `INativeWebView` document-start
+  scripts, a persistent profile folder and DevTools Protocol calls. The viewer uses none of them.
+
 ## 11.11
 
 **`MeasureText` remembers what it measured**, on DIR.Lib 11.9. Upstream's 7.56. A measurement runs the
