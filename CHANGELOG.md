@@ -13,6 +13,24 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.13
+
+**A frame's main pass can run single-sampled, and lines antialias in the shader**, on DIR.Lib 11.10.
+Upstream's 7.60.
+
+- **`VkRenderer.SingleSampleMainPass`** runs the next main pass at one sample on a device that
+  multisamples, decided per frame as late as `OnPreRenderPass`. For a frame that only blits the
+  viewer's cached content layer (antialiased in its own 4x pass, which is untouched) and draws chrome:
+  an idle frame on Werkplan maximised went from 3.16 to 2.29 ms of GPU on the Adreno X1-85. The device
+  gets a single-sample render pass, the context single-sample framebuffers and depth for the swapchain
+  and the offscreen target, and the renderer a second pipeline set, about 50 ms of driver compile built
+  off the render thread (`SingleSampleMainPassReady`). A single-sampled frame can take the damage
+  path's partial repaint, which a multisampled one cannot.
+- **`DrawLine` and the polylines** go through the rounded-box pipeline's distance-field coverage
+  instead of flat triangles, so they come out the same at any sample count.
+- **DIR.Lib 11.10** paints the pan icon's heads as pixel strips, the one mark that was triangles. With
+  both, the viewer's whole window comes out within 2/255 of the 4x frame.
+
 ## 11.12
 
 **A frame that outgrows the vertex ring keeps its draws, and frames are timed whole**, still on DIR.Lib
