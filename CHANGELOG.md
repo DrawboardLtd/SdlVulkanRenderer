@@ -13,6 +13,13 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.17
+
+**A file dialog starts in the folder it was asked to, not the one above** (upstream 7.64). `SdlFileDialogs` gives
+a start folder a trailing separator, which is how SDL tells a folder from a file; without one the Windows dialog
+took the last component for a file name and opened the folder above it. Found by the PDF viewer's Ctrl+O, the
+first real use, and checked there against the live dialog.
+
 ## 11.16
 
 **Global hotkeys and the platform's file dialogs**, on DIR.Lib 11.17. Upstream's 7.62 and 7.63, taken
