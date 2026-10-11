@@ -13,6 +13,29 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.16
+
+**Global hotkeys and the platform's file dialogs**, on DIR.Lib 11.17. Upstream's 7.62 and 7.63, taken
+together with DIR.Lib 11.13 to 11.17 (tooltips, popover pointer claim, hover queries, a drag keeping its
+cursor, `IFileDialogs`).
+
+- **Global hotkeys** (upstream 7.62). `SdlVulkanWindow.TryRegisterGlobalHotKey(id, modifiers, key)` registers
+  a combination that reaches the app from anywhere on the desktop, `UnregisterGlobalHotKey(id)` gives it
+  back (so does disposing the window), and a press arrives as `SdlEventLoop.OnGlobalHotKey(id)` on the
+  loop's thread; a host with its own SDL loop reads presses with `SdlVulkanWindow.IsGlobalHotKey(evt, out id)`.
+  Windows only for now: elsewhere registration returns false. `tools/WebViewSmoke assert-hotkey` presses one
+  for real with `SendInput`.
+- **`SdlFileDialogs`** (upstream 7.63) implements DIR.Lib 11.17's `IFileDialogs` over SDL's dialogs: `new
+  SdlFileDialogs(window)`, then `OpenAsync`, `SaveAsync` or `OpenFolderAsync` with a title, filters, a start
+  folder, a suggested save name and, for open, many files. The call returns at once and the task completes on
+  the event loop's thread (`SdlEventLoop` delivers the answer itself; a host with its own loop passes the
+  event to `SdlFileDialogs.TryDeliver(evt)`). A cancelled token completes the task as cancelled and drops the
+  dialog's late answer. A save path is given the filter's extension when the user typed none.
+  `tools/WebViewSmoke assert-filedialog` shows the real thing (Windows; SKIPs elsewhere).
+- **DIR.Lib 11.17**, which the submodule now pins: the tooltip painter (`Layout.Builder.Tooltip`), a popover's
+  pointer claim, hover queries for hand-painted chrome, a drag keeping the cursor it began with, and
+  `IFileDialogs` with its request, result and filter types.
+
 ## 11.15
 
 **Text can be laid out once and drawn every frame from a persistent buffer**, on DIR.Lib 11.12. Upstream's
