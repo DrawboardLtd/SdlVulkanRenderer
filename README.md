@@ -5,6 +5,7 @@ SDL3 + Vortice.Vulkan rendering library built on [DIR.Lib](https://github.com/Dr
 ## Types
 
 - **`SdlVulkanWindow`** — SDL3 window with Vulkan instance and surface lifecycle. Creates maximized, resizable windows with Vulkan surface.
+- **`SdlFileDialogs`** — DIR.Lib's `IFileDialogs` over the platform's own open, save and folder dialogs (`new SdlFileDialogs(window)`). Never blocks the window; the task completes on the event loop's thread, which `SdlEventLoop` arranges itself and a host with its own loop arranges with `SdlFileDialogs.TryDeliver(evt)`.
 - **`VulkanContext`** — Vulkan device, command buffers, sync management. `MaxFramesInFlight = 2` with per-frame vertex buffers. Two construction modes:
   - `VulkanContext.Create(instance, surface, w, h, ...)` — on-screen path with a swapchain tied to an `SdlVulkanWindow`.
   - `VulkanContext.CreateOffscreen(instance, w, h, ...)` — headless path rendering to a standalone `VkImage`; no surface, no swapchain, no SDL window. See **Headless / offscreen rendering** below.
@@ -466,8 +467,7 @@ no scRGB, no HDR10 via OpenGL on any platform.
 - **WebGPU .NET bindings** — if they mature, a future browser target becomes possible.
 - **Silk.NET 3.0** — if it ever ships with working Vulkan + a non-GLFW windowing path,
   the comparison may change.
-- **`SDL3-CS.Android` releases** — worth re-testing on each one, because a single bump could clear
-  *both* Android constraints above. The 16 KB page alignment needs an upstream rebuild, and the
-  Java/native mismatch that forces the 3.4.10.5 pin was last seen in early 3.4.12.x; 3.4.12.6 is
-  the current latest and is several patches past it, so it may already be consistent. Verify by
-  launching on a device — the mismatch fails SDL's version check at startup, not at build time.
+- **`SDL3-CS.Android` releases** — 3.4.16 cleared *both* Android constraints that had held the pin
+  at 3.4.10.5, so the thing to watch now is that a future bump does not reintroduce either. Run the
+  two package checks in the Android section above before taking one, and still launch it: the
+  version check fails at startup, not at build time.
