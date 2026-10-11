@@ -13,6 +13,21 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.15
+
+**Text can be laid out once and drawn every frame from a persistent buffer**, on DIR.Lib 11.12. Upstream's
+7.61.
+
+- **`LayoutSdfGlyph`** lays a glyph out once, in the caller's own space, as a 48-byte instance, and
+  **`DrawPersistentSdfGlyphs`** draws a range of them at an origin and scale through a new instanced
+  pipeline (`sdfinst`), built in both pipeline sets so it draws in a single-sampled main pass too. Each
+  glyph takes its coverage path and antialiasing band from its own size times the scale, so one draw holds
+  any mix of sizes and one layout serves every zoom.
+- **`SdfPageStamp`** says when to lay out again (DIR.Lib 11.12's page stamps), and **`UsesLargeSdfTier`**
+  is the batch path's tier rule.
+- The viewer's page text is built on it (#382 step 2): Werkplan's text went from 12.3 to 0.68 ms of CPU a
+  redraw, and its GPU from 52.9 to 37.0 ms.
+
 ## 11.14
 
 **DIR.Lib 11.11: a scrolled list follows its keyboard cursor, and reaches its end.** No renderer
