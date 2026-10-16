@@ -18,7 +18,7 @@ namespace SdlVulkan.Renderer;
 /// (single-window / offscreen), so multiple windows can share one device without double-free.
 /// </para>
 /// </summary>
-public sealed unsafe class VulkanDevice : IDisposable
+public sealed unsafe partial class VulkanDevice : IDisposable
 {
     // Capacity of ONE descriptor pool, not a global ceiling: when a pool fills, another is added
     // (see AllocateDescriptorSet). A pool cannot be resized once created, so growth is always by
@@ -60,6 +60,11 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// readback/offscreen byte-order parity; R8G8B8A8Unorm on Android/Mali, which offers no BGRA);
     /// fixed to B8G8R8A8Unorm on the offscreen path. Render pass and swapchain MUST agree on it.</summary>
     public VkFormat ColorFormat { get; }
+
+    /// <summary>Where every main pass on this device leaves its colour image: <c>PresentSrcKHR</c> on a device made
+    /// for a surface, <c>ColorAttachmentOptimal</c> on an offscreen one. A load pass starts from it, and a copy out of
+    /// a finished frame transitions from it.</summary>
+    internal VkImageLayout ColorFinalLayout { get; private set; } = VkImageLayout.PresentSrcKHR;
 
     /// <summary>The pool the next descriptor set will be taken from. Not the only one — see
     /// <see cref="AllocateDescriptorSet"/>; kept single-valued for callers that just need a
@@ -234,7 +239,14 @@ public sealed unsafe class VulkanDevice : IDisposable
     {
         var instanceApi = GetApi(instance);
         var physicalDevice = PickPhysicalDevice(instanceApi, surface, out var queueFamily);
+        return CreateOn(instance, instanceApi, physicalDevice, queueFamily, surface, msaaSamples, ownsInstance);
+    }
 
+    // The on-screen device, once the physical device is chosen: by PickPhysicalDevice for Create, or by the
+    // transparent-window picker (VulkanDevice.Transparency.cs) for a window that needs premultiplied alpha.
+    private static VulkanDevice CreateOn(VkInstance instance, VkInstanceApi instanceApi, VkPhysicalDevice physicalDevice,
+        uint queueFamily, VkSurfaceKHR surface, VkSampleCountFlags msaaSamples, bool ownsInstance)
+    {
         float queuePriority = 1.0f;
         VkDeviceQueueCreateInfo queueCI = new()
         {
@@ -326,6 +338,7 @@ public sealed unsafe class VulkanDevice : IDisposable
             graphicsQueue, queueFamily, renderPass, singleSamplePass, VkFormat.B8G8R8A8Unorm, depthFormat, msaaSamples, ownsInstance);
         dev.MarkQueuePrivate();
         dev.MemoryBudgetAvailable = wantsBudget;
+        dev.ColorFinalLayout = VkImageLayout.ColorAttachmentOptimal;
         return dev;
     }
 
@@ -778,6 +791,18 @@ public sealed unsafe class VulkanDevice : IDisposable
         return FindMemoryType(typeFilter, VkMemoryPropertyFlags.DeviceLocal);
     }
 
+    /// <summary>
+    /// The memory type for a buffer the CPU reads back every frame: host-visible and coherent, and cached where the
+    /// device offers that. Without <c>HOST_CACHED</c> a discrete GPU's host-visible memory is typically
+    /// write-combined, which the CPU writes fast and reads slowly.
+    /// </summary>
+    internal uint FindReadbackMemoryType(uint typeFilter)
+        => TryFindMemoryType(typeFilter,
+            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent | VkMemoryPropertyFlags.HostCached,
+            out var cached)
+            ? cached
+            : FindMemoryType(typeFilter, VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent);
+
     /// <summary>Whether the device has any lazily allocated memory type at all — a tiler does, a
     /// desktop GPU (and lavapipe) does not.</summary>
     public bool OffersLazilyAllocatedMemory
@@ -1081,7 +1106,10 @@ public sealed unsafe class VulkanDevice : IDisposable
         }
     }
 
-    private static VkPhysicalDevice PickPhysicalDevice(VkInstanceApi instanceApi, VkSurfaceKHR surface, out uint queueFamily)
+    // log: false when the caller may still choose another device (the transparent-window picker), so the log
+    // names the device that is actually used rather than one that was only considered.
+    private static VkPhysicalDevice PickPhysicalDevice(VkInstanceApi instanceApi, VkSurfaceKHR surface, out uint queueFamily,
+        bool log = true)
     {
         uint count = 0;
         instanceApi.vkEnumeratePhysicalDevices(&count, null);
@@ -1106,7 +1134,7 @@ public sealed unsafe class VulkanDevice : IDisposable
             if (props.deviceType == VkPhysicalDeviceType.DiscreteGpu)
             {
                 queueFamily = family;
-                LogSelectedDevice(instanceApi, pd, family, count);
+                if (log) LogSelectedDevice(instanceApi, pd, family, count);
                 return pd;
             }
 
@@ -1120,7 +1148,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         if (fallback != VkPhysicalDevice.Null)
         {
             queueFamily = fallbackFamily;
-            LogSelectedDevice(instanceApi, fallback, fallbackFamily, count);
+            if (log) LogSelectedDevice(instanceApi, fallback, fallbackFamily, count);
             return fallback;
         }
 

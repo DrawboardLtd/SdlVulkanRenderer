@@ -13,6 +13,30 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.22
+
+**Transparent windows, media controls, window sizing in design units, and the inspector's per-user
+registry**, on DIR.Lib 11.22 and AppShell 1.2. Upstream's 7.65 to 7.73, taken together with DIR.Lib
+11.18 to 11.22 (a split that drags itself, data views and context menus, a text leaf measured by its
+line box, `Sizing.StarUpToContent`, the inspector registry).
+
+- **A window can hide off the taskbar, and a caption double-click reaches the app** (upstream 7.65).
+- **`FullscreenChanged`**, so a host can fill the screen with a web page's fullscreen (upstream 7.66).
+- **A window sizes itself in design units and resizes where it stands** (upstream 7.68), and
+  `SetMaximizable(false)` survives SDL rebuilding the window's style (7.67).
+- **A window's own entry in the system's media controls** (upstream 7.69, Windows).
+- **The inspector sidecar finds local instances through DIR.Lib's per-user registry** (upstream 7.70);
+  LAN multicast is opt-in.
+- **Transparent windows** (upstream 7.71 and 7.73): `SdlVulkanWindow.CreateTransparent` and
+  `SdlVulkanApp.CreateTransparentWindow` take a swapchain with premultiplied alpha where the device offers
+  one, Dozen on the same GPU where the native driver does not, and on Windows a layered window when
+  neither can. `tools/TransparencyProbe` measures what a machine actually shows.
+- **A web view that cannot take focus no longer takes the app down** (upstream 7.72).
+- **`OnResize` carries the swapchain's extent, not the window's size.**
+- The packages ship their XML docs.
+
+Upstream's new non-gating Windows CI job is not taken: this fork's workflow is its own.
+
 ## 11.17
 
 **A file dialog starts in the folder it was asked to, not the one above** (upstream 7.64). `SdlFileDialogs` gives
