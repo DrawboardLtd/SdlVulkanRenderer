@@ -123,6 +123,11 @@ internal static partial class LogEvents
     [LoggerMessage(302, LogLevel.Warning, "[VulkanContext] screenshot readback timed out after {TimeoutMs}ms; aborting (GPU saturated).")]
     public static partial void ReadbackTimedOut(this ILogger logger, ulong timeoutMs);
 
+    // Once per layered window: a refusal that repeats would otherwise be a line per frame. The window keeps showing
+    // the last frame it took, so a window that stops updating is attributable to this.
+    [LoggerMessage(303, LogLevel.Warning, "[VulkanContext] UpdateLayeredWindow failed (error {Error}); the layered window keeps its last frame.")]
+    public static partial void LayeredWindowUpdateFailed(this ILogger logger, int error);
+
     [LoggerMessage(401, LogLevel.Warning, "[validation] messenger install failed: {Reason}")]
     public static partial void ValidationMessengerInstallFailed(this ILogger logger, string reason);
 
@@ -136,4 +141,21 @@ internal static partial class LogEvents
     // wedge, a driver quirk) cannot be attributed to hardware without this line.
     [LoggerMessage(501, LogLevel.Information, "[VulkanDevice] selected {DeviceName} ({DeviceType}, driver {DriverVersion}, Vulkan {ApiVersion}), queue family {QueueFamily}, from {DeviceCount} enumerated.")]
     public static partial void PhysicalDeviceSelected(this ILogger logger, string deviceName, string deviceType, string driverVersion, string apiVersion, uint queueFamily, uint deviceCount);
+
+    // A transparent window is the one place the renderer may run on a second device, typically Mesa's Dozen on
+    // Windows, whose native drivers offer no premultiplied alpha. Logged so a slower window, or one whose GPU resources are
+    // not the other windows', is attributable to that choice.
+    [LoggerMessage(502, LogLevel.Information, "[VulkanDevice] {NativeDevice} offers no premultiplied alpha on a transparent window's surface; that window uses {AlphaDevice}.")]
+    public static partial void TransparentWindowDevice(this ILogger logger, string nativeDevice, string alphaDevice);
+
+    // ...and when the window's context is on a device that does not offer it (no other device does, or the caller kept
+    // the window on the native one), where there are no layered windows to fall back on, it gets an opaque swapchain.
+    [LoggerMessage(503, LogLevel.Information, "[VulkanContext] {Device} offers no premultiplied alpha on a transparent window's surface, and there are no layered windows here: the window's swapchain is opaque.")]
+    public static partial void TransparentWindowOpaque(this ILogger logger, string device);
+
+    // On Windows there are: the window is drawn into an image of its own on that device, read back after every frame and
+    // handed over with UpdateLayeredWindow. Logged because that readback is a cost per frame, growing with the window's
+    // size, that a swapchain does not have.
+    [LoggerMessage(504, LogLevel.Information, "[VulkanContext] {Device} offers no premultiplied alpha on a transparent window's surface: the window is drawn offscreen on it and handed to Windows as a layered window, one readback per frame.")]
+    public static partial void TransparentWindowLayered(this ILogger logger, string device);
 }

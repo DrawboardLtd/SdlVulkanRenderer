@@ -24,7 +24,7 @@
          hyphen several of them contain, which XML forbids inside a comment — but that only ever ruled
          out putting them in a csproj, nothing ever read them there, and they had reached 431 of that
          file's 590 lines.) -->
-    <VersionMajorMinor>11.17</VersionMajorMinor>
+    <VersionMajorMinor>11.22</VersionMajorMinor>
     <!-- Local builds get Major.Minor.0; CI passes -p:Version=Major.Minor.<run><attempt>+<sha>, and the
          condition lets it win. -->
     <VersionPrefix Condition="'$(VersionPrefix)' == ''">$(VersionMajorMinor).0</VersionPrefix>
@@ -48,6 +48,15 @@
     <CreateHardLinksForCopyAdditionalFilesIfPossible>true</CreateHardLinksForCopyAdditionalFilesIfPossible>
     <CreateHardLinksForAdditionalFilesIfPossible>true</CreateHardLinksForAdditionalFilesIfPossible>
     <CreateHardLinksForPublishFilesIfPossible>true</CreateHardLinksForPublishFilesIfPossible>
+  </PropertyGroup>
+  <PropertyGroup>
+    <!-- Ship the /// comments in the package so consumers get IntelliSense. Keyed on the name
+         rather than IsPackable, which test projects set in their own csproj, after this file is
+         read. CS1591 (public member without a comment) and CS1573 (a parameter without a
+         <param> when its siblings have one) are silenced: the point is to ship the docs that
+         exist, not to demand them everywhere. Broken crefs and paramrefs still warn. -->
+    <GenerateDocumentationFile Condition="!$(MSBuildProjectName.EndsWith('.Tests'))">true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
   </PropertyGroup>
 
 </Project>

@@ -9,6 +9,7 @@ SDL3 + Vortice.Vulkan rendering library built on [DIR.Lib](https://github.com/Dr
 - **`VulkanContext`** — Vulkan device, command buffers, sync management. `MaxFramesInFlight = 2` with per-frame vertex buffers. Two construction modes:
   - `VulkanContext.Create(instance, surface, w, h, ...)` — on-screen path with a swapchain tied to an `SdlVulkanWindow`.
   - `VulkanContext.CreateOffscreen(instance, w, h, ...)` — headless path rendering to a standalone `VkImage`; no surface, no swapchain, no SDL window. See **Headless / offscreen rendering** below.
+  - `VulkanContext.CreateTransparent(window, w, h, ...)`: on-screen path for a window whose pixels blend with the desktop. See **Transparent windows** below.
 - **`VkRenderer`** — `Renderer<VulkanContext>` implementation with FillRectangle, DrawRectangle, FillEllipse, DrawText, plus batched glyph and persistent-vertex-buffer draw APIs. Exposes `FontAtlasDirty` so callers can trigger redraws after glyph rasterization. Has `BeginFrame` / `BeginOffscreenFrame` variants that match the two `VulkanContext` modes.
 - **`VkPipelineSet`** — Vulkan pipeline creation from pre-baked SPIR-V (flat, textured, ellipse, page, stroke, SDF, round-rect, blend variants). Shaders are authored as GLSL 450 and baked to committed SPIR-V by `tools/BakeShaders`, re-run by hand after editing one — see **Dependencies** below.
 - **`VkFontAtlas`** — Dynamic bitmap glyph atlas with ManagedFontRasterizer (from DIR.Lib) rasterization and Vulkan texture upload. Supports grow (512→4096), deferred eviction, and `skipUnflushed` to prevent sampling stale GPU texture data.
@@ -146,6 +147,72 @@ On a fresh Ubuntu runner (GitHub Actions `ubuntu-latest`, Azure Pipelines, GitLa
 
 Containers: add the same two packages to your image. The offscreen path doesn't require a `tty`, display variable, or privileged mode.
 
+## Transparent windows
+
+A window whose pixels blend with what is behind it, such as a desktop companion or an overlay. Transparency is a
+per-window choice: ordinary windows are unchanged.
+
+```csharp
+using var window = SdlVulkanWindow.CreateTransparent("Buddy", 240, 240);   // borderless, always on top
+using var ctx = VulkanContext.CreateTransparent(window, 240, 240);
+using var renderer = new VkRenderer(ctx, 240, 240);
+window.SetShape(silhouette);   // an RgbaImage: clicks outside its non-zero alpha reach the window underneath
+
+renderer.BeginFrame(new RGBAColor32(0, 0, 0, 0));   // clear to transparent, then draw as usual
+// ...
+renderer.EndFrame();
+```
+
+With `SdlVulkanApp`, open it with `app.CreateTransparentWindow(...)` and build its context with
+`VulkanContext.CreateTransparentForSharedDevice(app.DeviceFor(window), window, w, h)`.
+
+The window's frames reach the screen with their alpha by the first of these the machine can do, and
+`ctx.AlphaPresentation` says which it got. The app draws the same way whichever it is.
+
+| | Way | Where | Cost |
+|---|---|---|---|
+| 1 | `Swapchain`, on the native device | Wayland, macOS, Android drivers usually | none |
+| 2 | `Swapchain`, on a second device | Windows with Mesa's Dozen installed | a second device, which shares no resources |
+| 3 | `LayeredWindow`, on the native device | Windows without Dozen, or kept off it | a readback every frame |
+| 4 | `None`: an opaque swapchain, cut by `SetShape` | anywhere else | no alpha, hard edges only |
+
+- **Alpha comes from the swapchain's `PRE_MULTIPLIED` composite alpha,** and the ordinary pipelines already leave
+  premultiplied pixels over a transparent clear. Wayland, macOS and Android drivers usually offer it.
+- **On Windows the native drivers do not.** NVIDIA, Intel and Qualcomm Adreno offer no premultiplied alpha for any
+  kind of window (`OPAQUE`, plus `INHERIT` on Intel). Mesa's Dozen (Vulkan over Direct3D 12) does, and composites through DirectComposition, so a
+  transparent window that needs it gets a second device: Dozen on the same GPU, matched by adapter LUID. Every other
+  window stays on the native device. Dozen comes with Microsoft's "OpenCL, OpenGL, and Vulkan Compatibility Pack"
+  (`winget install 9NQPSL29BFFF --source msstore`).
+- **Without Dozen, a layered window.** The native device draws into an image of the context's own instead of a
+  swapchain's; `EndFrame` waits for the GPU, copies the frame out and hands it to the window with
+  `UpdateLayeredWindow`, which blends it per pixel. Clicks pass through wherever alpha is zero, so the window needs no
+  shape. The copy grows with the window's size: a 240 by 240 companion took 0.3 ms a frame from `BeginFrame` to
+  `EndFrame` on an Adreno X1-85, against 0.09 ms for Dozen's swapchain. To take this way with Dozen installed, and
+  keep the window's resources on the native device, build its context on `app.Device` rather than
+  `app.DeviceFor(window)`, or pass `nativeDeviceOnly: true` standalone.
+- **Check `ctx.AlphaPresentation`** (or `ctx.PresentsAlpha`). `None` on a transparent window means no device's
+  swapchain offered alpha and there are no layered windows to fall back on, so its swapchain is `OPAQUE`. Some
+  Windows drivers blend an opaque swapchain's alpha anyway on an SDL transparent window, which Vulkan does not report
+  (seen with NVIDIA under Mailbox presentation and with Intel under Fifo, in a Remote Desktop session; the Adreno, at
+  its console, blends it under neither), so treat that as a bonus, not a guarantee. `SetShape` still cuts the window
+  to a hard-edged silhouette.
+- **The shape is one bit per pixel** (a window region on Windows). It decides both where clicks go and where anything
+  is drawn, so make it cover every pixel with any alpha, soft edges included. Rebuilding it costs about 3 ms at
+  256 by 256, so set it when the silhouette changes, not every frame.
+- **A companion with hard edges needs no alpha at all.** On an opaque swapchain the shape still cuts the window out
+  and lets clicks through outside it, with no readback and no second device: give it an ordinary context,
+  `VulkanContext.CreateForSharedDevice(app.Device, window.Surface, ...)` or `VulkanContext.Create` standalone. Its
+  antialiased edge blends with the clear colour, so clear to the colour at the sprite's edge, or draw an outline.
+- **A second device shares no GPU resources** with the first: textures and meshes made on `app.Device` are not valid
+  in a transparent window on Dozen. A layered window on `app.Device` shares them.
+
+`tools/TransparencyProbe` measures a machine: `caps` lists what each device's surface offers, `present all` puts a
+known premultiplied picture over a checkerboard for every device, present mode and window kind and scores what the
+screen shows, and `buddy` runs this API end to end and times its frames (`buddy app native` and
+`buddy standalone native` keep the window on the native device, a layered window on Windows; `buddy app opaque`
+gives it an opaque swapchain). A capture is the compositor's picture, not necessarily the panel's: add `--look` to
+hold each picture on screen and answer by eye, which the tool prints beside the capture's verdict.
+
 ## Native WebView (optional)
 
 Host a native browser view *inside* an `SdlVulkanWindow`. The window system composites it over the
@@ -155,7 +222,7 @@ its own projects so a consumer that wants no browser pulls none of it:
 | Project | Purpose |
 | --- | --- |
 | `src/SdlVulkan.Renderer.WebView` | The `INativeWebView` abstraction + platform backends. Multi-targets `net10.0` (interface, factory and the Linux/WebKitGTK backend) and `net10.0-windows` (adds the Windows/WebView2 backend). |
-| `src/SdlVulkan.Renderer.WebView.Native` | `WebView2Loader.dll` per Windows RID (x64 / arm64 / x86). The Windows TFM of the project above references it — never reference it yourself. |
+| `src/SdlVulkan.Renderer.WebView.Native` | `WebView2Loader.dll` per Windows RID (x64 / arm64 / x86). The Windows TFM of the project above references it — never reference it yourself. The loader is Microsoft's: an app that ships it ships the project's `THIRD-PARTY-NOTICES.txt` too. |
 
 **Consume it by source, not from NuGet.** This repo publishes nothing to nuget.org, so reference the
 project the same way you reference the core renderer — through the submodule checkout, with the path

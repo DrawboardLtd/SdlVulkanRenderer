@@ -29,7 +29,8 @@ public interface INativeWebView : IDisposable
     /// (the same space the renderer draws in). Forward <c>SdlWindowView.OnResize</c> here.</summary>
     void SetBounds(RectInt bounds);
 
-    /// <summary>Gives the webview input focus.</summary>
+    /// <summary>Gives the webview input focus. Best effort: a webview that cannot take it now does not
+    /// throw, it reports the failure on <see cref="Trace"/>.</summary>
     void Focus();
 
     /// <summary>Shows or hides the webview child surface.</summary>
@@ -66,6 +67,17 @@ public interface INativeWebView : IDisposable
 
     /// <summary>Raised when the document title changes.</summary>
     event Action<string>? TitleChanged;
+
+    /// <summary>
+    /// Raised when the page enters fullscreen (<c>element.requestFullscreen()</c>: a video player's fullscreen
+    /// button) or leaves it: true while it is. The page's fullscreen fills only the view, so a host that wants it
+    /// to fill the screen makes its window fullscreen and the view's bounds the window's, and puts both back on
+    /// false.
+    /// </summary>
+    /// <remarks>On WebView2 it is raised on the window's thread (WebView2's events arrive in the window's message
+    /// loop), so the handler can resize the window and the view directly. Windows only for now: the WebKitGTK and
+    /// WKWebView backends never raise it.</remarks>
+    event Action<bool>? FullscreenChanged;
 
     /// <summary>Raised when a navigation completes; carries the final URL.</summary>
     event Action<string>? NavigationCompleted;
@@ -109,6 +121,16 @@ public sealed record NativeWebViewOptions
     /// view, and the last one wins.</item>
     /// </list></summary>
     public string? UserDataFolder { get; init; }
+
+    /// <summary>Whether the browser puts the page's media in the system's media controls itself. True, the default,
+    /// keeps the browser's own: WebView2 shows the page's media in Windows' media flyout, under the name
+    /// "Unknown app", and takes the media keys. An app that shows its own entry, for its window and under its own name
+    /// (<c>SdlVulkanWindow.TryGetMediaControls</c>), sets it false, so there are not two. WebView2 only (Chromium's
+    /// <c>--disable-features=HardwareMediaKeyHandling</c>); the other backends publish none of their own, and ignore
+    /// it.</summary>
+    /// <remarks>Every web view sharing a <see cref="UserDataFolder"/> must agree: WebView2 runs one browser per folder,
+    /// and refuses a second view whose browser arguments differ.</remarks>
+    public bool SystemMediaControls { get; init; } = true;
 }
 
 /// <summary>

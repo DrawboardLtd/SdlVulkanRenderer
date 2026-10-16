@@ -31,6 +31,7 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
     private SdlVulkanWindow? _window;
     private ComObject<ICoreWebView2Controller>? _controller;
     private ICoreWebView2? _webView2;
+    private CoreWebView2EnvironmentOptions? _environmentOptions;
 
     // Queued state applied once the controller/CoreWebView2 become ready.
     private string? _pendingNavigateUrl;
@@ -49,10 +50,12 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
     private CoreWebView2SourceChangedEventHandler? _sourceChangedHandler;
     private CoreWebView2NavigationCompletedEventHandler? _navCompletedHandler;
     private CoreWebView2DocumentTitleChangedEventHandler? _titleChangedHandler;
+    private CoreWebView2ContainsFullScreenElementChangedEventHandler? _fullscreenHandler;
     private EventRegistrationToken _navStartingToken;
     private EventRegistrationToken _sourceChangedToken;
     private EventRegistrationToken _navCompletedToken;
     private EventRegistrationToken _titleChangedToken;
+    private EventRegistrationToken _fullscreenToken;
 
     // Diagnostics: renderer-crash handler + the DevTools-Protocol receivers/handlers that feed
     // console/exception/log capture. All kept alive for the lifetime of the subscription.
@@ -66,6 +69,7 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
     private EventRegistrationToken _webMessageToken;
 
     public event Action<string>? TitleChanged;
+    public event Action<bool>? FullscreenChanged;
     public event Action<string>? NavigationCompleted;
     public event Action<string>? MessageReceived;
     public event Action<nint, uint, nint, nint>? WndProcOverride; // not surfaced via this backend yet
@@ -103,7 +107,16 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
             userDataFolder = PWSTR.From(Path.GetFullPath(folder));
         }
 
-        WebView2.Functions.CreateCoreWebView2EnvironmentWithOptions(PWSTR.Null, userDataFolder, null!,
+        // Browser arguments go in environment options; none are passed when there are none, which is WebView2's own
+        // default. The options object stays referenced while the environment is created (asynchronously).
+        if (!options.SystemMediaControls)
+        {
+            _environmentOptions = new CoreWebView2EnvironmentOptions();
+            // Chromium's media keys and its entry in the system's media controls, one feature.
+            _environmentOptions.put_AdditionalBrowserArguments(PWSTR.From("--disable-features=HardwareMediaKeyHandling")).ThrowOnError();
+        }
+
+        WebView2.Functions.CreateCoreWebView2EnvironmentWithOptions(PWSTR.Null, userDataFolder, _environmentOptions!,
             new CoreWebView2CreateCoreWebView2EnvironmentCompletedHandler((envResult, env) =>
             {
                 envResult.ThrowOnError();
@@ -203,6 +216,16 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
             TitleChanged?.Invoke(text);
         });
         webView2.add_DocumentTitleChanged(_titleChangedHandler, ref _titleChangedToken).ThrowOnError();
+
+        // The page's fullscreen, entered or left; raised on the window's thread (see INativeWebView.FullscreenChanged).
+        _fullscreenHandler = new CoreWebView2ContainsFullScreenElementChangedEventHandler((sender, _) =>
+        {
+            var contains = default(BOOL);
+            sender.get_ContainsFullScreenElement(ref contains);
+            Trace?.Invoke($"fullscreen: {(bool)contains}");
+            FullscreenChanged?.Invoke(contains);
+        });
+        webView2.add_ContainsFullScreenElementChanged(_fullscreenHandler, ref _fullscreenToken).ThrowOnError();
     }
 
     // Captures in-page diagnostics that WebView2 only exposes through the DevTools Protocol:
@@ -329,9 +352,15 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
     }
 
     public void Focus()
-        => _controller?.Object
-            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
-            .ThrowOnError();
+    {
+        // MoveFocus can fail on a controller momentarily in no state to take focus (seen: 0x800707DC,
+        // "The specified tag was not found", with the host window being activated). Focus is called
+        // from event handlers, where a throw takes the app down, and a missed focus is not worth that:
+        // it is traced, and the next call tries again.
+        if (_controller?.Object.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+            is { IsError: true } hr)
+            Trace?.Invoke($"focus failed (HRESULT 0x{hr.Value:X8})");
+    }
 
     public void SetVisible(bool visible)
     {
@@ -461,6 +490,7 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
         _sourceChangedHandler = null;
         _navCompletedHandler = null;
         _titleChangedHandler = null;
+        _fullscreenHandler = null;
         _processFailedHandler = null;
         _webMessageHandler = null;
         _cdpHandlers.Clear();
@@ -472,5 +502,7 @@ internal sealed class Win32WebView(NativeWebViewOptions options) : INativeWebVie
         _webView2 = null;
         _controller?.Dispose();
         _controller = null;
+        _environmentOptions?.Dispose();
+        _environmentOptions = null;
     }
 }

@@ -20,7 +20,9 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
     /// <summary>Called each frame between BeginFrame and EndFrame for this window.</summary>
     public Action? OnRender { get; set; }
 
-    /// <summary>Called after this window's renderer is resized. Parameters are the new pixel dimensions.</summary>
+    /// <summary>Called after this window's renderer is resized. Parameters are the new pixel dimensions: the size the
+    /// swapchain was built at (<see cref="VkRenderer.Width"/>/<see cref="VkRenderer.Height"/>), which the surface
+    /// chooses and which need not be the window's pixel size as SDL reports it.</summary>
     public Action<uint, uint>? OnResize { get; set; }
 
     /// <summary>
@@ -182,6 +184,20 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
     /// <see cref="SdlEventLoop.OnQuit"/> — preserving the single-window behavior.
     /// </summary>
     public Action? OnCloseRequested { get; set; }
+
+    /// <summary>
+    /// Called on a double-click on this window's caption: its OS title bar, or a borderless window's draggable area.
+    /// Only for a window that asked, with <see cref="SdlVulkanWindow.TryReportCaptionDoubleClicks"/> (Windows only
+    /// for now). A redraw follows.
+    /// </summary>
+    public Action? OnCaptionDoubleClick { get; set; }
+
+    /// <summary>
+    /// Called on a press of this window's media controls: a button of the system's media flyout or lock screen, or a
+    /// media key. Only for a window that has them, from <see cref="SdlVulkanWindow.TryGetMediaControls"/> (Windows only
+    /// for now). A redraw follows.
+    /// </summary>
+    public Action<MediaButton>? OnMediaButton { get; set; }
 
     /// <summary>
     /// Called each loop iteration before checking redraw for this window. Return true to force a
