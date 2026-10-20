@@ -13,6 +13,14 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.27
+
+**On DIR.Lib 11.27**, with no change to the renderer itself (upstream SdlVulkan.Renderer has nothing
+past 7.73). DIR.Lib 11.23 to 11.27 bring `RgbaImage(width, height, pixels)`, which adopts a decoded
+buffer without copying it; a composite's own regions asked before its children's (`ChildrenUnderOwn`);
+scroll bars in the host's colours; a Markdown parse 50 to 190 times faster on LALR.CC 4.11; math
+rasterized 13 to 32 times faster once warm; and the math layout fixes of 11.23 to 11.26.
+
 ## 11.22
 
 **Transparent windows, media controls, window sizing in design units, and the inspector's per-user
