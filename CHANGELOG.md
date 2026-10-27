@@ -13,6 +13,17 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.37
+
+**On DIR.Lib 11.37, and SDL's side mouse buttons arrive as `MouseButton.Back` and `MouseButton.Forward`**
+(upstream 7.74). `SdlWindowView.ToMouseButton` maps SDL's X1 to `Back` and X2 to `Forward` on press and
+release; they used to fall through to `Left`, so a back/forward click acted as a left click. The legacy
+`OnMouseDown` / `OnMouseUp` callbacks still receive SDL's raw button byte. DIR.Lib 11.28 to 11.37 bring a
+floating palette that declares its grip's drag, collapse and pointer claim; popovers that keep the pointer
+and cursor to themselves; a Markdown document as a layout tree; table columns resized by dragging the
+divider (fit on a double-click); a scroll stack's scrollbar taking thumb drags and track clicks, with a
+wheel notch moving at most a third of the viewport; and SharpAstro.Fonts 1.15.
+
 ## 11.27
 
 **On DIR.Lib 11.27**, with no change to the renderer itself (upstream SdlVulkan.Renderer has nothing
