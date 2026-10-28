@@ -13,6 +13,34 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.38
+
+**Depth is allocated per target only once a mesh is drawn on it** (upstream 7.75, #146), on DIR.Lib 11.37
+as before. This fork's line is numbered by DIR.Lib, so upstream's 7.75 is 11.38 here, not 7.75.
+
+- Every render pass used to carry a depth attachment so `BeginMeshRegion`/`DrawMesh` could draw inline, and so
+  every target paid for a depth image whether or not it ever drew a mesh. Where the device has no lazily allocated
+  memory (a desktop GPU, lavapipe) that is as much as the multisample colour image: **16 bytes a pixel under 4x
+  MSAA**, measured, on a swapchain, an offscreen target, every cached-layer slot and the thumbnail target alike.
+- The render-pass shape now has a depth-less variant (`VulkanContext.RenderPassNoDepth`,
+  `SingleSampleRenderPassNoDepth`), with a `VkPipelineSet` to match (no `Mesh` pipeline: it tests depth). **Every
+  target starts on it, with no depth image**: the swapchain framebuffers with the damage load pass and the
+  single-sample pass, the offscreen target, each cached-layer slot and the thumbnail capture. 2D output is
+  pixel-identical on either shape.
+- A target takes depth when a mesh asks, **per target**:
+  - up front, `VulkanContext.RequireMeshDepth(MeshDepthTargets)` / `VkRenderer.RequireMeshDepth(...)` with
+    `Main`, `CachedLayer`, `Thumbnail` (flags, `All`), and `CreateOffscreen(meshDepth: true)`; the first frame then
+    draws its meshes; or
+  - lazily: `BeginMeshRegion` on a depth-less pass returns false, draws nothing, and marks that target. The next
+    `BeginFrame`/`BeginOffscreenFrame`, `BeginCachedLayerPass` (each slot on its own turn) or
+    `BeginThumbnailCapturePass` gives it depth. `VkRenderer.TakeMeshDepthRedraw()` reports the refusal and
+    `SdlEventLoop` redraws on it. A cached layer or thumbnail that was refused a mesh holds its picture without it
+    until its consumer renders it again, so a consumer that draws meshes into one asks up front.
+  - The shape then stays across resize and swapchain recreation.
+- **Side-car pipelines must say which pass shape they target.** A pipeline is render-pass compatible with one
+  shape only. Create it against `ctx.RenderPass` (depth) or `ctx.RenderPassNoDepth` (now public), or both, and bind
+  the one matching `VkRenderer.CurrentPassHasDepth`.
+
 ## 11.37
 
 **On DIR.Lib 11.37, and SDL's side mouse buttons arrive as `MouseButton.Back` and `MouseButton.Forward`**

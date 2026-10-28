@@ -8,6 +8,14 @@ namespace SdlVulkan.Renderer;
 // BeginOffscreenFrame/EndOffscreenFrame are drop-in replacements for BeginFrame/EndFrame,
 // so VkRenderer and higher-level consumers work unchanged. After EndOffscreenFrame completes
 // (it blocks on the frame fence), call ReadbackOffscreenRgba to pull the pixels out.
+//
+// Depth. The target starts WITHOUT a depth image, on the depth-less variant of the render-pass shape
+// (VulkanDevice.RenderPassNoDepth): depth is only for VkRenderer.BeginMeshRegion/DrawMesh, and where there is
+// no lazily allocated memory (a desktop GPU, lavapipe) it costs as much as the multisample colour image,
+// 16 bytes a pixel at 4x. Something that draws a mesh asks for it, RequireMeshDepth up front or
+// BeginMeshRegion on a depth-less frame, and the next BeginOffscreenFrame allocates the image, rebuilds the
+// framebuffers on the depth shape and the frame records with it (VkRenderer binds the pipeline set of the
+// shape the pass has). The target keeps whichever shape it has across ResizeOffscreen.
 public sealed unsafe partial class VulkanContext
 {
     // Offscreen render target — format matches the swapchain path (B8G8R8A8Unorm) so render
@@ -19,8 +27,19 @@ public sealed unsafe partial class VulkanContext
     private uint _offscreenWidth;
     private uint _offscreenHeight;
     private bool _isOffscreen;
-
     public bool IsOffscreen => _isOffscreen;
+
+    /// <summary>
+    /// Whether the offscreen target carries a depth image, which is what lets a mesh region draw on it. False
+    /// until <see cref="RequireMeshDepth"/> (or a <c>meshDepth</c> at creation) has been honoured by a
+    /// <see cref="BeginOffscreenFrame"/>, and always false for a context that is not offscreen.
+    /// </summary>
+    public bool OffscreenHasDepth => _isOffscreen && _mainHasDepth;
+
+    // The main target's depth image handle (the offscreen target's, or the swapchain's), for the tests: Null
+    // while the target has none.
+    internal VkImage OffscreenDepthImage => _depthImage;
+
     public uint OffscreenWidth => _offscreenWidth;
     public uint OffscreenHeight => _offscreenHeight;
     public VkFormat OffscreenFormat => VkFormat.B8G8R8A8Unorm;
@@ -31,14 +50,19 @@ public sealed unsafe partial class VulkanContext
     /// (though the extension is still advertised on the device — every modern GPU has it,
     /// and skipping it would complicate this factory's physical-device pick).
     /// </summary>
+    /// <param name="meshDepth">Give the target a depth image from the start, so a mesh region draws on its
+    /// first frame: <see cref="RequireMeshDepth"/> before anything is allocated. False leaves the target
+    /// without one until a mesh asks for it.</param>
     public static VulkanContext CreateOffscreen(VkInstance instance, uint width, uint height,
-        uint vertexBufferSize = 4 * 1024 * 1024, VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1)
+        uint vertexBufferSize = 4 * 1024 * 1024, VkSampleCountFlags msaaSamples = VkSampleCountFlags.Count1,
+        bool meshDepth = false)
     {
         // Headless device (no surface, no swapchain extension). The offscreen context owns it.
         var device = VulkanDevice.CreateOffscreen(instance, msaaSamples);
         var ctx = new VulkanContext(device, VkSurfaceKHR.Null, vertexBufferSize, ownsDevice: true);
 
         ctx._isOffscreen = true;
+        ctx._mainWantsDepth = meshDepth;
         ctx._offscreenWidth = width;
         ctx._offscreenHeight = height;
 
@@ -116,18 +140,51 @@ public sealed unsafe partial class VulkanContext
             DeviceApi.vkCreateImageView(&msaaViewCI, null, out _msaaImageView).CheckResult();
         }
 
-        // Depth attachment — the swapchain path's fields, free here for the same reason the MSAA ones are.
-        CreateDepthAttachment(width, height, out _depthImage, out _depthMemory, out _depthImageView);
+        CreateOffscreenFramebuffers(width, height);
+    }
 
-        // Framebuffer: colour (multisample under MSAA, else the readback image), depth, and under MSAA
-        // the readback image as the resolve target.
+    // The part of the target that follows the depth shape: the depth image and the framebuffers. Built for
+    // whatever has been asked for, so a resize keeps the shape and a late request is honoured at once.
+    private void CreateOffscreenFramebuffers(uint width, uint height)
+    {
+        _mainHasDepth = _mainWantsDepth;
+        // Depth attachment — the swapchain path's fields, free here for the same reason the MSAA ones are.
+        // None at all on the depth-less shape: that is the allocation this saves.
+        if (_mainHasDepth)
+            CreateDepthAttachment(width, height, out _depthImage, out _depthMemory, out _depthImageView);
+
+        // Framebuffer: colour (multisample under MSAA, else the readback image), depth when the shape has
+        // it, and under MSAA the readback image as the resolve target.
         var msaa = MsaaSamples != VkSampleCountFlags.Count1;
-        _offscreenFramebuffer = CreateCompatibleFramebuffer(RenderPass,
+        _offscreenFramebuffer = CreateCompatibleFramebuffer(MainRenderPass,
             colorView: msaa ? _msaaImageView : _offscreenImageView,
             depthView: _depthImageView,
             resolveView: _offscreenImageView,
             width, height);
         CreateSingleSampleOffscreenTarget(width, height);
+    }
+
+    // The framebuffers and depth images, and nothing else of the target: what a change of shape replaces.
+    private void DestroyOffscreenFramebuffers()
+    {
+        CleanupSingleSampleOffscreenTarget();
+        if (_offscreenFramebuffer != VkFramebuffer.Null)
+        {
+            DeviceApi.vkDestroyFramebuffer(_offscreenFramebuffer);
+            _offscreenFramebuffer = VkFramebuffer.Null;
+        }
+        DestroyDepthAttachment(ref _depthImage, ref _depthMemory, ref _depthImageView);
+    }
+
+    // Switches the target to the depth shape: the allocation a mesh asked for. Runs between frames, from
+    // BeginOffscreenFrame; the framebuffers it replaces may still be named by a frame in flight, so the
+    // device is drained first, bounded and skipped on a stuck GPU as in ResizeOffscreen. Once per target:
+    // the request stands.
+    private void AddOffscreenDepth()
+    {
+        TryDrainDevice(DrainTimeoutNs, "offscreen depth");
+        DestroyOffscreenFramebuffers();
+        CreateOffscreenFramebuffers(_offscreenWidth, _offscreenHeight);
     }
 
     /// <summary>
@@ -175,6 +232,9 @@ public sealed unsafe partial class VulkanContext
     {
         if (!_isOffscreen) throw new InvalidOperationException("BeginOffscreenFrame requires CreateOffscreen");
         NoteUnendedFrameDropped();
+        // A mesh asked for depth since the last frame (RequireMeshDepth, or a BeginMeshRegion that found
+        // none): the target changes shape here, between frames, so this one records with it.
+        if (_mainWantsDepth && !_mainHasDepth) AddOffscreenDepth();
 
         var fence = _inFlightFences[_currentFrame];
         // Skip the wait when nothing is in flight under this index. A fence that was reset for a submit
@@ -226,7 +286,7 @@ public sealed unsafe partial class VulkanContext
         if (!_isOffscreen) throw new InvalidOperationException("BeginOffscreenRenderPass requires CreateOffscreen");
 
         Span<VkClearValue> clears = stackalloc VkClearValue[ClearValueCount];
-        FillClearValues(clears, clearR, clearG, clearB, clearA);
+        var clearCount = FillClearValues(clears, clearR, clearG, clearB, clearA, _mainHasDepth);
         var single = singleSample && SingleSampleMainPassAvailable;
         LastFrameSingleSampled = single;
 
@@ -234,10 +294,10 @@ public sealed unsafe partial class VulkanContext
         {
             VkRenderPassBeginInfo rpBI = new()
             {
-                renderPass = single ? SingleSampleRenderPass : RenderPass,
+                renderPass = single ? MainSingleSampleRenderPass : MainRenderPass,
                 framebuffer = single ? _offscreenSingleSampleFramebuffer : _offscreenFramebuffer,
                 renderArea = new VkRect2D(0, 0, _offscreenWidth, _offscreenHeight),
-                clearValueCount = ClearValueCount,
+                clearValueCount = (uint)clearCount,
                 pClearValues = pClears
             };
             DeviceApi.vkCmdBeginRenderPass(cmd, &rpBI, VkSubpassContents.Inline);
@@ -456,17 +516,13 @@ public sealed unsafe partial class VulkanContext
 
     private void CleanupOffscreenTarget()
     {
-        CleanupSingleSampleOffscreenTarget();
-        if (_offscreenFramebuffer != VkFramebuffer.Null)
-            DeviceApi.vkDestroyFramebuffer(_offscreenFramebuffer);
+        DestroyOffscreenFramebuffers();
         if (_offscreenImageView != VkImageView.Null)
             DeviceApi.vkDestroyImageView(_offscreenImageView);
         if (_offscreenImage != VkImage.Null)
             DeviceApi.vkDestroyImage(_offscreenImage);
         if (_offscreenMemory != VkDeviceMemory.Null)
             DeviceApi.vkFreeMemory(_offscreenMemory);
-
-        DestroyDepthAttachment(ref _depthImage, ref _depthMemory, ref _depthImageView);
 
         // The MSAA attachment CreateOffscreenTarget allocates alongside the readback image. Freeing it
         // here is what lets ResizeOffscreen recreate an MSAA target instead of leaking one per resize
@@ -478,7 +534,7 @@ public sealed unsafe partial class VulkanContext
         if (_msaaMemory != VkDeviceMemory.Null)
             DeviceApi.vkFreeMemory(_msaaMemory);
 
-        _offscreenFramebuffer = VkFramebuffer.Null;
+        _mainHasDepth = false;
         _offscreenImageView = VkImageView.Null;
         _offscreenImage = VkImage.Null;
         _offscreenMemory = VkDeviceMemory.Null;
