@@ -13,6 +13,13 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.41
+
+**On DIR.Lib 11.41, with SharpAstro.Fonts 1.16**: an OpenType font that carries a CFF but no `head` or `maxp`
+loads, both derived from the CFF. PDF producers embed such wrappers (only `CFF ` and `cmap`) as a simple font's
+`/FontFile3 /OpenType` program, and every one used to draw in a substitute face as unrelated characters. No source
+change here.
+
 ## 11.40
 
 **Disposing the renderer waits for the frames in flight, and `SDLVK_VALIDATION=1` validates a Release build**
