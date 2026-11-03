@@ -13,6 +13,23 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.40
+
+**Disposing the renderer waits for the frames in flight, and `SDLVK_VALIDATION=1` validates a Release build**
+(upstream 7.76-7.78), on DIR.Lib 11.40 (a multi-line text editor, the navigation strip, and a padded node and a
+stack measuring their children in the room they are given).
+
+- `VkRenderer.Dispose` destroyed its pipelines and font atlases at once, and every host disposes the renderer before
+  the context, whose `vkDeviceWaitIdle` was the only drain, so a frame still on the GPU held pipelines being
+  destroyed (`VUID-vkDestroyPipeline-pipeline-00765`). It now waits first with `TryWaitAllFramesIdle`: bounded,
+  skipped on a GPU already known stuck, and on a timeout the objects are destroyed anyway. `RendererDisposeTests`
+  pins it under the validation layer.
+- `SDLVK_VALIDATION=1` alone now turns on the Khronos layer, the debug-utils messenger and (with
+  `SDLVK_SYNC_VALIDATION=1`) synchronization validation in any build; it used to need a Debug build as well. Unset,
+  nothing changes.
+- Upstream 7.76's `SdlVulkan.Renderer.Debug` twin package is not taken: this fork publishes nothing, and every
+  consumer builds it from source in its own configuration (see CLAUDE.md).
+
 ## 11.38
 
 **Depth is allocated per target only once a mesh is drawn on it** (upstream 7.75, #146), on DIR.Lib 11.37
