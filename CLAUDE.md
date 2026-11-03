@@ -17,6 +17,7 @@ The fork now mirrors upstream's **full source** — the Android host (`Android/`
 - keep `src/Directory.Build.props`, and keep every csproj FREE of `VersionPrefix` — upstream versions per-csproj, and a csproj `VersionPrefix` overrides the props file, so a sync round silently restores the drift it exists to prevent (see Versioning);
 - don't overwrite `CHANGELOG.md`. The two version lines diverged at 7.6 and the file says so in its own header, so taking upstream's replaces this repo's release history with one numbered differently — and because the entries LOOK right, nothing about the result reads as wrong until someone matches a `Major.Minor` here against a package that never carried it;
 - keep the COMMENTS in `src/Directory.Packages.props`. The file itself is upstream's, in upstream's location — it moved up from `src/SdlVulkan.Renderer/` so it covers the test, inspector and webview projects too, which is what let those three drop the `ManagePackageVersionsCentrally=false` each carried to avoid inheriting the *consumer's* CPM through the submodule layout. What stays fork-only is the prose: the `DIR.Lib` line is inert here (the csproj reaches DIR.Lib through the submodule `ProjectReference`) and the `SharpAstro.AppShell` line beside it is not, and that distinction is exactly the knowledge a wholesale overwrite discards. Keep the `DIR.Lib` version in step with the submodule pin rather than letting it rot;
+- leave out upstream's **Debug twin** (`SdlVulkan.Renderer.Debug`, upstream 7.76): its csproj block (`DebugTwin`, which swaps the DIR.Lib reference for the `DIR.Lib.Debug` package), the two workflow steps that pack and check it, and `tools/debug-twin-check`. The twin exists for consumers that restore the published package and so never see the `#if DEBUG` inspector; this fork publishes nothing and every consumer builds it from source in their own configuration, and the twin would depend on upstream's published `DIR.Lib.Debug` rather than this fork's DIR.Lib submodule. `tools/debug-twin-check` is therefore the one upstream file a file-set comparison shows missing besides `.claude/settings.local.json`;
 - then bump the submodule pin + `VersionMajorMinor` in `src/Directory.Build.props`.
 
 Those last two were found the hard way, by diffing before overwriting: a sync round that trusts this
@@ -47,7 +48,7 @@ It covers **every** package here — renderer, Inspector, WebView, WebView.Nativ
 
 Add the matching entry to [CHANGELOG.md](CHANGELOG.md) at the repo root, in the same commit — newest first, one `## Major.Minor` section each. (The notes used to live in a comment block in `.github/workflows/dotnet.yml`, justified by the double hyphen several of them contain, which XML forbids inside a comment — but that only ever ruled out putting them in a csproj, nothing ever read them there, and they had reached 431 of that file's 590 lines.)
 
-Central package versioning via `src/SdlVulkan.Renderer/Directory.Packages.props` — update there, not in `.csproj`.
+Central package versioning via `src/Directory.Packages.props` — update there, not in `.csproj`.
 
 ## DIR.Lib dependency (submodule)
 
