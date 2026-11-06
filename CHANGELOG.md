@@ -13,6 +13,26 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.45
+
+**One click focuses a window and presses the button, the display may sleep, and the OS is told who the app is**
+(upstream 7.79-7.81), on DIR.Lib 11.45 (a wrap capped by `WithMaxLines` can end in an ellipsis, a scrolled stack
+reserves its scrollbar column, `FloatingPalette` backing, and a timed-out inspector operation frees its slot).
+
+- `SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH` is set to `"1"` before `SDL_Init`: SDL3 swallowed the mouse-down that
+  activated an unfocused window, so every action from another window took two clicks. Opt out with
+  `clickThroughOnFocus: false` on `SdlVulkanApp.Create`, `SdlVulkanWindow.Create` or `CreateTransparent`, for a canvas
+  where a bare click is costly or irreversible.
+- `SDL_HINT_VIDEO_ALLOW_SCREENSAVER` is set to `"1"`: SDL3 held the display on while any of its windows was open.
+  `keepDisplayAwake: true` on the same creators keeps SDL's behaviour, and `SdlVulkanWindow.KeepDisplayAwake(bool)`
+  switches it at runtime, process-wide.
+- `SDL_SetAppMetadata` runs before `SDL_Init`, from an optional `SdlAppMetadata` (name, version, reverse-DNS
+  identifier, creator, url) on every creator, so the taskbar groups the app's windows and Wayland/X11 get an
+  `app_id`/`WM_CLASS`. With none passed, name and version come from the entry assembly; under NativeAOT there may be
+  none, so an AOT app passes it explicitly.
+- The test project takes `SDL3-CS.Native` (tests that read hints need SDL3 to load); the library still leaves the
+  native library to the consuming app.
+
 ## 11.41
 
 **On DIR.Lib 11.41, with SharpAstro.Fonts 1.16**: an OpenType font that carries a CFF but no `head` or `maxp`
