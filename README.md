@@ -48,6 +48,14 @@ while (running)
 }
 ```
 
+The click that activates an unfocused window is delivered to the app as an ordinary click (`SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH`, set before `SDL_Init`), so one click focuses the window and presses the button. An app whose canvas does something costly or irreversible on a bare click passes `clickThroughOnFocus: false` to `SdlVulkanApp.Create`, `SdlVulkanWindow.Create` or `SdlVulkanWindow.CreateTransparent`.
+
+By default the app lets the display sleep (SDL's own default would hold it on while a window is open). Pass
+`keepDisplayAwake: true` to `SdlVulkanWindow.Create`/`CreateTransparent` or `SdlVulkanApp.Create`, or call
+`window.KeepDisplayAwake(true/false)` at runtime (process-wide), for a live view or focusing screen.
+
+**Tell the OS who the app is.** Every creator (`SdlVulkanApp.Create`, `SdlVulkanWindow.Create`, `CreateTransparent`) takes an optional `SdlAppMetadata` (name, version, reverse-DNS identifier such as `com.sharpastro.tianwen`, optional creator and url) and hands it to `SDL_SetAppMetadata` before `SDL_Init`. The taskbar groups the app's windows by it, Wayland and X11 take it as `app_id` / `WM_CLASS`, and the macOS menu and a power-inhibit reason show it. Pass nothing and the entry assembly's name and version are used (under NativeAOT there may be no entry assembly, so pass `appMetadata` explicitly there): `SdlVulkanApp.Create(appMetadata: new("TianWen", "1.4.2", "com.sharpastro.tianwen"))`.
+
 ## Headless / offscreen rendering
 
 `VulkanContext.CreateOffscreen` builds a context that renders to a single `VkImage` instead of a swapchain. No `VkSurfaceKHR`, no SDL window, no `VK_KHR_swapchain` device extension requested — useful for tests, thumbnail / raster workers, CI without a display server, and server-side rendering.
