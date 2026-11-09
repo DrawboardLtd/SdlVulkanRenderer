@@ -13,6 +13,19 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.55
+
+**DIR.Lib 11.55: SharpAstro.Fonts 1.17 and the `.sdfg` glyph cache at format 8.** No change to this repo's code; the DIR.Lib
+submodule goes from 11.51 to 11.55 (the fork's sync of upstream 11.52-11.55).
+
+- **Fonts 1.17.** CFF glyphs that use flex draw (they were displaced past the flex: C# in Depth's NewBaskerville came out as
+  smears), accented composites draw (a German homework sheet's ä, ö and ü were blank), and a bare CFF's built-in encoding is
+  read (the same sheet drew `bardbl` for every bullet and nothing for `(`, `=` or `∈`).
+- **`.sdfg` format 8.** Fields built from the old outlines are discarded and rasterized again on first use, so a cache file
+  cannot go on serving them.
+- **Also in DIR.Lib 11.52-11.54:** `CanvasViewport`, the grouped tree table, and a `PanZoomController` fix; nothing here
+  uses them.
+
 ## 11.51
 
 **Slug text beside MTSDF: a glyph's outline drawn by its own coverage on the GPU, and a probe that A/Bs the two on one page**
