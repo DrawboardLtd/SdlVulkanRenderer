@@ -364,6 +364,39 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         }
     }
 
+    private HdrDisplayInfo _hdrDisplay = HdrDisplayInfo.Sdr;
+
+    /// <summary>The HDR facts of the display this window is on, as of the last <see cref="RefreshHdrDisplay"/>: the
+    /// event loop refreshes them when the window is added and when SDL reports the display or the HDR state changed,
+    /// never per frame. SDR (no HDR, SDR white 1.0, no headroom) before the first refresh.</summary>
+    public HdrDisplayInfo HdrDisplay => _hdrDisplay;
+
+    /// <summary>Raised, on the thread that dispatches SDL events, when <see cref="RefreshHdrDisplay"/> finds the
+    /// facts changed. Carries the new facts.</summary>
+    public event Action<HdrDisplayInfo>? HdrDisplayChanged;
+
+    /// <summary>
+    /// Reads the window's and its display's HDR properties from SDL (<c>WindowHDREnabledBoolean</c>,
+    /// <c>WindowSDRWhiteLevelFloat</c>, <c>WindowHDRHeadroomFloat</c>, <c>DisplayHDREnabledBoolean</c>). On Windows the
+    /// window's values follow the HDR desktop and only the display property says whether the panel is HDR, so HDR counts
+    /// as active only when both say so (<see cref="HdrDisplayInfo.From"/>). Stores the result as
+    /// <see cref="HdrDisplay"/> and returns whether it changed (<see cref="HdrDisplayChanged"/> is raised then).
+    /// </summary>
+    public bool RefreshHdrDisplay()
+    {
+        var windowProps = GetWindowProperties(Handle);
+        var displayProps = GetDisplayProperties(GetDisplayForWindow(Handle));
+        var facts = HdrDisplayInfo.From(
+            GetBooleanProperty(windowProps, Props.WindowHDREnabledBoolean, false),
+            GetBooleanProperty(displayProps, Props.DisplayHDREnabledBoolean, false),
+            GetFloatProperty(windowProps, Props.WindowSDRWhiteLevelFloat, 1f),
+            GetFloatProperty(windowProps, Props.WindowHDRHeadroomFloat, 1f));
+        if (facts == _hdrDisplay) return false;
+        _hdrDisplay = facts;
+        HdrDisplayChanged?.Invoke(facts);
+        return true;
+    }
+
     /// <summary>
     /// Returns the DPI display scale factor for this window (e.g. 1.5 for 150% scaling).
     /// Uses SDL3's <c>GetWindowDisplayScale</c> which correctly handles per-monitor DPI.
@@ -827,9 +860,16 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         // validation, the GPU memory-hazard checker. All a no-op if the layer isn't installed.
         bool useValidation = VulkanValidation.Enabled && VulkanValidation.LayerAvailable();
 
+        // VK_EXT_swapchain_colorspace, when the loader offers it: without it a surface lists only SrgbNonLinear
+        // formats and an scRGB swapchain (VulkanContext's opt-in hdr) cannot be asked for. Nothing else changes
+        // when it is absent, and enabling it adds no work per frame; it only lengthens the surface format list,
+        // which every choice here reads by format and colour space together.
+        var hdrColorSpace = InstanceExtensionAvailable(SwapchainColorSpaceExtension);
+        string[] baseExtensions = hdrColorSpace ? [.. sdlExtensionNames, SwapchainColorSpaceExtension] : sdlExtensionNames;
+
         using var extensionArray = useValidation
-            ? new VkStringArray(WithValidationExtensions(sdlExtensionNames))
-            : new VkStringArray(sdlExtensionNames);
+            ? new VkStringArray(WithValidationExtensions(baseExtensions))
+            : new VkStringArray(baseExtensions);
         using var validationLayers = useValidation ? new VkStringArray([VulkanValidation.LayerName]) : default;
 
         // Ask for the highest instance version the loader offers, capped at what this renderer needs.
@@ -879,6 +919,27 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         if (useValidation)
             VulkanValidation.InstallMessenger(instance, GetApi(instance));
         return instance;
+    }
+
+    // Vortice's name constants are UTF-8 spans (see WithValidationExtensions), so the literal is spelled out here.
+    internal const string SwapchainColorSpaceExtension = "VK_EXT_swapchain_colorspace";
+
+    /// <summary>Whether the Vulkan loader offers an instance extension (<c>vkEnumerateInstanceExtensionProperties</c>).</summary>
+    internal static unsafe bool InstanceExtensionAvailable(string name)
+    {
+        uint count = 0;
+        if (vkEnumerateInstanceExtensionProperties((byte*)null, &count, null) != VkResult.Success || count == 0)
+            return false;
+        var props = new VkExtensionProperties[count];
+        fixed (VkExtensionProperties* p = props)
+        {
+            if (vkEnumerateInstanceExtensionProperties((byte*)null, &count, p) != VkResult.Success)
+                return false;
+            for (var i = 0; i < count; i++)
+                if (new string((sbyte*)p[i].extensionName) == name)
+                    return true;
+        }
+        return false;
     }
 
     // The SDL-required instance extensions plus VK_EXT_debug_utils (for the messenger) and, when sync
