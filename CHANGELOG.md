@@ -13,6 +13,27 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.57
+
+**HDR images: an opt-in scRGB swapchain, float textures and `DrawHdrImage`; a memory target and suspend for hidden
+WebViews; on DIR.Lib 11.57** (upstream 7.84-7.87). Nothing here changes what an SDR context draws or costs.
+
+- **HDR, per context and opt-in** (upstream 7.84, #165). `VulkanContext.Create`, `CreateForSharedDevice` and
+  `CreateOffscreen` take `hdr` (default false). Where the surface offers scRGB (`R16G16B16A16_SFLOAT` in
+  `EXTENDED_SRGB_LINEAR_EXT`) the frame still renders into an 8-bit SDR layer, so every pipeline, blend, MSAA resolve,
+  cached layer and readback is the SDR path's, and `EndFrame` composites the queued HDR images and that layer onto the
+  float image. An SDR context allocates no layer, pass or composite pipeline. `VkTexture.CreateFromRgbaFloat` and
+  `VkRenderer.DrawHdrImage` draw scene-linear floats, tone-mapped on any 8-bit target. `SdlVulkanWindow.HdrDisplay` and
+  `HdrDisplayChanged` carry what SDL says about the window's display; `VulkanContext.ApplyHdrDisplay` follows a move to
+  another display. Upstream measured no SDR regression beyond noise on the Adreno X1-85 (`tools/SdrFrameBench`, new).
+- **WebView** (upstream 7.86, #168): `INativeWebView.SetMemoryUsageTarget`, `TrySuspendAsync` and `Resume`, for a host
+  that keeps a page loaded in a hidden window. WebView2 only; WebKitGTK does nothing.
+- **Upstream 7.85** fixed its Release package depending on `DIR.Lib.Debug`. This fork packs nothing and reaches DIR.Lib
+  through the submodule, so it never had that dependency, and the pack check upstream added for it is left out with the
+  rest of the Debug twin.
+- **DIR.Lib 11.57** (the submodule goes from 11.55 to 11.57): the I-beam over selectable text and a press that reaches five
+  letters beside it (11.56), a table divider that follows the pointer (11.57), and a build with no warnings.
+
 ## 11.55
 
 **DIR.Lib 11.55: SharpAstro.Fonts 1.17 and the `.sdfg` glyph cache at format 8.** No change to this repo's code; the DIR.Lib
