@@ -13,6 +13,15 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.58
+
+**Meshes can carry a specular highlight** (upstream 7.88). `VkRenderer.DrawMesh` gains an overload taking a highlight
+colour and a Blinn-Phong exponent, added on top of the two-sided diffuse shade, so a dark part facing the light still
+catches it. The highlight assumes a headlamp, where the half vector is the light direction and n.h is the lambert term.
+The mesh pipeline's push constants grow from 96 to 112 bytes; the existing overload pushes no highlight and draws exactly
+as before.
+
+
 ## 11.57
 
 **HDR images: an opt-in scRGB swapchain, float textures and `DrawHdrImage`; a memory target and suspend for hidden
