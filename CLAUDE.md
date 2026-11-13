@@ -104,7 +104,7 @@ The 84-byte push-constant block is only a constraint if you use `ctx.PipelineLay
 - `SdlVulkanApp.cs` — process-wide SDL lifecycle + the shared `VkInstance`/`VulkanDevice` a multi-window app hangs off.
 - `SdlVulkanWindow.cs` — per-window SDL3 window + Vulkan surface. Implements AppShell's `IActivatableWindow`, so a single-instance hand-off can raise it.
 - `VkRenderer.cs` — high-level draw API, extends `Renderer<VulkanContext>` from DIR.Lib; GPU-optimized DrawLine/DrawEllipse.
-- `VkMeshPipeline.cs` — the depth-testing lit-mesh pipeline behind `VkRenderer.DrawMesh`; its own 96-byte push-constant layout, held by `VkPipelineSet`.
+- `VkMeshPipeline.cs` — the depth-testing lit-mesh pipeline behind `VkRenderer.DrawMesh`; its own 112-byte push-constant layout (mvp, colour, light direction, highlight), held by `VkPipelineSet`.
 - `VulkanContext.cs` — per-window swapchain/sync/vertex-ring lifecycle (references a `VulkanDevice`). Partials carry the paths that need their own: `VulkanContext.Offscreen.cs` (headless render-to-image), `.SwapchainReadback.cs`, `.ThumbnailCapture.cs`, `.Damage.cs` (repaint only what changed), `.CachedLayer.cs` (so a chrome-only redraw does not re-shade the picture), `.Depth.cs` (per-target depth state, allocated only once a mesh draws on the target, + the framebuffer and clear-value helpers), `.DeferredDestroy.cs` (release a bound object without a full drain).
 - `VkFontAtlas.cs` — glyph rasterization cache + GPU texture management (drives DIR.Lib's `ManagedFontRasterizer`).
 - `VkSdfFontAtlas.cs` — MTSDF glyph atlas for resolution-independent text.
