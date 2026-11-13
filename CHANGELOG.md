@@ -21,6 +21,8 @@ catches it. The highlight assumes a headlamp, where the half vector is the light
 The mesh pipeline's push constants grow from 96 to 112 bytes; the existing overload pushes no highlight and draws exactly
 as before.
 
+**A mesh can be drawn from a buffer the caller keeps.** `DrawMesh(VkBuffer, byteOffset, vertexCount, ...)` draws a range of a buffer made with `CreatePersistentVertexBuffer`, so a model drawn on every frame of an orbit is uploaded once rather than copied through the frame's vertex ring each time (a 630,000-triangle CAD model was 45 MB a frame). The span overloads are unchanged.
+
 
 ## 11.57
 
