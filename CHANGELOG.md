@@ -13,6 +13,14 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.99
+
+**Dependencies to their latest releases, on DIR.Lib 11.99** (upstream 7.108). SharpAstro.AppShell 1.4 (was 1.2: 1.3
+adds `CrashTrace`, 1.4 `DesktopAccent` and `DesktopAppearance`, all opt-in) and, for the inspector, SharpAstro.Png 3.41
+(was 3.14). DIR.Lib 11.99 takes SharpAstro.Svg 3.41 and changes nothing else. Nothing in the renderer's own source
+changes. The AppShell line here is live (there is no fork of it), so a consumer that pins AppShell itself moves with it.
+Additive only.
+
 ## 11.98
 
 **The debug inspector in Release behind an opt-in, glyph atlases that never touch the GPU under a recording frame, a

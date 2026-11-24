@@ -13,12 +13,12 @@
          PackageReference upstream's conditional path uses, so the line stays and is kept in step with
          whatever the submodule is pinned at, rather than being left to rot at whatever it said when
          the divergence was introduced. -->
-    <PackageVersion Include="DIR.Lib" Version="11.98.*" />
+    <PackageVersion Include="DIR.Lib" Version="11.99.*" />
     <!-- IActivatableWindow, which SdlVulkanWindow implements. Unlike the DIR.Lib line above this one
          is LIVE: there is no drawboard fork of AppShell, so the csproj's sibling probe misses in both
          the nested-submodule layout and a standalone clone, and the PackageReference path is the one
          that actually resolves. -->
-    <PackageVersion Include="SharpAstro.AppShell" Version="1.2.*" />
+    <PackageVersion Include="SharpAstro.AppShell" Version="1.4.*" />
     <!-- Interface-only (no implementation assemblies): the renderer logs its unconditional
          diagnostics through an injectable ILogger (SdlVulkanLog) with a stderr fallback. -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
@@ -52,7 +52,7 @@
     <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.0.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
     <PackageVersion Include="ModelContextProtocol" Version="2.2.0" />
-    <PackageVersion Include="SharpAstro.Png" Version="3.14.*" />
+    <PackageVersion Include="SharpAstro.Png" Version="3.41.*" />
     <PackageVersion Include="Shouldly" Version="4.3.0" />
     <PackageVersion Include="WebView2Aot" Version="1.4.1" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
