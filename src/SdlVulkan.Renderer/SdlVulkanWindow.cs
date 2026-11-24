@@ -33,6 +33,9 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
     // SDL out from under their sibling windows.
     private readonly bool _ownsSdl;
 
+    // The thread that created the window runs its loop; Dispose must happen there (DisposeThreadGuard).
+    private readonly int _ownerThreadId = Environment.CurrentManagedThreadId;
+
     private SdlVulkanWindow(nint handle, VkInstance instance, VkSurfaceKHR surface, bool ownsSdl)
     {
         Handle = handle;
@@ -121,6 +124,15 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
             // callbacks that null the native window, so building the swapchain hits VK_ERROR_SURFACE_LOST_KHR
             // (libsdl-org/SDL#12957). Fullscreen keeps the native surface attached.
             flags |= WindowFlags.Fullscreen;
+            // iOS, two flags:
+            // - HighPixelDensity: iOS sizes a window in POINTS and gives it a drawable of the same size unless asked
+            //   for the screen's pixel density, so without it an iPad draws at half its resolution, scaled up blurred.
+            //   (Its mouse events stay in points; SdlEventLoop scales them to pixels, 7.94.)
+            // - Resizable: without it (and without SDL_HINT_ORIENTATIONS) SDL allows only the orientations matching
+            //   the window's initial shape (UIKit_GetSupportedOrientations), so a portrait design size pinned the app
+            //   to portrait and a landscape iPad drew it sideways (7.94). With it SDL allows every orientation and iOS
+            //   applies the ones the app's Info.plist lists. The window still fills the screen.
+            if (OperatingSystem.IsIOS()) flags |= WindowFlags.HighPixelDensity | WindowFlags.Resizable;
         }
         else
         {
@@ -175,8 +187,11 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         if (!Init(InitFlags.Video | InitFlags.Events))
             throw new InvalidOperationException($"SDL_Init failed: {GetError()}");
 
-        VulkanLoadLibrary(null);
-        vkInitialize().CheckResult();
+        // One Vulkan library for SDL and for Vortice: null (each finds the system loader) everywhere but iOS, where
+        // there is no system loader and both are pointed at the MoltenVK the app bundles (AppleVulkan).
+        var vulkanLibrary = AppleVulkan.BundledLibraryPath();
+        VulkanLoadLibrary(vulkanLibrary);
+        vkInitialize(vulkanLibrary).CheckResult();
 
         return CreateVulkanInstance();
     }
@@ -803,6 +818,7 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
 
     public void Dispose()
     {
+        DisposeThreadGuard.Enforce(_ownerThreadId, "SdlVulkanWindow");
         foreach (var id in _globalHotKeys.ToArray())
             UnregisterGlobalHotKey(id);
         if (OperatingSystem.IsWindows())
@@ -867,6 +883,15 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         var hdrColorSpace = InstanceExtensionAvailable(SwapchainColorSpaceExtension);
         string[] baseExtensions = hdrColorSpace ? [.. sdlExtensionNames, SwapchainColorSpaceExtension] : sdlExtensionNames;
 
+        // VK_KHR_portability_enumeration, on Apple platforms only: there the device is MoltenVK, a portability
+        // implementation, and a Vulkan loader in front of it (the LunarG SDK on macOS) lists it only to an
+        // instance that asks for portability devices. Asked nowhere else on purpose: the Khronos loader offers the
+        // extension on every platform, and asking for it on Windows or Linux would let a non-conformant ICD into
+        // the device pick that today never sees one. The device side (VK_KHR_portability_subset) is VulkanDevice's.
+        var portability = AppleVulkan.IsApple && InstanceExtensionAvailable(PortabilityEnumerationExtension);
+        if (portability)
+            baseExtensions = [.. baseExtensions, PortabilityEnumerationExtension];
+
         using var extensionArray = useValidation
             ? new VkStringArray(WithValidationExtensions(baseExtensions))
             : new VkStringArray(baseExtensions);
@@ -883,6 +908,7 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
         VkInstanceCreateInfo instanceCI = new()
         {
             pApplicationInfo = &appInfo,
+            flags = portability ? VkInstanceCreateFlags.EnumeratePortabilityKHR : VkInstanceCreateFlags.None,
             enabledExtensionCount = extensionArray.Length,
             ppEnabledExtensionNames = extensionArray
         };
@@ -923,6 +949,7 @@ public sealed unsafe class SdlVulkanWindow : IDisposable, IActivatableWindow
 
     // Vortice's name constants are UTF-8 spans (see WithValidationExtensions), so the literal is spelled out here.
     internal const string SwapchainColorSpaceExtension = "VK_EXT_swapchain_colorspace";
+    internal const string PortabilityEnumerationExtension = "VK_KHR_portability_enumeration";
 
     /// <summary>Whether the Vulkan loader offers an instance extension (<c>vkEnumerateInstanceExtensionProperties</c>).</summary>
     internal static unsafe bool InstanceExtensionAvailable(string name)

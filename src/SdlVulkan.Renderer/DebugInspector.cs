@@ -1,5 +1,4 @@
-﻿#if DEBUG
-using System.Buffers;
+﻿using System.Buffers;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
@@ -13,7 +12,7 @@ using Layout = DIR.Lib.Layout;
 namespace SdlVulkan.Renderer;
 
 /// <summary>
-/// DEBUG-only live UI debug inspector. Hosts a TCP command server (ephemeral port) plus a UDP
+/// Live UI debug inspector, compiled into every build and INERT unless the process opts in. Hosts a TCP command server (ephemeral port) plus a UDP
 /// multicast discovery responder so a sidecar (the published SdlVulkan.Renderer.Inspector MCP
 /// server) can discover this running app and drive it: read the clickable region tree, capture a
 /// screenshot, inject input, and post named signals.
@@ -26,7 +25,15 @@ namespace SdlVulkan.Renderer;
 /// Enqueueing still calls <see cref="SdlWindowView.RequestRedraw"/> to wake the loop promptly
 /// (latency bounded by the loop's ~16ms wait).
 /// </para>
-/// The entire type is compiled only in DEBUG builds, so no release artifact carries it.
+/// <para>
+/// Opt-in: in a Release build <see cref="Attach(SdlEventLoop, SdlWindowView, DebugInspectorOptions)"/> starts
+/// nothing unless the environment sets <c>DIR_INSPECTOR=1</c> and <c>DIR_INSPECTOR_TOKEN</c> (DIR.Lib's
+/// <see cref="DebugInspectorCore.StartIfOptedIn(IDebugInspectorHost, DebugInspectorDiscovery)"/>); every
+/// client request must then carry the token. With it unset the returned inspector is inert: no socket, no
+/// registry file and no <see cref="SdlEventLoop.OnLoopIteration"/> hook, so frame pacing is untouched.
+/// A Debug build keeps its always-on behaviour unless <c>DIR_INSPECTOR</c> is set, which then applies the
+/// same rules.
+/// </para>
 /// </summary>
 public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugInspectorSteppedHost
 {
@@ -34,7 +41,7 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
     private readonly DebugInspectorOptions _opts;
     private readonly SdlWindowView _view;
     private readonly SdlEventLoop _loop; // for frame-timing readback (frameStats)
-    private readonly string _startedAtUtc;
+    private string _startedAtUtc = ""; // set only on the active path: formatting it roots DateTime/culture code a trimmed publish must not keep
     private DebugInspectorCore? _core;
 
     private DebugInspector(SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts)
@@ -42,12 +49,14 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         _opts = opts;
         _view = view;
         _loop = loop;
-        _startedAtUtc = DateTimeOffset.UtcNow.ToString("o");
     }
 
     /// <summary>The ephemeral loopback port the command server bound to; 0 before
     /// <see cref="Attach(SdlEventLoop, DebugInspectorOptions)"/>.</summary>
     public int Port => _core?.Port ?? 0;
+
+    /// <summary>True when the command server is running; false for an inert inspector (the process did not opt in).</summary>
+    public bool IsActive => _core is not null;
 
     // ---------------- IDebugInspectorHost: the parts that are actually SDL ----------------
 
@@ -77,16 +86,55 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         $"\"startedAt\":{DebugInspectorCore.Quote(_startedAtUtc)}";
 
     /// <summary>
-    /// Attaches the inspector to the given loop + window view and starts the command server. Chains the
-    /// core's pump onto the loop's <see cref="SdlEventLoop.OnLoopIteration"/>. Call once, under
-    /// <c>#if DEBUG</c>, after the loop's callbacks are wired but before <see cref="SdlEventLoop.Run"/>.
-    /// The returned <see cref="IDisposable"/> stops the server when disposed.
+    /// Attaches the inspector to the given loop + window view and, when the process opted in, starts the
+    /// command server and chains the core's pump onto the loop's <see cref="SdlEventLoop.OnLoopIteration"/>.
+    /// Call once, unconditionally, after the loop's callbacks are wired but before <see cref="SdlEventLoop.Run"/>:
+    /// when the opt-in is absent (or has no token) the result is inert (<see cref="IsActive"/> false) and
+    /// nothing is started or chained. The returned <see cref="IDisposable"/> stops the server when disposed.
     /// </summary>
     public static DebugInspector Attach(SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts)
     {
-        var inspector = new DebugInspector(loop, view, opts);
+        // Branch on the property itself, so ILC's feature-switch substitution makes the active half unreachable.
+        // A bool passed down as a parameter is not propagated, and the whole active half stayed rooted.
+        if (DebugInspectorCore.IsSupported) return AttachSupported(loop, view, opts);
+        return AttachUnsupported(loop, view, opts, Console.Error);
+    }
 
-        inspector._core = DebugInspectorCore.Start(inspector, opts.EnableDiscovery);
+    /// <summary>
+    /// The decision behind <see cref="Attach(SdlEventLoop, SdlWindowView, DebugInspectorOptions)"/>, with DIR.Lib's
+    /// feature switch and stderr passed in (the test seam; the public overload passes <see cref="DebugInspectorCore.IsSupported"/>
+    /// directly so ILC sees the constant). With the switch off nothing here starts or hands the inspector to the host
+    /// code, even in a Debug build, so ILC can trim the verbs; DIR_INSPECTOR=1 gets one stderr line saying why.
+    /// </summary>
+    internal static DebugInspector Attach(
+        SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts, bool supported, TextWriter stderr)
+        => supported ? AttachSupported(loop, view, opts) : AttachUnsupported(loop, view, opts, stderr);
+
+    private static DebugInspector AttachUnsupported(
+        SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts, TextWriter stderr)
+    {
+        if (Environment.GetEnvironmentVariable(DebugInspectorCore.OptInVariable) == "1")
+        {
+            stderr.WriteLine($"[inspector] {DebugInspectorCore.OptInVariable}=1 but the inspector was trimmed out of this build: publish with -p:DirInspectorSupport=true");
+            stderr.Flush();
+        }
+        return new DebugInspector(loop, view, opts); // inert: _core stays null
+    }
+
+    private static DebugInspector AttachSupported(SdlEventLoop loop, SdlWindowView view, DebugInspectorOptions opts)
+    {
+        var inspector = new DebugInspector(loop, view, opts) { _startedAtUtc = DateTimeOffset.UtcNow.ToString("o") };
+
+        var discovery = opts.EnableDiscovery ? DebugInspectorDiscovery.Registry : DebugInspectorDiscovery.None;
+#if DEBUG
+        // Debug builds stay always-on, as before, unless the run-time opt-in is present (then its rules, token included, apply).
+        inspector._core = Environment.GetEnvironmentVariable(DebugInspectorCore.OptInVariable) is null
+            ? DebugInspectorCore.Start(inspector, discovery)
+            : DebugInspectorCore.StartIfOptedIn(inspector, discovery);
+#else
+        inspector._core = DebugInspectorCore.StartIfOptedIn(inspector, discovery);
+#endif
+        if (inspector._core is null) return inspector; // inert: no hook, frame pacing untouched
 
         // The pump goes on the loop's per-iteration hook (OnLoopIteration), NOT OnPostFrame: it must run
         // every iteration -- including when nothing rendered because the window is minimized -- so commands
@@ -97,7 +145,7 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         loop.OnLoopIteration = () =>
         {
             prev?.Invoke();
-            inspector._core!.Pump();
+            inspector._core.Pump();
         };
         return inspector;
     }
@@ -217,7 +265,9 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         "restore" => ExecuteWindowState(static w => w.Restore()),
         "validationReport" => ExecuteValidationReport(),
         "frameStats" => ExecuteFrameStats(),
+#if DEBUG
         "gpuFault" => ExecuteGpuFault(p),
+#endif
         "click" => ExecuteClickAt(Coord(p, "x"), Coord(p, "y"), Mods(p), Clicks(p)),
         "clickLabel" => ExecuteClickLabel(RequiredString(p, "label"), Clicks(p)),
         "key" => ExecuteKey(ResolveInputKey(RequiredString(p, "key")), Mods(p)),
@@ -428,6 +478,8 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         void RequestRedraw();
         /// <summary>Marks the next presented frame to capture itself.</summary>
         void RequestCapture();
+        /// <summary>Disarms a capture request no frame has taken, and drops a finished unconsumed snapshot.</summary>
+        void CancelCapture();
         bool TryTakeCapture(out byte[] rgba, out uint width, out uint height);
     }
 
@@ -463,6 +515,7 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
             => view.Window.TryGetUsableSizeInPixels(out width, out height);
         public void RequestRedraw() => view.RequestRedraw();
         public void RequestCapture() => view.Renderer.Context.RequestPresentCapture();
+        public void CancelCapture() => view.Renderer.Context.CancelPresentCapture();
         public bool TryTakeCapture(out byte[] rgba, out uint width, out uint height)
             => view.Renderer.Context.TryTakePresentCapture(out rgba, out width, out height);
     }
@@ -579,32 +632,39 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
     /// <para>With a size, the window is resized first (see <see cref="ResizeCore"/>), captured at that size,
     /// then put back as it was: maximised again, or its floating size and position.</para>
     /// </summary>
-    internal sealed class ScreenshotOperation : IDebugInspectorOperation
+    internal sealed class ScreenshotOperation : IDebugInspectorOperation, IDisposable
     {
         internal static readonly TimeSpan DefaultPresentBudget = TimeSpan.FromSeconds(5);
         internal const string NoPresentError = "the window presented no frame: is the display off?";
+        internal const string MinimizedError = "the window is minimized and did not restore: no frame can be captured";
 
         private readonly IInspectorWindow _window;
         private readonly bool _reminimize;
         private readonly TimeSpan _presentBudget;
         private readonly bool _unminimised;
         private readonly long _baselineFrames;
-        private readonly long _startTick = Environment.TickCount64;
+        private readonly Func<long> _nowMs;
+        private readonly long _startTick;
         private readonly (int W, int H)? _size;
         private ResizeCore? _resize;
         private bool _captureRequested;
+        private bool _finished;
+        private long _lastFrames, _lastProgressTick;
         private bool _wasMaximized;
         private (int Width, int Height) _oldSize;
         private (int X, int Y) _oldPos;
 
         internal ScreenshotOperation(IInspectorWindow window, bool reminimize, TimeSpan presentBudget,
-            int? width = null, int? height = null)
+            int? width = null, int? height = null, Func<long>? nowMs = null)
         {
+            _nowMs = nowMs ?? (() => Environment.TickCount64);
+            _startTick = _nowMs();
             _window = window;
             _reminimize = reminimize;
             _presentBudget = presentBudget;
             _size = width is { } w && height is { } h ? (w, h) : null;
-            _baselineFrames = window.FramesPresented;
+            _baselineFrames = _lastFrames = window.FramesPresented;
+            _lastProgressTick = _startTick;
             if (window.IsMinimized)
             {
                 _unminimised = true;
@@ -661,6 +721,10 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
             var reply = Step();
             if (reply is not null)
             {
+                _finished = true;
+                // The slot is free once a reply is given; so must the context be: a request still armed
+                // would ride whatever frame presents next and answer a later screenshot with a stale one.
+                _window.CancelCapture();
                 PutBack();
                 if (_unminimised && _reminimize)
                 {
@@ -669,6 +733,23 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
             }
             return reply;
         }
+
+        /// <summary>The core disposes an operation that hit its deadline or whose client gave up.</summary>
+        public void Dispose()
+        {
+            if (_finished) return;
+            _finished = true;
+            _window.CancelCapture();
+            PutBack();
+        }
+
+        private void MarkProgress()
+        {
+            _lastFrames = _window.FramesPresented;
+            _lastProgressTick = _nowMs();
+        }
+
+        private string NoFrameError() => _window.IsMinimized ? MinimizedError : NoPresentError;
 
         private string? Step()
         {
@@ -691,11 +772,12 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
                     {
                         _window.RequestCapture();
                         _captureRequested = true;
+                        MarkProgress();
                     }
                 }
-                else if (Environment.TickCount64 - _startTick >= _presentBudget.TotalMilliseconds)
+                else if (_nowMs() - _startTick >= _presentBudget.TotalMilliseconds)
                 {
-                    return Error(NoPresentError);
+                    return Error(NoFrameError());
                 }
 
                 _window.RequestRedraw();
@@ -709,6 +791,7 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
                 if (r.Length > 0) return Error(r);
                 _window.RequestCapture();
                 _captureRequested = true;
+                MarkProgress();
                 _window.RequestRedraw();
                 return null;
             }
@@ -723,6 +806,20 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
                 // Structured error rather than more waiting: never queue work behind a fence that is
                 // not signalling. The caller can retry once the GPU recovers.
                 return Error("screenshot unavailable: GPU stalled");
+            }
+
+            // The window may have been minimized (or hidden) after the request: no frame ever carries it,
+            // and waiting out the whole timeout would hold the slot against every later screenshot.
+            var frames = _window.FramesPresented;
+            var now = _nowMs();
+            if (frames > _lastFrames)
+            {
+                _lastFrames = frames;
+                _lastProgressTick = now;
+            }
+            else if (now - _lastProgressTick >= _presentBudget.TotalMilliseconds)
+            {
+                return Error(NoFrameError());
             }
 
             _window.RequestRedraw(); // keep frames coming until the capture frame's fence is waited
@@ -986,13 +1083,24 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
     {
         // The modifiers ride on every motion event, as a held key does on real ones, so a hover that
         // answers to a key (the atlas previewing a Ctrl+click) can be driven without a keyboard.
-        _view.DispatchPointerMove(x1, y1, mods);
+        var consumed = _view.DispatchPointerMove(x1, y1, mods);
         for (var i = 1; i <= steps; i++)
         {
             var t = (float)i / steps;
-            _view.DispatchPointerMove(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, mods);
+            consumed |= _view.DispatchPointerMove(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, mods);
         }
-        _view.RequestRedraw();
+
+        // A move the app took owes the frame a real move owes: one armed FOR A POINTER MOVE, so an app that narrows such
+        // a frame to what the move changed (RedrawPendingForPointerMoveAlone) can be driven and measured from here. It
+        // used to be a plain redraw request, which such an app reads as a cause it cannot name and draws in full.
+        if (consumed)
+        {
+            _view.ArmForPointerMove();
+        }
+        else
+        {
+            _view.RequestRedraw();
+        }
         return "\"ok\"";
     }
 
@@ -1051,11 +1159,12 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
     });
 
     /// <summary>
-    /// Arms, clears or reads the window's device fault (<see cref="GpuFaultInjection"/>): <c>mode</c> is
+    /// Arms, clears or reads the window's device fault (GpuFaultInjection, DEBUG only): <c>mode</c> is
     /// <c>reject</c> (with an optional positive <c>count</c>; without one, every submit until cleared),
     /// <c>lost</c>, <c>clear</c>, or <c>status</c>, the default. Answers with the state after the change,
     /// plus the context's own view of it, so one call both acts and shows what the renderer made of it.
     /// </summary>
+#if DEBUG
     private string ExecuteGpuFault(JsonElement p)
     {
         var context = _view.Renderer.Context;
@@ -1108,6 +1217,8 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
             w.WriteEndObject();
         });
     }
+
+#endif
 
     private static string ExecuteValidationReport() => ToJson(w =>
     {
@@ -1169,4 +1280,3 @@ public sealed class DebugInspector : IDisposable, IDebugInspectorHost, IDebugIns
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 }
-#endif

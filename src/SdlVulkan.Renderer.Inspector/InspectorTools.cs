@@ -1,15 +1,15 @@
 using System.ComponentModel;
-using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
-using SharpAstro.Png;
+
+using SdlVulkan.Renderer.Inspector.Client;
 
 namespace SdlVulkan.Renderer.Inspector;
 
 /// <summary>
-/// MCP tools that bridge an AI agent to a running Debug-build SDL3+Vulkan app. Discovery resolves
+/// MCP tools that bridge an AI agent to a running SDL3+Vulkan app. Discovery resolves
 /// which instance to talk to; action tools take an optional <c>instance</c> pid (defaulting to the
 /// sole running instance, erroring if ambiguous).
 /// </summary>
@@ -19,7 +19,7 @@ public sealed class InspectorTools
     [McpServerTool, Description("Discover running Debug-build SDL/Vulkan app instances on the local machine and LAN. Returns one line per instance: pid, app, title, address:port.")]
     public static async Task<string> list_instances(InspectorDiscoveryClient discovery, CancellationToken ct = default)
     {
-        const string none = "No debuggable instances found. Is a Debug-build app running with DebugInspector.Attach?";
+        const string none = "No debuggable instances found. Is an app running with DebugInspector.Attach, DIR_INSPECTOR=1 and DIR_INSPECTOR_TOKEN set? A trimmed or NativeAOT publish has no inspector unless it was published with -p:DirInspectorSupport=true.";
         var (all, notes) = await discovery.DiscoverWithNotesAsync(ct);
         if (all.Count == 0 && notes.Count == 0) return none;
         var sb = new StringBuilder();
@@ -52,8 +52,7 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "describe", null, ct);
-        return result.GetRawText();
+        return (await new InspectorClient(target).DescribeUiAsync(ct)).GetRawText();
     }
 
     [McpServerTool, Description(
@@ -69,8 +68,7 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "describeLayout", null, ct);
-        return result.GetRawText();
+        return (await new InspectorClient(target).DescribeLayoutAsync(ct)).GetRawText();
     }
 
     [McpServerTool, Description("Capture a PNG screenshot of the instance's current window frame. With width and height (window pixels) the window is resized first, captured at that size and then put back as it was (maximised, its floating size and position, or minimised with reminimize). A minimized window is restored first, the capture waits for its first presented frame, and the window stays restored unless reminimize is true (the wire reply carries unminimised:true then). If the window presents no frame within a few seconds the call fails at once with 'the window presented no frame: is the display off?'.")]
@@ -82,16 +80,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var args = (captureWidth > 0 || captureHeight > 0)
-            ? Json.Obj(("reminimize", reminimize), ("width", captureWidth), ("height", captureHeight))
-            : reminimize ? Json.Obj(("reminimize", true)) : null;
-        var result = await socket.SendAsync(target, "screenshot", args, ct);
-        var width = result.GetProperty("width").GetInt32();
-        var height = result.GetProperty("height").GetInt32();
-        var format = result.GetProperty("format").GetString();
-        var payload = Convert.FromBase64String(result.GetProperty("base64").GetString() ?? "");
-        var rgba = format == "rgba+gzip" ? Gunzip(payload) : payload;
-        var png = PngWriter.Encode(rgba, width, height);
+        var shot = await new InspectorClient(target).ScreenshotAsync(reminimize, captureWidth, captureHeight, ct);
+        var png = shot.Png;
         return ImageContentBlock.FromBytes(png, "image/png");
     }
 
@@ -105,8 +95,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "click", Json.Obj(("x", x), ("y", y), ("mods", mods), ("clicks", clicks)), ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).ClickAsync(x, y, mods, clicks, ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Click the button whose label (ButtonHit action, e.g. 'Tab:Planner') matches. Use describe_ui to see labels.")]
@@ -135,8 +125,8 @@ public sealed class InspectorTools
             "A DIR.Lib InputKey name such as Enter, Escape, Tab, Up, F9 or A. Modifiers belong in 'mods'.");
 
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "key", Json.Obj(("key", key), ("mods", mods)), ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).PressKeyAsync(key, mods, ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Inject a text-input string (as if typed). Goes to the focused text field, if any.")]
@@ -149,8 +139,8 @@ public sealed class InspectorTools
             "The string to inject, as if typed. A key that is not a character (Enter, Escape, an arrow) goes through press_key.");
 
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "text", Json.Obj(("s", text)), ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).TypeTextAsync(text, ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Synthesize a mouse-wheel scroll at pixel (x, y), routed through the same path as a real SDL wheel event. scrollY > 0 is wheel-up (zoom IN in most views, e.g. the sky map / FITS viewer); negative zooms out. The view zooms around (x, y). Magnitude ~1 per notch. Pass mods to hold a modifier during the tick -- a wheel gesture usually means something ELSE with one held (Ctrl zooms, Shift scrolls sideways), and those readings are unreachable any other way.")]
@@ -179,8 +169,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "drag", Json.Obj(("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2), ("mods", mods), ("steps", steps)), ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).DragAsync(x1, y1, x2, y2, mods, steps, ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Move the pointer from (x1,y1) to (x2,y2) with NO button held -- HOVER, not a drag. Emits interpolated motion events between the endpoints. This is the only verb that can reach hover-driven behaviour: a hover highlight, a tooltip, a cursor change, a readout that tracks the pointer. click / drag / press_hold all arrive with a button DOWN, so none of them can drive it.")]
@@ -195,9 +185,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "move",
-            Json.Obj(("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2), ("steps", steps), ("mods", mods)), ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).MoveAsync(x1, y1, x2, y2, steps, mods, ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Synthesize a left-button PRESS-AND-HOLD at (x, y): mouse-down, hold the button for `seconds` while the app KEEPS RENDERING (so hold-duration logic -- long-press, hold-to-repeat, charge-up -- ticks through the hold), then mouse-up. The hold runs on the app's per-frame command pump; it does NOT block the render thread. Returns after the hold completes. Use this instead of drag for a stationary timed press; use drag for movement.")]
@@ -232,8 +221,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "resize", Json.Obj(("width", width), ("height", height)), ct);
-        return result.GetRawText();
+        var r = await new InspectorClient(target).ResizeAsync(width, height, ct);
+        return $"{{\"width\":{r.Width},\"height\":{r.Height},\"clamped\":{(r.Clamped ? "true" : "false")}}}";
     }
 
     [McpServerTool, Description("Maximize the instance's window to fill the screen (work area).")]
@@ -252,8 +241,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "restore", null, ct);
-        return result.GetString() ?? "ok";
+        await new InspectorClient(target).RestoreAsync(ct);
+        return "ok";
     }
 
     [McpServerTool, Description("Read the app's rolling-average frame time in milliseconds (the EWMA that drives the frame.slow diagnostic) plus the slow-frame floor. Measure jank numerically: sample this, drive a pan/zoom (ideally via batch so frames render between steps), sample again. Returns {avgFrameMs, slowFrameFloorMs}.")]
@@ -262,8 +251,8 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "frameStats", null, ct);
-        return result.GetRawText();
+        var r = await new InspectorClient(target).FrameStatsAsync(ct);
+        return Json.Obj(("avgFrameMs", r.AvgFrameMs), ("slowFrameFloorMs", r.SlowFrameFloorMs));
     }
 
     [McpServerTool, Description(
@@ -280,8 +269,7 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "validationReport", null, ct);
-        return result.GetRawText();
+        return (await new InspectorClient(target).ValidationReportAsync(ct)).GetRawText();
     }
 
     [McpServerTool, Description(
@@ -408,8 +396,7 @@ public sealed class InspectorTools
         CancellationToken ct = default)
     {
         var target = await ResolveAsync(discovery, instance, ct);
-        var result = await socket.SendAsync(target, "signals", null, ct);
-        return result.GetRawText();
+        return (await new InspectorClient(target).SignalsAsync(ct)).GetRawText();
     }
 
     [McpServerTool, Description("Post a named signal to the instance's app bus. Name must be one of list_signals. Args is a JSON object passed to the signal factory.")]
@@ -464,28 +451,38 @@ public sealed class InspectorTools
     private static string MissingArg(string tool, string parameter, string expected)
         => $"error: {tool} requires a '{parameter}' argument. {expected}";
 
+    // One resolution for the client and the sidecar: InspectorClient.Resolve. Its InspectorException (none,
+    // unknown pid, several with pid 0) reaches the caller as the server's own text through InspectorErrorFilter.
     private static async Task<InspectorInstance> ResolveAsync(InspectorDiscoveryClient discovery, int pid, CancellationToken ct)
-    {
-        var all = await discovery.DiscoverAsync(ct);
-        if (all.Count == 0)
-            throw new InvalidOperationException("No debuggable instances found. Is a Debug-build app running with DebugInspector.Attach?");
-        if (pid != 0)
-            return all.FirstOrDefault(i => i.Pid == pid)
-                ?? throw new InvalidOperationException($"No instance with pid {pid}. Found: {Summarize(all)}");
-        if (all.Count == 1)
-            return all[0];
-        throw new InvalidOperationException($"Multiple instances running; pass instance=<pid>. Found: {Summarize(all)}");
-    }
+        => InspectorClient.Resolve(await discovery.DiscoverAsync(ct), pid);
+}
 
-    private static string Summarize(IReadOnlyList<InspectorInstance> all)
-        => string.Join(", ", all.Select(i => $"{i.App}(pid {i.Pid})"));
+/// <summary>
+/// The SDK replaces an ordinary exception from a tool with "An error occurred invoking '&lt;tool&gt;'." and keeps
+/// the text only for an <see cref="McpException"/>. This ONE call-tool filter (registered once in Program) turns
+/// the failures a tool can meet into an error result carrying the real message, so no tool needs its own
+/// try/catch and the agent sees why (e.g. "'screenshot' is already in progress", "pass a pid").
+/// </summary>
+public static class InspectorErrorFilter
+{
+    public static McpRequestFilter<CallToolRequestParams, CallToolResult> Create()
+        => next => async (context, ct) =>
+        {
+            try
+            {
+                return await next(context, ct);
+            }
+            catch (Exception ex) when (ex is InspectorException or System.IO.IOException
+                or System.Net.Sockets.SocketException or TimeoutException)
+            {
+                return Failure(ex);
+            }
+        };
 
-    private static byte[] Gunzip(byte[] data)
+    /// <summary>The error result for <paramref name="ex"/>: the server's own message, flagged as an error.</summary>
+    public static CallToolResult Failure(Exception ex) => new()
     {
-        using var input = new MemoryStream(data);
-        using var gz = new GZipStream(input, CompressionMode.Decompress);
-        using var output = new MemoryStream();
-        gz.CopyTo(output);
-        return output.ToArray();
-    }
+        IsError = true,
+        Content = [new TextContentBlock { Text = ex.Message }],
+    };
 }

@@ -334,7 +334,11 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
     /// It uploads inside each frame's <c>BeginFrame</c>, from the frame after it is created.
     /// </summary>
     internal VkSlugGlyphStore SlugGlyphStore =>
-        _slugGlyphStore ??= new VkSlugGlyphStore(Surface, _fontAtlas!.Rasterizer);
+        _slugGlyphStore ??= new VkSlugGlyphStore(Surface, _fontAtlas!.Rasterizer, SlugInitialCapacityWords);
+
+    /// <summary>Starting size, in words, of the Slug store made on first use. A test sets it small to make the store grow;
+    /// it has no effect once the store exists.</summary>
+    internal int SlugInitialCapacityWords { get; set; } = VkSlugGlyphStore.DefaultInitialCapacityWords;
 
     /// <summary>
     /// True while the Slug store has a glyph asked for that is not in its buffer yet (still encoding, or waiting for
@@ -1150,6 +1154,10 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         }
     }
 
+    /// <summary>The base and large-tier SDF atlases, for the validation tests.</summary>
+    internal VkSdfFontAtlas? BaseSdfAtlas => _sdfFontAtlas;
+    internal VkSdfFontAtlas? LargeSdfAtlas => _sdfFontAtlasLarge;
+
     /// <summary>Per-tier SDF atlas residency (pages + glyphs) for the tiered-atlas A/B — the small
     /// tier, plus the large tier when it's enabled. Cheap; intended for DEBUG/diagnostic reads.</summary>
     public string SdfAtlasStats => _sdfFontAtlasLarge is { } lg
@@ -1896,7 +1904,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
 
         BindPipeline(_pipelines.TexturedPipeline);
 
-        var descriptorSet = Surface.DescriptorSet;
+        var descriptorSet = _fontAtlas!.DescriptorSet;
         api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
             Surface.PipelineLayout, 0, 1, &descriptorSet, 0, null);
 
@@ -2956,7 +2964,7 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var api = Surface.DeviceApi;
         _pushConstants[20] = 0f; // sdfEdge, unused by a bitmap batch
         BindPipeline(_pipelines!.TexturedPipeline);
-        var bmpDescriptor = Surface.DescriptorSet;
+        var bmpDescriptor = _fontAtlas!.DescriptorSet;
         api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
             Surface.PipelineLayout, 0, 1, &bmpDescriptor, 0, null);
         fixed (float* pPC = _pushConstants)

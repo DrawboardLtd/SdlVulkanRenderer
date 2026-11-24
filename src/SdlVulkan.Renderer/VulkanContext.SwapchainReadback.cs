@@ -1,9 +1,8 @@
-#if DEBUG
 using Vortice.Vulkan;
 
 namespace SdlVulkan.Renderer;
 
-// DEBUG-only swapchain capture for the live UI debug inspector (see DebugInspector.cs).
+// Swapchain capture for the live UI debug inspector (see DebugInspector.cs).
 //
 // The capture is recorded INTO THE FRAME'S OWN command buffer, after vkCmdEndRenderPass (the image
 // is in PresentSrcKHR, the render pass's finalLayout) and before vkEndCommandBuffer -- while this
@@ -50,6 +49,19 @@ public sealed unsafe partial class VulkanContext
         AssertFrameThread(nameof(RequestPresentCapture));
         _presentCaptureReadyRgba = null;
         _presentCaptureRequested = true;
+    }
+
+    /// <summary>
+    /// Disarms a request no frame has picked up yet and drops any finished snapshot, so an abandoned
+    /// capture (timeout, a minimized window that never presented) cannot ride a later frame and answer a
+    /// later request with a stale picture. A copy already recorded into a frame in flight still lands
+    /// harmlessly and is replaced by the next request. Render thread only.
+    /// </summary>
+    internal void CancelPresentCapture()
+    {
+        AssertFrameThread(nameof(CancelPresentCapture));
+        _presentCaptureRequested = false;
+        _presentCaptureReadyRgba = null;
     }
 
     /// <summary>
@@ -212,4 +224,3 @@ public sealed unsafe partial class VulkanContext
         _presentCaptureCapacity = size;
     }
 }
-#endif

@@ -17,7 +17,7 @@ namespace SdlVulkan.Renderer;
 /// on the returned view.
 /// </para>
 /// </summary>
-public sealed class SdlEventLoop
+public sealed class SdlEventLoop : IShutdownDrainLoop
 {
     // windowID -> view, plus a stable iteration list (render order, also survives dict churn).
     private readonly Dictionary<uint, SdlWindowView> _views = new();
@@ -80,14 +80,16 @@ public sealed class SdlEventLoop
             ctx.LastGpuFrameOrdinal, double.IsFinite(gpuMs) ? gpuMs : 0, ctx.DescribeLastGpuSections());
     }
 
-#if DEBUG
-    // Slow-frame diagnostics: a rolling average of real frame time (BeginFrame->EndFrame) plus a
-    // threshold, so ANY stall (atlas evict/grow drain, heavy tessellation, a present hitch) logs one
-    // [rdiag] frame.slow line. Shared across windows — it's only diagnostics.
+    // A rolling average of real frame time (BeginFrame->EndFrame), kept in every build for the inspector's
+    // frameStats (two doubles of arithmetic a frame, no allocation). In DEBUG it also drives the [rdiag]
+    // frame.slow line: a threshold on top of it, so ANY stall (atlas evict/grow drain, heavy tessellation, a
+    // present hitch) logs. Shared across windows.
     private double _frameAvgMs;
-    private const double SlowFrameFloorMs = 40;  // stay quiet below this — normal frames don't log
+    private const double SlowFrameFloorMs = 40;  // stay quiet below this: normal frames don't log
+#if DEBUG
     private const double SlowFrameFactor = 3;    // flag a spike that's >3x the rolling average...
     private const double HardStallMs = 150;      // ...or any outright freeze, regardless of average
+#endif
 
     /// <summary>Rolling average real frame time (ms) — the EWMA that drives the frame.slow log.
     /// Exposed for the DebugInspector's frameStats command so jank can be measured numerically.</summary>
@@ -95,7 +97,12 @@ public sealed class SdlEventLoop
 
     /// <summary>The floor below which frames are considered normal (no slow-frame log).</summary>
     internal static double DebugSlowFrameFloorMs => SlowFrameFloorMs;
-#endif
+
+    /// <summary>The clock every caret blink decision reads (frame pacing and backoff stay on the Stopwatch). Injectable for tests.</summary>
+    public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
+
+    /// <inheritdoc cref="SdlWindowView.Ui"/>
+    public WindowUiSettings? Ui { get => Primary.Ui; set => Primary.Ui = value; }
 
     /// <summary>Multi-window constructor. Add windows with <see cref="AddWindow"/>.</summary>
     public SdlEventLoop() { }
@@ -165,11 +172,9 @@ public sealed class SdlEventLoop
     /// <summary>Number of windows currently registered.</summary>
     public int WindowCount => _viewList.Count;
 
-#if DEBUG
-    /// <summary>DEBUG-only: the single-window primary view, for the debug inspector's input
+    /// <summary>The single-window primary view, for the debug inspector's input
     /// injection + frame capture. Null when built with the multi-window constructor.</summary>
     internal SdlWindowView? DebugPrimaryView => _primary;
-#endif
 
     // --- Loop-level callbacks (process-wide, not per-window) ---
 
@@ -239,6 +244,10 @@ public sealed class SdlEventLoop
     public Action<string, int, int>? OnTextEditing { get => Primary.OnTextEditing; set => Primary.OnTextEditing = value; }
     public Action<string>? OnDropFile { get => Primary.OnDropFile; set => Primary.OnDropFile = value; }
     public Func<bool>? CheckNeedsRedraw { get => Primary.CheckNeedsRedraw; set => Primary.CheckNeedsRedraw = value; }
+    /// <inheritdoc cref="SdlWindowView.RedrawPending"/>
+    public bool RedrawPending => Primary.RedrawPending;
+    /// <inheritdoc cref="SdlWindowView.RedrawPendingForPointerMoveAlone"/>
+    public bool RedrawPendingForPointerMoveAlone => Primary.RedrawPendingForPointerMoveAlone;
 
     /// <summary>Primary window's render-degraded (load-shed) callback. See <see cref="SdlWindowView.OnRenderDegraded"/>.</summary>
     public Action? OnRenderDegraded { get => Primary.OnRenderDegraded; set => Primary.OnRenderDegraded = value; }
@@ -260,6 +269,12 @@ public sealed class SdlEventLoop
 
     /// <summary>Stops the event loop. Safe to call from any callback.</summary>
     public void Stop() => _running = false;
+
+    // Explicit so ShutdownDrain can be tested against a fake loop; these only forward.
+    void IShutdownDrainLoop.Run(CancellationToken ct) => Run(ct);
+    Action? IShutdownDrainLoop.OnRender { get => OnRender; set => OnRender = value; }
+    Func<bool>? IShutdownDrainLoop.CheckNeedsRedraw { get => CheckNeedsRedraw; set => CheckNeedsRedraw = value; }
+    Func<bool>? IShutdownDrainLoop.OnQuit { get => OnQuit; set => OnQuit = value; }
 
     /// <summary>
     /// Optional diagnostic sink. Android apps have no console (Console.Error is not routed to logcat),
@@ -300,6 +315,27 @@ public sealed class SdlEventLoop
     }
 
     /// <summary>
+    /// The share of the machine's processors a window's drawing may take on a software rasteriser
+    /// (<see cref="FrameCostPacing"/>); zero for no limit. A GPU's frames are paced by the display alone.
+    /// </summary>
+    public double FrameProcessorShare { get; set; } = FrameCostPacing.DefaultShare;
+
+    /// <summary>The longest a window rests after a frame for cost alone, so the limit can never stall it.</summary>
+    public TimeSpan MaxFrameHold { get; set; } = FrameCostPacing.DefaultMaxHold;
+
+    // Moves a window's next frame out to where its cost allows it, on a software rasteriser. Asked on every pass,
+    // since the processor time of a frame goes on growing while the rasteriser's threads finish it.
+    private void PaceForCost(SdlWindowView v)
+    {
+        if (v.LastFrameStartTimestamp == 0 || !(FrameProcessorShare > 0.0) || !v.Renderer.Context.GraphicsDevice.IsSoftwareRasterizer)
+            return;
+        var costDue = FrameCostPacing.DueTimestamp(v.LastFrameStartTimestamp, v.LastFrameEndTimestamp,
+            Environment.CpuUsage.TotalTime - v.ProcessorAtLastFrameStart, Environment.ProcessorCount, FrameProcessorShare,
+            (long)(MaxFrameHold.TotalSeconds * Stopwatch.Frequency), Stopwatch.Frequency);
+        v.NextFrameDueTimestamp = Math.Max(v.DisplayFrameDueTimestamp, costDue);
+    }
+
+    /// <summary>
     /// Runs the event loop until <see cref="Stop"/> is called or the cancellation token is triggered.
     /// Blocks the calling thread. It may be called again after it returned, including after it stopped
     /// because a window's GPU was declared wedged: such a window stays inert
@@ -328,7 +364,17 @@ public sealed class SdlEventLoop
             // window whose GPU is wedged never renders again, so it never forces the poll path either.
             foreach (var v in _viewList)
             {
+                // The caret: only a window whose field has the keyboard asks for anything. The wait is capped at the loop's
+                // base 16 ms, so the loop wakes at that rate while a field is focused; a frame is drawn only at a phase change.
+                if (!v.IsGpuWedged && v.Ui is { } caretUi && !v.Window.IsMinimizedOrHidden && CaretBlinkPacing.HasFocusedField(caretUi))
+                {
+                    if (CaretBlinkPacing.FrameOwed(caretUi, v.PaintedCaretPhase, TimeProvider))
+                        v.ArmForCheck();
+                    else
+                        waitMs = Math.Clamp(Math.Min(waitMs, CaretBlinkPacing.MillisecondsToNextChange(TimeProvider)), 1, 16);
+                }
                 if (v.IsGpuWedged || !v.NeedsRedraw || nowTick < v.NextRenderAttemptTick || v.Window.IsMinimizedOrHidden) continue;
+                PaceForCost(v);
                 if (nowStamp >= v.NextFrameDueTimestamp) { anyNeedsRedraw = true; break; }
                 var dueMs = (int)Math.Ceiling((v.NextFrameDueTimestamp - nowStamp) * 1000.0 / Stopwatch.Frequency);
                 waitMs = Math.Clamp(Math.Min(waitMs, dueMs), 1, 16);
@@ -352,7 +398,7 @@ public sealed class SdlEventLoop
             // once-per-iteration hook, as a shutdown drain does to stop the loop when its work completes.
             foreach (var v in _viewList)
                 if (v.CheckNeedsRedraw?.Invoke() == true)
-                    v.NeedsRedraw = true;
+                    v.ArmForCheck();
 
             if (!_running)
                 break;
@@ -377,17 +423,27 @@ public sealed class SdlEventLoop
                 // for vblank, so a pointer moving over a redraw-on-move surface drew at the mouse's
                 // report rate, hundreds of frames a second, on the GPU the 2 s OS timeout watches.
                 var frameStart = Stopwatch.GetTimestamp();
+                PaceForCost(v);
                 if (frameStart < v.NextFrameDueTimestamp) continue;
+                var processorAtStart = Environment.CpuUsage.TotalTime;
                 v.NeedsRedraw = false;
                 // Committed to a frame: let the app configure it before the pass opens.
+                var caretPhase = v.Ui is { } ui ? CaretBlinkPacing.Step(ui, TimeProvider) : CaretBlinkPacing.NeverPainted;
                 v.OnBeforeFrame?.Invoke();
                 if (RenderView(v))
                 {
                     renderedAny = true;
+                    // Painted only once the frame was drawn: a failed or dropped frame leaves the phase owed, so the caret frame is retried.
+                    if (v.Ui is not null) v.PaintedCaretPhase = caretPhase;
                     // Paced from the frame's START, so the rate is the display's and not the display's
                     // less the time a frame takes; 95 percent of the interval, so a frame that is due
                     // on the vblank is not pushed to the next one by a tick of scheduling jitter.
                     v.NextFrameDueTimestamp = frameStart + FrameIntervalTicks(v) * 95 / 100;
+                    // And no sooner than its cost allows, on a software rasteriser (PaceForCost, asked each pass).
+                    v.DisplayFrameDueTimestamp = v.NextFrameDueTimestamp;
+                    v.LastFrameStartTimestamp = frameStart;
+                    v.LastFrameEndTimestamp = Stopwatch.GetTimestamp();
+                    v.ProcessorAtLastFrameStart = processorAtStart;
                     // A frame that ran out of vertex ring dropped some of its draws. The ring grows at
                     // the next BeginFrame, so one more frame paints what this one could not; without
                     // this the hole stays until something else happens to ask for a redraw.
@@ -563,12 +619,12 @@ public sealed class SdlEventLoop
                     hooksMs, Stopwatch.GetElapsedTime(beginDone, renderDone).TotalMilliseconds,
                     Stopwatch.GetElapsedTime(renderDone, frameDone).TotalMilliseconds);
 
+            var prevAvg = _frameAvgMs;
+            _frameAvgMs = prevAvg <= 0 ? frameMs : prevAvg * 0.9 + frameMs * 0.1;
 #if DEBUG
             // Flag a frame that's over the floor AND a big spike over the rolling average, or any hard
             // freeze. A steady slow frame never spikes, so it never shows here: SDLVK_FRAME_LOG is
             // what measures one.
-            var prevAvg = _frameAvgMs;
-            _frameAvgMs = prevAvg <= 0 ? frameMs : prevAvg * 0.9 + frameMs * 0.1;
             if (frameMs > SlowFrameFloorMs && (prevAvg <= 0 || frameMs > prevAvg * SlowFrameFactor || frameMs > HardStallMs))
             {
                 var beginMs = Stopwatch.GetElapsedTime(frameStart, beginDone).TotalMilliseconds - hooksMs;
@@ -809,6 +865,15 @@ public sealed class SdlEventLoop
 
     private bool TryView(uint windowId, out SdlWindowView view) => _views.TryGetValue(windowId, out view!);
 
+    // SDL's mouse events are in WINDOW coordinates; everything a consumer hit-tests against (the renderer, the layout,
+    // the content transform) is in PIXELS. The two are the same wherever the pixel density is 1 (Windows, X11, Android,
+    // a desktop window without HighPixelDensity), so this changes nothing there. On iOS the window is HighPixelDensity
+    // and its coordinates are POINTS, half the pixels on a Retina iPad: every tap landed at half its position, so the
+    // first iPad run took 17 taps and hit nothing (7.94). Finger events need no scale: they are normalised and the loop
+    // multiplies them by the renderer's pixel size. Synthesized input (DebugInspector) is already in pixels and does not
+    // come through here.
+    private static float PointerScale(SdlWindowView view) => view.Window.PixelDensity;
+
     private void Dispatch(ref Event evt)
     {
         switch ((EventType)evt.Type)
@@ -956,7 +1021,9 @@ public sealed class SdlEventLoop
             case EventType.MouseButtonDown:
                 if (TryView(evt.Button.WindowID, out var vmd))
                 {
-                    vmd.DispatchPointerDown(evt.Button.Button, evt.Button.X, evt.Button.Y, evt.Button.Clicks, GetModState().ToInputModifier);
+                    var dScale = PointerScale(vmd);
+                    vmd.NoteButtonDown(evt.Button.Button);
+                    vmd.DispatchPointerDown(evt.Button.Button, evt.Button.X * dScale, evt.Button.Y * dScale, evt.Button.Clicks, GetModState().ToInputModifier);
                     vmd.NeedsRedraw = true;
                 }
                 break;
@@ -967,18 +1034,38 @@ public sealed class SdlEventLoop
                     // SDL's button-up event DOES carry the release coordinates — only the legacy
                     // Action<byte> signature drops them. The synthesized event keeps them, so
                     // position-dependent release logic (tap-vs-drag slop, tap-to-select) just works.
-                    if (vmu.DispatchPointerUp(evt.Button.Button, evt.Button.X, evt.Button.Y))
+                    var uScale = PointerScale(vmu);
+                    vmu.NoteButtonUp(evt.Button.Button);
+                    var upConsumed = vmu.DispatchPointerUp(evt.Button.Button, evt.Button.X * uScale, evt.Button.Y * uScale);
+                    // A leave withheld while a button was held goes out after the release that clears the last one.
+                    var leaveConsumed = vmu.FlushPendingLeave();
+                    if (upConsumed || leaveConsumed)
                     {
                         vmu.NeedsRedraw = true;
                     }
                 }
                 break;
 
+            case EventType.WindowMouseLeave:
+                if (TryView(evt.Window.WindowID, out var vml) && vml.DispatchPointerLeave())
+                {
+                    vml.NeedsRedraw = true;
+                }
+                break;
+
+            case EventType.WindowMouseEnter:
+                if (TryView(evt.Window.WindowID, out var vme))
+                {
+                    vme.NoteMouseEnter();
+                }
+                break;
+
             case EventType.MouseMotion:
                 if (TryView(evt.Motion.WindowID, out var vmm))
                 {
-                    var newMx = evt.Motion.X;
-                    var newMy = evt.Motion.Y;
+                    var mScale = PointerScale(vmm);
+                    var newMx = evt.Motion.X * mScale;
+                    var newMy = evt.Motion.Y * mScale;
                     if (newMx != vmm.MouseX || newMy != vmm.MouseY)
                     {
                         vmm.MouseX = newMx;
@@ -990,7 +1077,7 @@ public sealed class SdlEventLoop
                             if (now - vmm.LastMouseRedrawCounter >= MouseRedrawInterval)
                             {
                                 vmm.LastMouseRedrawCounter = now;
-                                vmm.NeedsRedraw = true;
+                                vmm.ArmForPointerMove();
                             }
                         }
                     }

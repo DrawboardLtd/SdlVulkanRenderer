@@ -1,0 +1,124 @@
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using DIR.Lib;
+
+namespace SdlVulkan.Renderer;
+
+/// <summary>
+/// Base iOS host that brings up SDL3 + Vulkan (MoltenVK) and hands a ready <see cref="VkRenderer"/> and
+/// <see cref="SdlEventLoop"/> to a consumer: the iOS counterpart of the Android <c>SdlVulkanActivity</c>, with the
+/// same members, so one subclass body serves both.
+///
+/// <para>A consumer's <c>net10.0-ios</c> head calls <see cref="Run"/> from its <c>Main</c> INSTEAD of
+/// <c>UIApplication.Main</c>: SDL owns the UIKit application (<c>SDL_RunApp</c> runs <c>UIApplicationMain</c> with
+/// SDL's own delegate) and calls back into the shared bring-up once the app has launched. The head bundles
+/// <c>SDL3.xcframework</c> and <c>MoltenVK.xcframework</c> as dynamic frameworks (<c>NativeReference</c>); see
+/// <see cref="AppleVulkan"/> for how they are found.</para>
+///
+/// <para>Compiled into the plain <c>net10.0</c> assembly on purpose: it needs no iOS API, only SDL's P/Invokes, so
+/// the package needs no <c>net10.0-ios</c> target (whose workload does not exist on the Linux runner that packs
+/// it), and an iOS head consumes the <c>net10.0</c> asset.</para>
+/// </summary>
+[SupportedOSPlatform("ios")]
+public abstract class SdlVulkanIosApp
+{
+    private static SdlVulkanIosApp? _running;
+
+    /// <summary>The window title (unused visually on iOS, where the app is fullscreen, but SDL wants one).</summary>
+    protected virtual string WindowTitle => "SDL Vulkan";
+
+    /// <summary>
+    /// Logical size handed to <see cref="SdlVulkanWindow.Create"/>. iOS ignores it (the window fills the screen),
+    /// so the real pixel size comes from <see cref="SdlVulkanWindow.GetSizeInPixels"/>; it only needs to be non-zero.
+    /// </summary>
+    protected virtual (int Width, int Height) DesignSize => (1024, 1366);
+
+    /// <summary>Frame-clear colour; a consumer that draws full-surface chrome should match its own background.</summary>
+    protected virtual RGBAColor32 BackgroundColor => new(0x1a, 0x1a, 0x2e, 0xff);
+
+    /// <summary>
+    /// Whether to create the window fullscreen (status bar hidden). Default true, as on Android. Either way,
+    /// consumers should lay out within <see cref="SdlVulkanWindow.GetSafeAreaInsets"/> (via <see cref="SdlWindow"/>),
+    /// which covers the rounded corners and the home indicator.
+    /// </summary>
+    protected virtual bool Fullscreen => true;
+
+    /// <summary>The SDL window, available from <see cref="OnRendererReady"/> onward.</summary>
+    protected SdlVulkanWindow SdlWindow { get; private set; } = null!;
+
+    /// <summary>
+    /// Hands the process to SDL and does not return while the app runs (<c>UIApplicationMain</c> never returns on
+    /// iOS). Call it from the head's <c>Main</c>, once.
+    /// </summary>
+    public int Run()
+    {
+        if (Interlocked.CompareExchange(ref _running, this, null) is not null)
+            throw new InvalidOperationException("An SdlVulkanIosApp is already running; Run is called once per process.");
+
+        // Before any SDL call: "SDL3" (SDL3-CS's imports and RunApp below) is a framework inside the bundle on iOS.
+        AppleVulkan.ResolveBundledSdl();
+        return RunApp(0, nint.Zero, SdlMainCallback, nint.Zero);
+    }
+
+    // SDL_RunApp is imported here, NOT taken from SDL3-CS. SDL3-CS's MainFunc callback declares `string[] argv` with no
+    // [MarshalAs] size, and Mono (the iOS runtime) cannot build a native-to-managed wrapper for an unsized array: the
+    // first iPad run of chess ended at launch with "MarshalDirectiveException: [MarshalAs] attribute required to marshal
+    // arrays to managed code". 7.92 tried a function pointer into an [UnmanagedCallersOnly] method instead, looked up
+    // with NativeLibrary.Load("SDL3", <SDL3-CS assembly>, null), and never got that far: on iOS that overload does not
+    // consult the assembly's DllImportResolver, so it threw DllNotFoundException: SDL3. So 7.93 keeps exactly the
+    // mechanism that DID reach the callback on a device (an ordinary P/Invoke taking a delegate, its target marked
+    // [MonoPInvokeCallback]) and changes only the argument: argv is SDL's char**, kept a raw pointer (an iOS app is not
+    // started with arguments), so there is nothing to marshal.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int RawMainFunc(int argc, nint argv);
+
+    [DllImport("SDL3", EntryPoint = "SDL_RunApp", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int RunApp(int argc, nint argv, RawMainFunc mainFunction, nint reserved);
+
+    // SDL calls back through a native function pointer, so the delegate must outlive the call (a static field), and
+    // under Mono's ahead-of-time compilation its target must carry [MonoPInvokeCallback].
+    private static readonly RawMainFunc SdlMainCallback = SdlMain;
+
+    [MonoPInvokeCallback(typeof(RawMainFunc))]
+    internal static int SdlMain(int argc, nint argv)
+    {
+        // An exception must not cross back into SDL's native frame: it would end the process with no trace.
+        try
+        {
+            // Default the diagnostic sink before bring-up, as the Android host does: a failure in the surface
+            // bring-up happens BEFORE OnRendererReady, where a consumer would install its own. On iOS stderr goes
+            // to the device log. ??= so a sink the consumer set earlier wins.
+            SdlEventLoop.DiagnosticLog ??= static m => Console.Error.WriteLine($"SdlVulkan: {m}");
+
+            var app = _running ?? throw new InvalidOperationException("SDL called back with no SdlVulkanIosApp running.");
+            MobileHost.Run(app.WindowTitle, app.DesignSize, app.Fullscreen, app.BackgroundColor,
+                window => app.SdlWindow = window, app.OnRendererReady);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            SdlEventLoop.DiagnosticLog?.Invoke($"[ios] the app ended with an exception: {ex}");
+            return 1;
+        }
+    }
+
+    /// <summary>
+    /// Wire the event-loop callbacks here (<see cref="SdlEventLoop.OnRender"/>, <see cref="SdlEventLoop.OnResize"/>,
+    /// <see cref="SdlEventLoop.OnMouseDown"/>, <see cref="SdlEventLoop.CheckNeedsRedraw"/>, …), identical to the
+    /// desktop and Android wiring. Touch is already dispatched as finger/mouse events by <see cref="SdlEventLoop"/>.
+    /// Returns once wired; the base then runs the loop until the app ends.
+    /// </summary>
+    protected abstract void OnRendererReady(VkRenderer renderer, SdlEventLoop loop);
+}
+
+/// <summary>
+/// Marks a static method that native code calls through a delegate. Mono's ahead-of-time compiler (iOS) recognises
+/// the attribute by NAME and generates the native-to-managed wrapper the call needs; without it the callback fails at
+/// run time on a device. Declared here because the iOS assembly that carries Microsoft's copy is not referenced by a
+/// <c>net10.0</c> library.
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+internal sealed class MonoPInvokeCallbackAttribute(Type delegateType) : Attribute
+{
+    public Type DelegateType { get; } = delegateType;
+}

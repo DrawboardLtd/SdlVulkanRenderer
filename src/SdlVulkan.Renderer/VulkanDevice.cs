@@ -142,6 +142,23 @@ public sealed unsafe partial class VulkanDevice : IDisposable
         }
     }
 
+    private VkYCbCrConverter? _ycbcrConverter;
+    private readonly Lock _ycbcrConverterLock = new();
+
+    /// <summary>
+    /// The compute pipeline that converts Y'CbCr planes to a float texture (<see cref="VkTexture.CreateDeferredFromYCbCr"/>).
+    /// Built on first use, so a device that never converts a picture never makes it.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The graphics queue runs no compute work.</exception>
+    internal VkYCbCrConverter YCbCrConverter
+    {
+        get
+        {
+            lock (_ycbcrConverterLock)
+                return _ycbcrConverter ??= new VkYCbCrConverter(this);
+        }
+    }
+
     /// <summary>Layout for the Slug glyph store's set: binding 0 one read-only storage buffer (the
     /// glyph words, <see cref="VkSlugGlyphStore"/>), visible to the vertex and fragment stages. A
     /// layout of its own, like <see cref="MaskedDescriptorSetLayout"/>, so the single-sampler layout
@@ -189,6 +206,27 @@ public sealed unsafe partial class VulkanDevice : IDisposable
     /// the render pass and the pre-baked pipelines bake it in, so every swapchain sharing this
     /// device renders at the same sample count.</summary>
     public VkSampleCountFlags MsaaSamples { get; }
+
+    private bool? _isSoftwareRasterizer;
+
+    /// <summary>
+    /// Whether this device rasterises on the processor (<c>VK_PHYSICAL_DEVICE_TYPE_CPU</c>: llvmpipe, SwiftShader): a
+    /// frame's work is then processor time on every core, and what a frame costs is worth pacing by
+    /// (<see cref="FrameCostPacing"/>).
+    /// </summary>
+    public bool IsSoftwareRasterizer
+    {
+        get
+        {
+            if (_isSoftwareRasterizer is not { } known)
+            {
+                InstanceApi.vkGetPhysicalDeviceProperties(PhysicalDevice, out var props);
+                _isSoftwareRasterizer = known = props.deviceType == VkPhysicalDeviceType.Cpu;
+            }
+
+            return known;
+        }
+    }
 
     /// <summary>
     /// The depth format every render pass on this device carries as its depth attachment, chosen once
@@ -342,12 +380,9 @@ public sealed unsafe partial class VulkanDevice : IDisposable
             pQueuePriorities = &queuePriority
         };
 
-        var wantsBudget = SupportsMemoryBudget(instanceApi, physicalDevice);
         // Spelled out rather than built from VK_KHR_SWAPCHAIN_EXTENSION_NAME: that constant is a
         // UTF-8 span, and a mixed array of it and a string has no common element type.
-        using var extensionNames = new VkStringArray(wantsBudget
-            ? new[] { SwapchainExtensionName, MemoryBudgetExtensionName }
-            : new[] { SwapchainExtensionName });
+        using var extensionNames = new VkStringArray(DeviceExtensions(instanceApi, physicalDevice, presents: true, out var wantsBudget));
         VkDeviceCreateInfo deviceCI = new()
         {
             queueCreateInfoCount = 1,
@@ -406,14 +441,14 @@ public sealed unsafe partial class VulkanDevice : IDisposable
         // device. Important for headless environments (Linux CI with Mesa lavapipe / llvmpipe
         // software rasterizer, containers without a display server) where the instance has no
         // surface extensions enabled.
-        var wantsBudget = SupportsMemoryBudget(instanceApi, physicalDevice);
-        using var extensionNames = new VkStringArray(new[] { MemoryBudgetExtensionName });
+        var offscreenExtensions = DeviceExtensions(instanceApi, physicalDevice, presents: false, out var wantsBudget);
+        using var extensionNames = new VkStringArray(offscreenExtensions);
         VkDeviceCreateInfo deviceCI = new()
         {
             queueCreateInfoCount = 1,
             pQueueCreateInfos = &queueCI,
-            enabledExtensionCount = wantsBudget ? extensionNames.Length : 0,
-            ppEnabledExtensionNames = wantsBudget ? extensionNames : null,
+            enabledExtensionCount = offscreenExtensions.Length > 0 ? extensionNames.Length : 0,
+            ppEnabledExtensionNames = offscreenExtensions.Length > 0 ? extensionNames : null,
         };
         instanceApi.vkCreateDevice(physicalDevice, &deviceCI, null, out var device).CheckResult();
         var deviceApi = GetApi(instance, device);
@@ -931,6 +966,35 @@ public sealed unsafe partial class VulkanDevice : IDisposable
     /// creation, because chaining the budget struct onto a device that did not enable the extension
     /// is undefined rather than merely unanswered.</summary>
     private static bool SupportsMemoryBudget(VkInstanceApi instanceApi, VkPhysicalDevice physicalDevice)
+        => DeviceExtensionAvailable(instanceApi, physicalDevice, MemoryBudgetExtensionName);
+
+    /// <summary>
+    /// <c>VK_KHR_portability_subset</c>: a device that advertises it (MoltenVK, on macOS and iOS) implements
+    /// Vulkan only in part, and the spec REQUIRES it to be enabled at device creation; leaving it out is a
+    /// validation error and, on a strict loader, a refused device. No desktop or Android driver advertises it.
+    /// </summary>
+    private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
+
+    /// <summary>
+    /// The device extensions to enable: the swapchain when the device presents, the memory budget when
+    /// offered, and the portability subset when the device is a portability implementation (see
+    /// <see cref="PortabilitySubsetExtensionName"/>). One list for the on-screen and the offscreen device, so
+    /// neither can forget one.
+    /// </summary>
+    private static string[] DeviceExtensions(VkInstanceApi instanceApi, VkPhysicalDevice physicalDevice,
+        bool presents, out bool wantsBudget)
+    {
+        wantsBudget = SupportsMemoryBudget(instanceApi, physicalDevice);
+        var names = new List<string>(3);
+        if (presents) names.Add(SwapchainExtensionName);
+        if (wantsBudget) names.Add(MemoryBudgetExtensionName);
+        if (DeviceExtensionAvailable(instanceApi, physicalDevice, PortabilitySubsetExtensionName))
+            names.Add(PortabilitySubsetExtensionName);
+        return [.. names];
+    }
+
+    /// <summary>Whether the physical device offers a device extension (<c>vkEnumerateDeviceExtensionProperties</c>).</summary>
+    private static bool DeviceExtensionAvailable(VkInstanceApi instanceApi, VkPhysicalDevice physicalDevice, string name)
     {
         uint count = 0;
         if (instanceApi.vkEnumerateDeviceExtensionProperties(physicalDevice, (byte*)null, &count, null)
@@ -943,7 +1007,7 @@ public sealed unsafe partial class VulkanDevice : IDisposable
             return false;
 
         for (var i = 0; i < count; i++)
-            if (new string((sbyte*)props[i].extensionName) == MemoryBudgetExtensionName)
+            if (new string((sbyte*)props[i].extensionName) == name)
                 return true;
         return false;
     }
@@ -1293,6 +1357,7 @@ public sealed unsafe partial class VulkanDevice : IDisposable
         DeviceApi.vkDestroyPipelineLayout(SlugPipelineLayout);
         if (_hdrImagePipelineLayout != VkPipelineLayout.Null)
             DeviceApi.vkDestroyPipelineLayout(_hdrImagePipelineLayout);
+        _ycbcrConverter?.Dispose();
         DeviceApi.vkDestroyDescriptorSetLayout(SlugDescriptorSetLayout);
         foreach (var pool in _descriptorPools)
             DeviceApi.vkDestroyDescriptorPool(pool);

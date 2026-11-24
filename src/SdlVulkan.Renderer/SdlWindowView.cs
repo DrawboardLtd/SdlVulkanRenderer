@@ -14,6 +14,14 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
     public SdlVulkanWindow Window => window;
     public VkRenderer Renderer => renderer;
 
+    /// <summary>The settings every widget of this window shares, which the host sets once. When set, the loop owns the
+    /// caret blink for this window: it sets <see cref="WindowUiSettings.CaretPhase"/> before each frame and wakes at each
+    /// phase change while a text field has the keyboard (and only then). Null (the default) means no caret work.</summary>
+    public WindowUiSettings? Ui { get; set; }
+
+    // The caret phase last painted in this window; see CaretBlinkPacing.
+    internal long PaintedCaretPhase = CaretBlinkPacing.NeverPainted;
+
     /// <summary>Background clear color used for this window's <see cref="VkRenderer.BeginFrame"/>.</summary>
     public RGBAColor32 BackgroundColor { get; set; } = new(0x1a, 0x1a, 0x2e, 0xff);
 
@@ -134,6 +142,65 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
         return consumed;
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Pointer leave. Only the real SDL path calls these (the DebugInspector goes through the
+    // DispatchPointer* methods above, which never touch this state), so a synthetic click can
+    // neither flush nor create a leave.
+    //
+    // What SDL does with a button held (release-3.4.0, read as source; no window is reachable here):
+    //  - src/events/SDL_mouse.c:1443 SDL_UpdateMouseCapture captures the mouse while any button is
+    //    down (hint SDL_HINT_MOUSE_AUTO_CAPTURE, default true, :213), so moves and the release keep
+    //    arriving after the pointer leaves the window.
+    //  - src/video/windows/SDL_windowsevents.c:1512 WM_MOUSELEAVE is ignored while
+    //    SDL_WINDOW_MOUSE_CAPTURE is set, so no leave is sent during a captured drag on Windows;
+    //    SDL_SetMouseFocus(NULL) (SDL_mouse.c:571, sends WINDOW_MOUSE_LEAVE at :593) runs at once the
+    //    capture ends.
+    //  - src/video/x11/SDL_x11events.c:1513 LeaveNotify with NotifyGrab/NotifyUngrab sends no leave,
+    //    but a plain LeaveNotify does, and SDL_SetMouseFocus(NULL) is not capture-gated there.
+    // So the leave arrives with a button held on X11 (and when auto capture is off or capture is
+    // unsupported), but not on Windows. The rule below holds either way: a leave with a button held
+    // is withheld until the last button is released; an enter first drops it.
+    // ---------------------------------------------------------------------------------------------
+
+    private uint _heldButtons;
+    private bool _leavePending;
+
+    private static uint ButtonBit(byte sdlButton) => 1u << (sdlButton & 31);
+
+    /// <summary>Record a real button press (SDL path only).</summary>
+    internal void NoteButtonDown(byte sdlButton) => _heldButtons |= ButtonBit(sdlButton);
+
+    /// <summary>Record a real button release (SDL path only).</summary>
+    internal void NoteButtonUp(byte sdlButton) => _heldButtons &= ~ButtonBit(sdlButton);
+
+    /// <summary>SDL's window mouse-leave. With no button held it goes out now as
+    /// <see cref="InputEvent.PointerLeft"/> and returns what the handler returned; with one held it is withheld
+    /// (see <see cref="FlushPendingLeave"/>) and returns false.</summary>
+    internal bool DispatchPointerLeave()
+    {
+        if (_heldButtons != 0)
+        {
+            _leavePending = true;
+            return false;
+        }
+        _leavePending = false;
+        return OnPointerInput?.Invoke(new InputEvent.PointerLeft()) == true;
+    }
+
+    /// <summary>SDL's window mouse-enter: the pointer came back, so a withheld leave is dropped.</summary>
+    internal void NoteMouseEnter() => _leavePending = false;
+
+    /// <summary>After a release: sends the withheld leave once the last button is up. Returns what the handler returned.</summary>
+    internal bool FlushPendingLeave()
+    {
+        if (!_leavePending || _heldButtons != 0)
+        {
+            return false;
+        }
+        _leavePending = false;
+        return OnPointerInput?.Invoke(new InputEvent.PointerLeft()) == true;
+    }
+
     /// <summary>SDL button byte (1=left, 2=middle, 3=right, 4=X1/back, 5=X2/forward) to the DIR.Lib button enum;
     /// a button SDL numbers beyond those maps to Left.</summary>
     internal static MouseButton ToMouseButton(byte sdlButton) => sdlButton switch
@@ -204,7 +271,7 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
 
     /// <summary>
     /// Called each loop iteration before checking redraw for this window. Return true to force a
-    /// redraw (external state changes: background task completions, cursor blink, etc.).
+    /// redraw (external state changes: background task completions, etc.). A text caret no longer needs it: set <see cref="Ui"/> and the loop blinks it.
     /// </summary>
     public Func<bool>? CheckNeedsRedraw { get; set; }
 
@@ -262,7 +329,36 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
     /// <summary>Frames this window has submitted and presented; a clean-frame counter the debug
     /// inspector's screenshot reads to know a restored window is drawing again.</summary>
     internal long FramesPresented;
-    internal bool NeedsRedraw = true;
+    // A property, so that ANY arming of a frame but ArmForPointerMove marks the frame as owed to more than a move:
+    // the safe answer is the default, and a new arming site written as "NeedsRedraw = true" gets it without knowing.
+    private bool _needsRedraw = true;
+    private bool _pendingForPointerMoveAlone;
+    internal bool NeedsRedraw
+    {
+        get => _needsRedraw;
+        set
+        {
+            _needsRedraw = value;
+            _pendingForPointerMoveAlone = false;
+        }
+    }
+
+    /// <summary>Arms a frame for a pointer move a handler took. Its only effect beyond <see cref="NeedsRedraw"/> is that a
+    /// frame nothing else is owed for is known as such (<see cref="RedrawPendingForPointerMoveAlone"/>).</summary>
+    internal void ArmForPointerMove()
+    {
+        if (!_needsRedraw)
+        {
+            _needsRedraw = true;
+            _pendingForPointerMoveAlone = true;
+        }
+    }
+
+    /// <summary>Arms a frame the host's redraw check asked for. A frame already owed to a pointer move alone stays known
+    /// as one: the check that agreed to it saw that, and a frame is often held for pacing past the next check, which
+    /// would otherwise find it owed to "more than a move" by nothing but the check's own yes. A frame the check alone
+    /// asked for is owed to more than a move, as before.</summary>
+    internal void ArmForCheck() => _needsRedraw = true;
 
     // Android app lifecycle (see SdlEventLoop.Dispatch/RenderView): the native surface is destroyed
     // when the app is backgrounded and handed back fresh on foreground. Paused skips all rendering
@@ -311,6 +407,13 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
     internal long NextFrameDueTimestamp;
     // One display refresh in Stopwatch ticks, read from the window's display; 0 until first measured.
     internal long FrameIntervalTicks;
+    // Pacing by cost (FrameCostPacing), on a software rasteriser: the timestamp the display's interval alone allows
+    // the next frame at, when the last frame began and ended, and the process's processor time as it began. Zero
+    // until a frame was drawn.
+    internal long DisplayFrameDueTimestamp;
+    internal long LastFrameStartTimestamp;
+    internal long LastFrameEndTimestamp;
+    internal TimeSpan ProcessorAtLastFrameStart;
     // When FrameIntervalTicks was last read, so a window dragged to another display is re-read.
     internal long FrameIntervalReadTimestamp;
 
@@ -335,4 +438,26 @@ public sealed class SdlWindowView(SdlVulkanWindow window, VkRenderer renderer)
 
     /// <summary>Requests a redraw of this window on the next loop iteration.</summary>
     public void RequestRedraw() => NeedsRedraw = true;
+
+    /// <summary>
+    /// Whether a frame is already owed to this window: armed by an event the loop dispatched (input a handler took, an
+    /// expose, a resize, a restore), by <see cref="RequestRedraw"/>, by an earlier <see cref="CheckNeedsRedraw"/> whose
+    /// frame has not been drawn yet (paced, minimised, in a recovery backoff), or by the loop itself (a frame that ran
+    /// out of vertex ring).
+    /// </summary>
+    /// <remarks>
+    /// Read it from <see cref="CheckNeedsRedraw"/>, which the loop asks AFTER dispatching the iteration's events, to learn
+    /// whether the frame about to be drawn has a cause the app did not raise itself. An app that narrows a frame's damage
+    /// (<see cref="VkRenderer.AddFrameDamage"/>) for a cause of its own, a clock's tick say, must repaint in full when
+    /// this is true: it cannot say what an expose or a restored window needs, and the loop does not tell it otherwise.
+    /// </remarks>
+    public bool RedrawPending => NeedsRedraw;
+
+    /// <summary>
+    /// Whether the frame owed (<see cref="RedrawPending"/>) is owed to nothing but pointer moves a handler took since
+    /// the last frame. An app whose move handler says exactly what the move changed (a hover's crosshair, a readout) may
+    /// then repaint that alone; a frame owed to anything else as well, a key, a press, an expose, a resize, an earlier
+    /// request, is not one it can narrow, and this is false for it.
+    /// </summary>
+    public bool RedrawPendingForPointerMoveAlone => _needsRedraw && _pendingForPointerMoveAlone;
 }
