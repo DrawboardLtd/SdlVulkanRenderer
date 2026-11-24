@@ -13,6 +13,76 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.98
+
+**The debug inspector in Release behind an opt-in, glyph atlases that never touch the GPU under a recording frame, a
+bounded software rasteriser, pointer-leave and the caret blink from the loop, Y'CbCr planes to an HDR texture; on
+DIR.Lib 11.98** (upstream 7.89-7.107). Nothing here changes what a frame draws on a GPU.
+
+- **The debug inspector is in Release, off unless asked for** (upstream 7.96, 7.97, #179, #182). `DebugInspector` and
+  `DebugInspectorOptions` are no longer `#if DEBUG`: call `Attach` unconditionally. It starts only with `DIR_INSPECTOR=1`
+  and `DIR_INSPECTOR_TOKEN` set, and every request must carry the token; otherwise it returns an inert inspector (no
+  socket, no registry file, no loop hook). A Debug build stays always-on when `DIR_INSPECTOR` is absent.
+  `GpuFaultInjection` and the `gpuFault` verb stay DEBUG. A trimmed or NativeAOT publish drops the inspector unless it
+  sets DIR.Lib's `DIR.Lib.Inspector.IsSupported` switch (`-p:DirInspectorSupport=true` for a package consumer). **A
+  consumer that builds this repo from source does not get that default**: it arrives through DIR.Lib's
+  `buildTransitive` targets, which only a package reference imports, so a source consumer imports
+  `DeviceIndependentRenderingLibrary/src/DIR.Lib/buildTransitive/DIR.Lib.targets` in its app project or sets the
+  `RuntimeHostConfigurationOption` itself. Upstream measured the switch with `tools/InspectorAotProbe` (win-x64
+  NativeAOT): 2,560 bytes over the same app without `Attach` when off, 1.66 MB when on.
+- **`SdlVulkan.Renderer.Inspector.Client`** (upstream 7.96): a typed async `InspectorClient` (connect by pid and token,
+  one method per verb) and `InspectorException` carrying the server's own text. The registry reader, discovery and
+  socket client moved into it from the MCP sidecar, which is now built on it. A `screenshot` on a window minimised
+  after the request fails within the present budget instead of leaving the capture armed.
+- **One rule for when a glyph atlas may touch the GPU** (upstream 7.103, 7.105, #187, #193). A draw-path call never
+  destroys, recreates or rewrites an object the current or an in-flight frame uses; it records the need, and the
+  change happens at the next `BeginFrame`, in the pre-pass upload, or through `DeferDestroy`. The bitmap atlas
+  (`VkFontAtlas`, colour and emoji glyphs) grew on the spot, rewriting a descriptor set the recording command buffer
+  had bound: it now grows at the next frame start into an image, view and set of its own, and the glyph that did not
+  fit is skipped for that one frame. The MTSDF atlas's evict-all sends each page through `DeferDestroy` instead of a
+  bounded wait. Each atlas has a validation-layer test that floods it through grow, eviction and a dropped frame.
+- **Glyph atlases start transparent** (upstream 7.95, #178): a fresh atlas image is cleared once before its first
+  upload, so linear filtering at a glyph's edge never blends in undefined texels (a one-pixel line on Metal).
+- **A software rasteriser's cost is bounded, and a full repaint is drawn once** (upstream 7.98, #181). On a device
+  that rasterises on the processor (`VulkanDevice.IsSoftwareRasterizer`) frames are paced by what they cost
+  (`FrameCostPacing`, `SdlEventLoop.FrameProcessorShare`, `MaxFrameHold`) and the frame is kept in one image the
+  swapchain images are copied from (`VulkanContext.RetainsFrame`; `SDLVK_RETAINED_FRAME=1` or `=0` forces it). A GPU
+  takes neither.
+- **The pointer leaving the window is an event** (upstream 7.102, #173): `SdlEventLoop` turns SDL's window
+  mouse-leave into DIR.Lib's `InputEvent.PointerLeft`, withheld while a button is down so a drag that runs off the
+  window keeps its moves and release.
+- **`RedrawPending` and `RedrawPendingForPointerMoveAlone`** (upstream 7.89, 7.91, #172, #174) on `SdlWindowView` and
+  `SdlEventLoop`: an app that narrows a frame's damage for one cause can tell whether anything else also asked for the
+  frame. The inspector's `move` arms a frame the way a real pointer does.
+- **The event loop owns the caret blink** (upstream 7.106, #200): with `SdlWindowView.Ui` set, the loop puts
+  `CaretBlink.PhaseAt` of its `TimeProvider` on the window's settings before each frame and wakes at each phase change
+  only while a field has the keyboard. A window with no focused field, or no `Ui`, draws no frame for the caret.
+- **`ShutdownDrain.PumpUntilComplete(loop, task)`** (upstream 7.104, #140) pumps the loop while background work drains
+  after `Run` returns. A window or context disposed off its own thread throws in Debug and logs once in Release.
+- **Y'CbCr planes to an HDR texture on the GPU** (upstream 7.107): `VkTexture.CreateDeferredFromYCbCr` converts a
+  decoder's planes in a compute shader into the float texture `DrawHdrImage` takes. `tools/BakeShaders` and the
+  stale-bake check take `*.comp`.
+- **Groundwork for iOS, and Vulkan through MoltenVK on Apple** (upstream 7.90, 7.92-7.94): `SdlVulkanIosApp` and the
+  bring-up both mobile hosts share (`MobileHost`), in the plain `net10.0` assembly, so there is no new target and no
+  new workload. Mouse coordinates are multiplied by the window's pixel density, which is 1 everywhere but iOS.
+- **Left out, as before:** the Debug twin package and its check, and the preview-package path upstream's workflow
+  gained (this fork publishes nothing). Upstream 7.99 and 7.100 are lockstep rebuilds with no code.
+- **DIR.Lib 11.98** (the submodule goes from 11.57 to 11.98). What a consumer of this repo will meet:
+  - **SharpAstro.Fonts 2.0 and SharpAstro.Svg 3.40** (11.78, 11.80, 11.82): SVG icons and images (`IconBaker`,
+    `VectorIcon`). Fonts is a major number because its own `Rgba32` is gone; `RGBAColor32` converts to and from
+    `SharpAstro.VectorGraphics.Rgba32`.
+  - **Behaviour changes:** a stack declared `WithScroll` whose controller draws a bar measures its cross extent with
+    the bar column added (11.66); a node whose border is rounded on all four sides fills its background inside that
+    outline (11.72); what is painted over something takes the pointer from it (`Node.IsSurface`, 11.86).
+  - **New, additive:** declared borders, shadows and focus rings on a node (11.68, 11.88, 11.98); theme-driven
+    Button, Hyperlink, Chip, Split button, Toggle tile, Slider, Dropdown and Setting row (11.93, 11.96, 11.97); a
+    segmented control, an icon toggle and `Node.NarrowForm` (11.89); a notifications component with toasts (11.83,
+    11.86, 11.88, 11.91, 11.94, 11.95); floating child windows (11.85); the menu panel's Back and close controls,
+    Tab between them, and F1 for its keys (11.69, 11.74, 11.79, 11.81); a declared list cursor (11.61);
+    `InputEvent.PointerLeft` (11.59); `WindowUiSettings.CaretPhase` (11.84); prototypes as JSON documents (11.75,
+    11.77); wireframe overlap checks in a unit test (11.60); the inspector core in Release behind
+    `DIR.Lib.Inspector.IsSupported` (11.70, 11.73, 11.76).
+
 ## 11.58
 
 **Meshes can carry a specular highlight** (upstream 7.88). `VkRenderer.DrawMesh` gains an overload taking a highlight

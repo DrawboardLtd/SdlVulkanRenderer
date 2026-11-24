@@ -13,7 +13,7 @@
          PackageReference upstream's conditional path uses, so the line stays and is kept in step with
          whatever the submodule is pinned at, rather than being left to rot at whatever it said when
          the divergence was introduced. -->
-    <PackageVersion Include="DIR.Lib" Version="11.57.*" />
+    <PackageVersion Include="DIR.Lib" Version="11.98.*" />
     <!-- IActivatableWindow, which SdlVulkanWindow implements. Unlike the DIR.Lib line above this one
          is LIVE: there is no drawboard fork of AppShell, so the csproj's sibling probe misses in both
          the nested-submodule layout and a standalone clone, and the PackageReference path is the one
@@ -49,6 +49,7 @@
          opt-outs guarding against one hazard; one file in the right place removes the hazard. -->
     <PackageVersion Include="coverlet.collector" Version="8.0.1" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.8" />
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.0.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
     <PackageVersion Include="ModelContextProtocol" Version="2.2.0" />
     <PackageVersion Include="SharpAstro.Png" Version="3.14.*" />

@@ -10,13 +10,20 @@ needs to plan, build, check and land.
   push, open a PR or merge; the controller lands the flight. Leave nothing uncommitted, and put scratch output
   outside the plane.
 - Sibling clones are not yours. `DIR.Lib` source sits beside this repo, not inside a plane, so a plane restores the
-  `DIR.Lib` package (a floating pin, `11.57.*`, in `src/Directory.Packages.props`), as CI does. A change that needs `DIR.Lib` to change is its own flight in that repo: name it
+  `DIR.Lib` package (a floating pin, `11.61.*`, in `src/Directory.Packages.props`), as CI does. A change that needs `DIR.Lib` to change is its own flight in that repo: name it
   and leave it.
 - No display or window is reachable from a plane. The tests render through a headless offscreen Vulkan context and
   `Assert.Skip` when no Vulkan ICD is present, so a skipped test proves nothing about rendering. The tools under
   `tools/` that need a panel (`HdrProbe`, `TransparencyProbe`) are the controller's to run, not a step.
 - Never wait with a job that sleeps or polls: use `pilot leg wait --for-file <path>` and end the turn. Long builds
   and test runs go through `pilot run -- <command>`. The machine is shared, so a job may wait its turn first.
+
+## Packages first
+
+- A consumer (tianwen and the sebgod apps) that needs a change here which is not released yet pins that PR's preview
+  package or waits for the release, and moves its pin to the release before it lands.
+- Label a same-repo PR `preview` and CI publishes its packages to nuget.org as `<Major.Minor>.<run><attempt>-pr<N>`.
+  nuget.org keeps every prerelease, so label only when a consumer needs one.
 
 ## Build and check
 

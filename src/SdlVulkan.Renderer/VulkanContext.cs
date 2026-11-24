@@ -242,6 +242,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // turns it into an immediate, named failure in DEBUG at zero release cost.
     private int _frameThreadId;
 
+    // Recorded in Release too (AssertFrameThread is DEBUG only), so Dispose can name a wrong-thread teardown.
+    private void RecordFrameThread()
+    {
+        if (!_isOffscreen && _frameThreadId == 0) _frameThreadId = Environment.CurrentManagedThreadId;
+    }
+
     [Conditional("DEBUG")]
     private void AssertFrameThread(string method)
     {
@@ -346,14 +352,12 @@ public sealed unsafe partial class VulkanContext : IDisposable
     /// </summary>
     public int CurrentFrame => _currentFrame;
 
-#if DEBUG
     /// <summary>
-    /// DEBUG-only: index into <c>_swapchainImages</c> of the most recently presented frame.
+    /// Index into <c>_swapchainImages</c> of the most recently presented frame.
     /// Stays valid after <see cref="EndFrame"/> (only <see cref="CurrentFrame"/> advances there),
     /// so the inspector's render-thread readback can copy the just-presented image.
     /// </summary>
     internal uint CurrentSwapchainImageIndex => _currentImageIndex;
-#endif
 
     // Per-frame vertex staging buffers (avoids race between in-flight frames)
     private readonly VkBuffer[] _vertexBuffers = new VkBuffer[MaxFramesInFlight];
@@ -858,6 +862,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
 
     public VkCommandBuffer BeginFrame(out bool resized)
     {
+        RecordFrameThread();
         AssertFrameThread(nameof(BeginFrame));
         resized = false;
         NoteUnendedFrameDropped();
@@ -928,8 +933,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
         // capture's copy rode this fence index, its GPU work is complete — snapshot it now without
         // any extra GPU wait. Done before the reset below so the fence is still in its signaled state.
         ConsumeThumbnailReadback();
-        // Same contract for the DEBUG-only inspector screenshot capture (a partial method, so the
-        // call compiles away in Release along with its implementation file).
+        // Same contract for the inspector screenshot capture (a no-op unless one was requested).
         ConsumePresentCaptureReadback();
 
         // NOTE: the fence is deliberately NOT reset here — see EndFrame, which resets it immediately
@@ -1040,6 +1044,8 @@ public sealed unsafe partial class VulkanContext : IDisposable
             // HDR only: the composite on the scRGB image, from the SDR layer the main pass just finished (and the
             // capture above just read). Nothing on an SDR context runs this.
             if (_hdrActive) RecordHdrComposite(cmd);
+            // A retained frame: what the acquired swapchain image is missing of it, copied across.
+            if (_retainedActive) RecordRetainedCopy(cmd);
             // A layered context's frame reaches its window through a readback, recorded here for the same reason:
             // after all the rendering, in the frame's own command buffer. A frame that died before its render pass
             // has nothing to show, and the window keeps what it had.
@@ -1226,9 +1232,8 @@ public sealed unsafe partial class VulkanContext : IDisposable
         SubmitFrame(_commandBuffers[_currentFrame], endRenderPass: _renderPassBegun);
     }
 
-    // DEBUG-only inspector screenshot capture, implemented in VulkanContext.SwapchainReadback.cs
-    // (a file wrapped in #if DEBUG). Partial methods with no implementation have their calls removed
-    // by the compiler, so a Release build carries neither the code nor the call sites.
+    // Inspector screenshot capture, implemented in VulkanContext.SwapchainReadback.cs. Every hook returns at
+    // once unless a capture was requested, so with the inspector off there is no readback and no allocation.
     partial void RecordPresentCapture(VkCommandBuffer cmd);
     partial void CancelPresentCaptureOnDroppedFrame();
     partial void ConsumePresentCaptureReadback();
@@ -1365,6 +1370,9 @@ public sealed unsafe partial class VulkanContext : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        // An abandoned context is torn down (leaked) by design from wherever the app is on its way down;
+        // offscreen contexts have no owning thread.
+        if (!_abandoned && !_isOffscreen) DisposeThreadGuard.Enforce(_frameThreadId, "VulkanContext");
         _disposed = true;
 
         // An abandoned recovery task is still running on a thread nobody can join -- that is what
@@ -1506,10 +1514,14 @@ public sealed unsafe partial class VulkanContext : IDisposable
             // built, because the formats are per surface (a window on another display). Not asked at all otherwise.
             SurfaceFormatChoice? scRgb = null;
             if (_wantsHdr && ChooseHdrSurfaceFormat() is { IsScRgb: true } choice) scRgb = choice;
+            // A software rasteriser keeps the frame in one image of its own (VulkanContext.Retained.cs), which needs the
+            // swapchain's images to be a copy's destination.
+            var retain = WantsRetainedFrame(caps, hdr: scRgb is not null);
             imgCount = scRgb is { } hdrChoice
                 ? CreateSwapchainImages(caps, extent, hdrChoice.Format, imageCount, hdrChoice.ColorSpace)
-                : CreateSwapchainImages(caps, extent, format, imageCount);
+                : CreateSwapchainImages(caps, extent, format, imageCount, copyDestination: retain);
             if (scRgb is not null) AdoptHdrSwapchain(extent, imgCount);
+            else if (retain) AdoptRetainedFrame(extent, imgCount);
         }
         SwapchainFormat = format;
         SwapchainWidth = extent.width;
@@ -1626,7 +1638,7 @@ public sealed unsafe partial class VulkanContext : IDisposable
     // The swapchain itself and its images, for CreateSwapchain: everything about presenting through the surface.
     // Returns how many images the surface handed out.
     private uint CreateSwapchainImages(in VkSurfaceCapabilitiesKHR caps, VkExtent2D extent, VkFormat format,
-        uint imageCount, VkColorSpaceKHR colorSpace = VkColorSpaceKHR.SrgbNonLinear)
+        uint imageCount, VkColorSpaceKHR colorSpace = VkColorSpaceKHR.SrgbNonLinear, bool copyDestination = false)
     {
         // Prefer Mailbox over Fifo when the driver offers it: Fifo (vsync) can block
         // vkAcquireNextImageKHR for up to a full vblank interval, adding up to ~16 ms of
@@ -1653,15 +1665,16 @@ public sealed unsafe partial class VulkanContext : IDisposable
         }
 
         var imageUsage = VkImageUsageFlags.ColorAttachment;
-#if DEBUG
-        // TransferSrc lets the DEBUG-only inspector copy the presented frame out for screenshots
+        // A retained frame reaches the swapchain's images by a copy; asked only where the surface offers it
+        // (WantsRetainedFrame).
+        if (copyDestination) imageUsage |= VkImageUsageFlags.TransferDst;
+        // TransferSrc lets the inspector copy the presented frame out for screenshots
         // (see VulkanContext.SwapchainReadback.cs). Desktop drivers always support it as a swapchain
         // usage, but Android/Mali swapchains often expose ColorAttachment ONLY — and requesting an
         // unsupported usage fails vkCreateSwapchainKHR (reported as VK_ERROR_SURFACE_LOST_KHR on
         // Android). Only add it when the surface actually advertises it.
         if ((caps.supportedUsageFlags & VkImageUsageFlags.TransferSrc) != 0)
             imageUsage |= VkImageUsageFlags.TransferSrc;
-#endif
 
         var compositeAlpha = ChooseCompositeAlpha(caps.supportedCompositeAlpha, _wantsAlpha);
         AlphaPresentation = _wantsAlpha && compositeAlpha == VkCompositeAlphaFlagsKHR.PreMultiplied
@@ -1717,6 +1730,8 @@ public sealed unsafe partial class VulkanContext : IDisposable
             DeviceApi.vkDestroyImageView(iv);
         // HDR only: the SDR layers behind those views, the float views, the composite's framebuffers and descriptors.
         if (_hdrLayerImages.Length != 0) CleanupHdrSwapchain();
+        // A retained frame's image, behind those views too.
+        CleanupRetainedFrame();
         // A layered context's image is its own, where a swapchain's belong to the swapchain, so it goes here.
         CleanupLayeredImage();
 

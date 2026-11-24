@@ -8,6 +8,7 @@ using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using SdlVulkan.Renderer.Inspector;
+using SdlVulkan.Renderer.Inspector.Client;
 using Shouldly;
 using Xunit;
 

@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Shouldly" />
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio">
@@ -39,6 +40,7 @@
   <ItemGroup>
     <ProjectReference Include="..\SdlVulkan.Renderer\SdlVulkan.Renderer.csproj" />
     <ProjectReference Include="..\SdlVulkan.Renderer.Inspector\SdlVulkan.Renderer.Inspector.csproj" />
+    <ProjectReference Include="..\SdlVulkan.Renderer.Inspector.Client\SdlVulkan.Renderer.Inspector.Client.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -95,7 +95,7 @@ At runtime you need the Vulkan loader plus an ICD (driver). Nothing else: no X11
   - **GPU driver** (Mesa `radv` / `intel_anv` / NVIDIA proprietary) — fastest.
   - **Mesa `lavapipe` / `llvmpipe`** — software rasterizer. 5–20× slower but fully headless. Apt: `mesa-vulkan-drivers`.
   - **Google SwiftShader** — alternative software ICD.
-- **macOS / iOS**: MoltenVK (Vulkan on Metal). Untested for offscreen here but no reason it shouldn't work.
+- **macOS / iOS**: MoltenVK (Vulkan on Metal). Untested for offscreen here but no reason it shouldn't work. The instance and device enable the portability extensions MoltenVK needs (see "iOS" below).
 
 SDL3-CS remains a package reference because the on-screen path uses it. Its P/Invokes are lazy — `libSDL3.so` / `SDL3.dll` is never loaded if `SdlVulkanWindow` is not instantiated, so the offscreen path has no SDL runtime dependency.
 
@@ -137,6 +137,27 @@ Consumers also need `dotnet workload install android`; the workload supplies the
 the Android SDK, which `dotnet build -t:InstallAndroidDependencies -p:AcceptAndroidSDKLicenses=true`
 will provision. The tooling needs a JDK it can parse — **JDK 17**; JDK 25 is too new and throws inside
 `GetJdkRevision`.
+
+### iOS (untested on a device)
+
+The iOS host is `SdlVulkanIosApp`, the counterpart of `SdlVulkanActivity` with the same members
+(`WindowTitle`, `DesignSize`, `BackgroundColor`, `Fullscreen`, `SdlWindow`, `OnRendererReady`); both run one
+shared bring-up (`MobileHost`), so a consumer's subclass body is the same on both. It lives in the plain
+`net10.0` assembly, not an iOS target: it needs only SDL's P/Invokes, so the package carries no `net10.0-ios`
+asset (whose workload the Linux packing runner does not have), and a `net10.0-ios` head consumes the
+`net10.0` one.
+
+The head calls `new MyApp().Run()` from `Main` **instead of** `UIApplication.Main`: SDL owns the UIKit
+application (`SDL_RunApp`) and calls the bring-up back once it has launched. iOS has no Vulkan loader and
+SDL3-CS ships no iOS natives, so the head bundles both as **dynamic** xcframeworks (`NativeReference`):
+
+- `SDL3.xcframework`, from the SDL release matching the SDL3-CS version the head pins (the `.dmg` carries it);
+- `MoltenVK.xcframework`, the dynamic one from a KhronosGroup/MoltenVK release.
+
+The library finds them by absolute path inside the bundle (`Frameworks/SDL3.framework/SDL3`,
+`Frameworks/MoltenVK.framework/MoltenVK`) and hands SDL and Vortice the SAME MoltenVK. On every Apple platform
+the instance asks for `VK_KHR_portability_enumeration`, and a device that advertises `VK_KHR_portability_subset`
+(MoltenVK does) gets it enabled, as the spec requires; neither changes anything on Windows, Linux or Android.
 
 ### CI setup
 
@@ -285,6 +306,29 @@ renderer.DrawHdrImage(image, x, y, width, height, HdrPrimaries.Bt2020, sourcePea
 dotnet run --project tools/SdrFrameBench -c Release -- --frames 300
 ```
 
+## Shutting down an app whose Main is async
+
+The window and its `VulkanContext` belong to the thread that ran `SdlEventLoop.Run`, and background work (a camera
+closing, a save) often needs that thread's loop to keep pumping before it can finish. Two spellings hang:
+
+```csharp
+loop.Run(...);
+await drain;              // wrong: the continuation may resume on another thread, and nothing pumps the loop
+drain.GetAwaiter().GetResult();   // wrong: blocks the loop's thread while the work waits for the loop
+```
+
+Call this after `Run` returns, before disposing anything:
+
+```csharp
+loop.Run(...);
+ShutdownDrain.PumpUntilComplete(loop, drainTask);   // pumps the loop until drainTask completes or a timeout (10 s)
+window.Dispose();
+```
+
+It takes an optional `TimeProvider`, `ILogger` and timeout, and returns false when the timeout won. Disposing an
+`SdlVulkanWindow` or `VulkanContext` on another thread throws `InvalidOperationException` in Debug and logs a
+warning in Release, naming both threads and pointing here.
+
 ## Native WebView (optional)
 
 Host a native browser view *inside* an `SdlVulkanWindow`. The window system composites it over the
@@ -385,17 +429,53 @@ Backend notes:
 
 ## Debug inspector: screenshot and resize
 
-The `#if DEBUG` `DebugInspector` (client: `SdlVulkan.Renderer.Inspector`, which also has a `selftest` mode) answers
-these window verbs:
+**A trimmed or NativeAOT publish has no inspector unless it is published with `-p:DirInspectorSupport=true`.**
+`DebugInspector.Attach` follows DIR.Lib's `DIR.Lib.Inspector.IsSupported` feature switch (no second property): a
+`dotnet publish` with `PublishTrimmed` or `PublishAot` turns it off, so `Attach` returns the inert inspector, DIR.Lib prints
+one stderr line when `DIR_INSPECTOR=1` is set, and the verbs are trimmed away. Build, run and test keep the inspector.
+`tools/InspectorAotProbe` measures it (upstream's CHANGELOG 7.97; here under 11.98).
+
+`DebugInspector` is compiled into Release builds too and is inert unless the process opts in: set `DIR_INSPECTOR=1` and
+`DIR_INSPECTOR_TOKEN=<secret>` (DIR.Lib's contract) and call `DebugInspector.Attach(loop, opts)` unconditionally. With
+the variable unset (or no token) `Attach` returns an inactive inspector: no socket, no registry file, no loop hook.
+Every client request must carry the token. A Debug build stays always-on when `DIR_INSPECTOR` is absent. The
+`gpuFault` verb stays Debug only. The client is `SdlVulkan.Renderer.Inspector`, which also has a `selftest` mode.
+It answers these window verbs:
 
 - `screenshot` un-minimises a minimised window itself, waits for the first presented frame and captures, and the
   reply says it did so. `reminimize: true` puts the window back minimised afterwards. If no frame is presented
   within a short budget it fails at once with "the window presented no frame: is the display off?".
+  A window minimised (or hidden) after the capture was requested fails within the same budget, saying the window is
+  minimized, and the capture request is disarmed on completion, timeout and dispose, so a later `screenshot` is not
+  refused as already in progress and no stale capture rides a later frame.
 - `resize` takes `width` and `height` in window pixels, un-maximises if needed, sets the client size clamped to the
   display work area, and answers once the next frame at that size has been laid out.
 - `screenshot` with optional `width` and `height` resizes, captures at that size and puts the window back as it was
   (maximised, its floating size, or minimised), so a layout can be captured at real window sizes. The size is
   clamped to the work area like `resize`, so the reply's width and height are what was actually captured.
+
+### Typed client (`SdlVulkan.Renderer.Inspector.Client`)
+
+The MCP sidecar is built on a library you can use from a test or a tool. It references neither the framework nor
+DIR.Lib. `InspectorClient.ConnectAsync(pid, token)` finds the app in DIR.Lib's per-user registry (pid 0 is the one
+running instance) and sends the token on every request; the token defaults to `DIR_INSPECTOR_TOKEN`. Each verb is a
+typed async method, and a failure the app reports throws `InspectorException` with the verb and the server's own text.
+With pid 0 and several inspected apps running it throws `InspectorException` naming how many and each app and pid, and
+asking for a pid (`InspectorClient.Resolve`, shared with the MCP sidecar). The sidecar turns every such failure into an
+MCP error whose text is the server's message, not "An error occurred invoking ...".
+
+```csharp
+var client = await InspectorClient.ConnectAsync(pid, token);
+await client.ResizeAsync(900, 700);
+await client.ClickAsync(120, 40);
+await client.PressKeyAsync("Enter", "Ctrl");
+var shot = await client.ScreenshotAsync();          // shot.Rgba, shot.Width, shot.Height, shot.Png
+var stats = await client.FrameStatsAsync();         // stats.AvgFrameMs
+var tree = await client.DescribeUiAsync();          // a JsonElement
+```
+
+Also `DescribeLayoutAsync`, `DragAsync`, `MoveAsync`, `TypeTextAsync`, `RestoreAsync`, `ValidationReportAsync`,
+`RenderLivenessAsync` and `SignalsAsync`.
 
 ## Dependencies
 
