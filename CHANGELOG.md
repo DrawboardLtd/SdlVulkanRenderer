@@ -13,6 +13,19 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.101
+
+**BC1 textures, an eighth of RGBA; on DIR.Lib 11.99** (upstream 7.112).
+
+- `VkTexture.CreateDeferred` takes `VkFormat.Bc1RgbUnormBlock`: BC1 blocks, 8 bytes for every 4×4 pixels, a partial
+  block at an edge that is not a multiple of 4. A 3164×4096 page scan is 6.2 MB on the GPU and in the upload, where its
+  RGBA is 49.4 MB. Encoding is the caller's.
+- The device enables the `textureCompressionBC` feature wherever it is offered (no feature was enabled before, and
+  none other is now). `VulkanDevice.SupportsBc1Textures` says whether BC1 can be sampled with linear filtering; every
+  desktop GPU and lavapipe can, and `CreateDeferred` refuses BC1 on a device that cannot.
+- `VkTexture.ImageBytes` is a texture's pixels in its own format, for a memory budget that counted every texture as
+  RGBA. `Bc1TextureRenderTests` draws solid-colour blocks and reads each one back. Additive.
+
 ## 11.100
 
 **Many textured quads off one texture in one draw, a redraw check paced to the refresh, iOS frameworks from the
