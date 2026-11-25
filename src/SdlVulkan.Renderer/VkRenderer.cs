@@ -1238,7 +1238,13 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
                 var y0 = (float)r.UpperLeft.Y;
                 var x1 = (float)r.LowerRight.X;
                 var y1 = (float)r.LowerRight.Y;
-                _rectScratch.AddRange([x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
+                // Float by float: a collection expression handed to AddRange is an array made for every rectangle.
+                _rectScratch.Add(x0); _rectScratch.Add(y0);
+                _rectScratch.Add(x1); _rectScratch.Add(y0);
+                _rectScratch.Add(x1); _rectScratch.Add(y1);
+                _rectScratch.Add(x0); _rectScratch.Add(y0);
+                _rectScratch.Add(x1); _rectScratch.Add(y1);
+                _rectScratch.Add(x0); _rectScratch.Add(y1);
             }
 
             SetColor(color);
@@ -1526,6 +1532,65 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var vkOffset = (ulong)offset;
         api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
         api.vkCmdDraw(_currentCmd, 6, 1, 0, 0);
+    }
+
+    // Vertex scratch for DrawTexturedQuadRegions: grown to the largest run, kept for the renderer's life.
+    private float[] _texturedQuadScratch = [];
+
+    /// <summary>
+    /// <see cref="DrawTexturedQuadRegion"/> for many quads off ONE texture in one draw: the vertices of
+    /// every quad go into the ring together, then one bind and one <c>vkCmdDraw</c>. A sheet built from
+    /// thousands of raster strips packed into an image atlas otherwise pays a descriptor bind and a draw
+    /// for each strip. Each quad paints after the one before it, as separate calls would.
+    /// </summary>
+    public void DrawTexturedQuadRegions(VkDescriptorSet textureSet, ReadOnlySpan<TexturedQuad> quads)
+    {
+        if (_pipelines is null || quads.IsEmpty) return;
+        if (quads.Length == 1)
+        {
+            ref readonly var q = ref quads[0];
+            DrawTexturedQuadRegion(textureSet, q.X0, q.Y0, q.X1, q.Y1, q.X2, q.Y2, q.X3, q.Y3, q.U0, q.V0, q.U1, q.V1);
+            return;
+        }
+
+        var api = Surface.DeviceApi;
+        var floats = quads.Length * 24;
+        if (_texturedQuadScratch.Length < floats) _texturedQuadScratch = new float[Math.Max(floats, _texturedQuadScratch.Length * 2)];
+        var v = _texturedQuadScratch.AsSpan(0, floats);
+        for (var i = 0; i < quads.Length; i++)
+        {
+            ref readonly var q = ref quads[i];
+            var o = v.Slice(i * 24, 24);
+            // The same two triangles DrawTexturedQuadRegion writes.
+            o[0] = q.X0; o[1] = q.Y0; o[2] = q.U0; o[3] = q.V0;
+            o[4] = q.X1; o[5] = q.Y1; o[6] = q.U1; o[7] = q.V0;
+            o[8] = q.X3; o[9] = q.Y3; o[10] = q.U1; o[11] = q.V1;
+            o[12] = q.X0; o[13] = q.Y0; o[14] = q.U0; o[15] = q.V0;
+            o[16] = q.X3; o[17] = q.Y3; o[18] = q.U1; o[19] = q.V1;
+            o[20] = q.X2; o[21] = q.Y2; o[22] = q.U0; o[23] = q.V1;
+        }
+
+        _pushConstants[16] = 1f;
+        _pushConstants[17] = 1f;
+        _pushConstants[18] = 1f;
+        _pushConstants[19] = 1f;
+
+        var offset = Surface.WriteVertices(v);
+        if (offset == uint.MaxValue) return;
+
+        BindPipeline(_pipelines.PagePipeline);
+
+        fixed (float* pPC = _pushConstants)
+            api.vkCmdPushConstants(_currentCmd, Surface.PipelineLayout,
+                VkShaderStageFlags.Vertex | VkShaderStageFlags.Fragment, 0, 84, pPC);
+
+        api.vkCmdBindDescriptorSets(_currentCmd, VkPipelineBindPoint.Graphics,
+            Surface.PipelineLayout, 0, 1, &textureSet, 0, null);
+
+        var buffer = Surface.VertexBuffer;
+        var vkOffset = (ulong)offset;
+        api.vkCmdBindVertexBuffers(_currentCmd, 0, 1, &buffer, &vkOffset);
+        api.vkCmdDraw(_currentCmd, (uint)(quads.Length * 6), 1, 0, 0);
     }
 
     /// <summary>
@@ -3112,10 +3177,22 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var cx = (x0 + x1) * 0.5f; var cy = (y0 + y1) * 0.5f;
         var ex = halfLen + 1f;
         var ey = hw + 1f;
-        void Vertex(List<float> d, float along, float across) => d.AddRange(
-            [cx + ux * along + vx * across, cy + uy * along + vy * across, along, across, halfLen, hw, 0f]);
+        // Each vertex added float by float: a collection expression handed to AddRange is an array (and a wrapper
+        // around it) made for every vertex, twelve objects for every line drawn (traced 2026-11-25: 8 MB in 18 s of
+        // an atlas with an object's panel open, its night curve alone).
         Vertex(dst, -ex, -ey); Vertex(dst, ex, -ey); Vertex(dst, ex, ey);
         Vertex(dst, -ex, -ey); Vertex(dst, ex, ey); Vertex(dst, -ex, ey);
+
+        void Vertex(List<float> d, float along, float across)
+        {
+            d.Add(cx + ux * along + vx * across);
+            d.Add(cy + uy * along + vy * across);
+            d.Add(along);
+            d.Add(across);
+            d.Add(halfLen);
+            d.Add(hw);
+            d.Add(0f);
+        }
     }
 
     // One draw of the line boxes AppendLineBox accumulated.
@@ -3455,6 +3532,18 @@ public sealed unsafe class VkRenderer : Renderer<VulkanContext>
         var layoutY = (float)layout.UpperLeft.Y;
         var layoutW = (float)layout.Width;
         var layoutH = (float)layout.Height;
+
+        // What the scissor would discard is not shaped at all (TextCulling). A pass paints inside _damageRegion and
+        // nowhere else, whichever target is bound: the whole surface on a full frame, a strip on one that repaints a
+        // clock, the layer's own area in a cached layer. Under a content transform the layout is not in the pass's
+        // pixels, and the text is drawn as it always was.
+        if (_contentTransform.IsIdentity
+            && !TextCulling.MayReach(text.Length, lineCount, fontSize, lineHeight, horizAlignment,
+                layoutX, layoutY, layoutW, layoutH,
+                _damageRegion.X, _damageRegion.Y, _damageRegion.W, _damageRegion.H))
+        {
+            return;
+        }
 
         var startY = vertAlignment switch
         {

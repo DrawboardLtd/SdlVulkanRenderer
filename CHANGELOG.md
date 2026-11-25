@@ -13,6 +13,28 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.100
+
+**Many textured quads off one texture in one draw, a redraw check paced to the refresh, iOS frameworks from the
+package; on DIR.Lib 11.99** (upstream 7.109-7.111).
+
+- **`VkRenderer.DrawTexturedQuadRegions(textureSet, quads)`** draws a span of `TexturedQuad` off one texture with one
+  bind and one draw, where `DrawTexturedQuadRegion` took both for every quad. A page of small images packed into one
+  atlas texture used to pay a draw per image; in the PDF viewer a sheet of 1,365 raster strips goes from 1,365 draws to
+  4, and its redraw from 4.7 to 1.7 ms of GPU (Adreno X1-85). The pixels are those of the quads drawn one call at a time
+  (`TexturedQuadRegionsRenderTests`). Additive.
+- **The redraw check is asked once a refresh, not on every wake** (`RedrawCheckPacing`): a burst of input asked
+  `SdlWindowView.CheckNeedsRedraw` thousands of times a second. **BEHAVIOUR CHANGE** for a host that used the check as
+  a once-per-pass hook. `SdlWindowView.IdleCheckInterval` lets an idle host say when it next needs asking, and
+  `SdlEventLoop.Wake()` asks sooner from any thread. `RedrawPendingForCheckAndPointerMovesAlone` says what a pending
+  frame is owed to.
+- **The render thread asks Windows for full speed** (`RenderThreadQos`), so a hybrid processor does not run a
+  background window's frames on an efficiency core. **Text outside a partial repaint is not shaped** (`TextCulling`).
+  `SDLVK_FRAME_LOG` has an input line (`InputTrace`). Line boxes and `FillRectangles` no longer allocate a temporary
+  array per rectangle.
+- **An iOS app gets SDL3 and MoltenVK** through `buildTransitive/SdlVulkan.Renderer.targets`, and the mobile hosts log
+  to a readable default (`MobileLog`). Nothing changes for a desktop consumer.
+
 ## 11.99
 
 **Dependencies to their latest releases, on DIR.Lib 11.99** (upstream 7.108). SharpAstro.AppShell 1.4 (was 1.2: 1.3
