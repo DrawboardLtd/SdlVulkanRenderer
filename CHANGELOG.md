@@ -15,10 +15,14 @@ this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
 ## 11.104
 
-**`BetweenFramesCollector` and `SdlEventLoop.BetweenFrames`** (upstream 7.115), on **DIR.Lib 11.103**. Set
+**`BetweenFramesCollector` and `SdlEventLoop.BetweenFrames`** (upstream 7.115 and 7.116), on **DIR.Lib 11.103**. Set
 `loop.BetweenFrames = new BetweenFramesCollector()` and the loop asks it after every presented frame, right after
-`OnPostFrame`: once 4 MB has been allocated since the last collection it collects generation 0 there, between frames,
-rather than letting the runtime start one at an allocation inside the next paint. Null (the default) changes nothing.
+`OnPostFrame`: once most of the runtime's gen-0 budget has been allocated since the last collection it collects
+generation 0 there, between frames, rather than letting the runtime start one at an allocation inside the next paint.
+The threshold is learned (7.116): three quarters of a running average of what the runtime allowed between the
+collections it started itself, between 1 MB and the constructor's 4 MB. A fixed 4 MB never fired in the PDF viewer,
+whose runtime collects after 3.2 to 4.1 MB; learned, 20 of 22 gen-0 collections in a driven pan and zoom ran between
+frames. Null (the default) changes nothing.
 DIR.Lib 11.103 stops a trimmed run (a tab title) allocating every frame, keeps `PaintLayout`'s depth stacks between
 paints and adds `IPixelWidget.CollectRegisteredTextInputs`. Additive only.
 
