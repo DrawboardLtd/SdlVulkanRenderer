@@ -13,6 +13,15 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.104
+
+**`BetweenFramesCollector` and `SdlEventLoop.BetweenFrames`** (upstream 7.115), on **DIR.Lib 11.103**. Set
+`loop.BetweenFrames = new BetweenFramesCollector()` and the loop asks it after every presented frame, right after
+`OnPostFrame`: once 4 MB has been allocated since the last collection it collects generation 0 there, between frames,
+rather than letting the runtime start one at an allocation inside the next paint. Null (the default) changes nothing.
+DIR.Lib 11.103 stops a trimmed run (a tab title) allocating every frame, keeps `PaintLayout`'s depth stacks between
+paints and adds `IPixelWidget.CollectRegisteredTextInputs`. Additive only.
+
 ## 11.103
 
 **On DIR.Lib 11.102** (upstream 7.114), which adds `KeptLayout<TKey>`: a widget's arranged tree kept from one frame to
