@@ -13,6 +13,14 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.106
+
+**The saved pipeline cache carries a checksum** (upstream 7.120). The file is a magic number, a format version and a
+SHA-256 of the cache data, then the data; on load the checksum is checked before the device header, so a body damaged
+behind an intact header is refused rather than handed to the driver, and the log says which check refused it. A file
+written by 11.105 is rebuilt once. (Upstream 7.119, the incremental present, is not merged upstream yet and is not in
+this take.)
+
 ## 11.105
 
 **A pipeline cache per device, saved where the app says** (upstream 7.117 and 7.118). Every pipeline was built without a
