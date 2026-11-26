@@ -15,13 +15,15 @@ this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
 ## 11.105
 
-**A pipeline cache per device, saved where the app says** (upstream 7.117). Every pipeline was built without a
+**A pipeline cache per device, saved where the app says** (upstream 7.117 and 7.118). Every pipeline was built without a
 `VkPipelineCache`, so the driver compiled the same SPIR-V again for every set: 82 to 99 ms for the first set in a fresh
 process on the Adreno X1-85, 71 to 88 ms for each after it. Now `VulkanDevice.PipelineCache` is made with the device and
 every pipeline is built through it; set `VulkanDevice.PipelineCacheDirectory` before the first device and it is loaded
 from there and saved on dispose, checked against the device's header first and written atomically. Measured: the first
 launch 69 ms, every launch after it 4 ms, a set rebuilt in the same process 1 ms. With no directory the cache lives as
-long as the device. Additive only.
+long as the device. 7.118 also saves it in the background as each pipeline set is built, not only on dispose,
+so a run that is killed or crashes keeps what it built (launches that killed themselves: 86 ms, then 6 and 7 ms).
+Additive only.
 
 ## 11.104
 
