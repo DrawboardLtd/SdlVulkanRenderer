@@ -13,6 +13,12 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.103
+
+**On DIR.Lib 11.102** (upstream 7.114), which adds `KeptLayout<TKey>`: a widget's arranged tree kept from one frame to
+the next while everything its build reads stands, still painted every frame so its regions and hover stay live. The PDF
+viewer keeps its hint bar and tool palette with it. Nothing in the renderer's own source changes. Additive only.
+
 ## 11.102
 
 **Dependencies to their latest releases, on DIR.Lib 11.101** (upstream 7.113). DIR.Lib 11.101 (was 11.99: 11.100 keeps
