@@ -13,6 +13,15 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.102
+
+**Dependencies to their latest releases, on DIR.Lib 11.101** (upstream 7.113). DIR.Lib 11.101 (was 11.99: 11.100 keeps
+a `TabBar` strip's tree between frames and lets `FontFallbackResolver` measure a span without allocating, 11.101 takes
+Svg 3.42), SharpAstro.AppShell 1.5 (was 1.4: `AppIdentity.Claim` does nothing inside an app package, and
+`AppIdentity.IsPackaged` asks) and, for the inspector, SharpAstro.Png 3.42 (was 3.41). Nothing in the renderer's own
+source changes. The AppShell line here is live (there is no fork of it), so a consumer that pins AppShell itself moves
+with it. Additive only.
+
 ## 11.101
 
 **BC1 textures, an eighth of RGBA; on DIR.Lib 11.99** (upstream 7.112).
