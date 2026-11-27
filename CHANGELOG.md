@@ -13,6 +13,15 @@ a different release in each. 7.5 and earlier are the shared history from before 
 an entry here against upstream's entry for the same number, and do not conclude from a version gap that
 this repo is behind: it tracks DIR.Lib's number, upstream numbers its own way.
 
+## 11.107
+
+**Incremental present** (upstream 7.121, merged as #216 under the title 7.119). Where the device offers
+`VK_KHR_incremental_present`, each present can name the rectangle that changed since the last present that was made, fed
+by `AddFrameDamage` and `MarkFullFrameDamage`; a dropped frame's damage carries to the next present, and the present is
+whole before a swapchain's first present, after a full frame, on an HDR frame, after a failed present and on a rotated
+swapchain. On by default only on a software rasteriser (the only place it was measured, with no difference from noise);
+`SDLVK_INCREMENTAL_PRESENT=1` turns it on elsewhere and `=0` refuses it. `SDLVK_FRAME_LOG` says what each present named.
+
 ## 11.106
 
 **The saved pipeline cache carries a checksum** (upstream 7.120). The file is a magic number, a format version and a
